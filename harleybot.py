@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Harley Quinn Bot - Playful, chaotic, and dangerously fun
-Version 1.0 - Auto-capture Chat ID edition
+Version 1.1 - Fixed SQLAlchemy session issues
 """
 
 import os
@@ -9,7 +9,7 @@ import logging
 import asyncio
 import random
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -37,7 +37,7 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL not set!")
 
-engine = create_engine(DATABASE_URL)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 Base = declarative_base()
 Session = sessionmaker(bind=engine)
 
@@ -82,7 +82,7 @@ class UserProfile(Base):
     total_tasks_failed = Column(Integer, default=0)
     current_streak = Column(Integer, default=0)
     longest_streak = Column(Integer, default=0)
-    harley_points = Column(Integer, default=0)  # "Harley Dollars"
+    harley_points = Column(Integer, default=0)
     
     # Current task
     current_task = Column(Text)
@@ -121,7 +121,7 @@ class TaskHistory(Base):
     task_description = Column(Text, nullable=False)
     assigned_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime)
-    status = Column(String, default='assigned')  # assigned, completed, failed, expired
+    status = Column(String, default='assigned')
     verification_photo_url = Column(String)
     harley_feedback = Column(Text)
 
@@ -136,6 +136,146 @@ class ConversationLog(Base):
 
 # Create tables
 Base.metadata.create_all(engine)
+
+# ==================== DATABASE HELPERS (FIXED) ====================
+
+def get_or_create_user(chat_id: str, username: str = None) -> Dict[str, Any]:
+    """Get existing user or create new one - returns dict, not ORM object"""
+    session = Session()
+    try:
+        user = session.query(UserProfile).filter_by(chat_id=str(chat_id)).first()
+        if not user:
+            user = UserProfile(chat_id=str(chat_id), username=username)
+            session.add(user)
+            session.commit()
+            logger.info(f"Created new user: {chat_id}")
+        else:
+            user.last_active = datetime.utcnow()
+            if username and not user.username:
+                user.username = username
+            session.commit()
+        
+        # Convert to dict before session closes
+        user_dict = {
+            'chat_id': user.chat_id,
+            'username': user.username,
+            'total_tasks_completed': user.total_tasks_completed,
+            'total_tasks_failed': user.total_tasks_failed,
+            'current_streak': user.current_streak,
+            'longest_streak': user.longest_streak,
+            'harley_points': user.harley_points,
+            'current_task': user.current_task,
+            'task_completed': user.task_completed,
+            'photo_retry_count': user.photo_retry_count,
+            'task_assigned_at': user.task_assigned_at,
+        }
+        # Add all kink preferences
+        for kink_id in HARLEY_KINKS.keys():
+            user_dict[kink_id] = getattr(user, kink_id, True)
+            
+        return user_dict
+    finally:
+        session.close()
+
+def update_user_field(chat_id: str, field: str, value):
+    """Update a single user field"""
+    session = Session()
+    try:
+        user = session.query(UserProfile).filter_by(chat_id=str(chat_id)).first()
+        if user:
+            setattr(user, field, value)
+            session.commit()
+            return True
+        return False
+    finally:
+        session.close()
+
+def update_user_fields(chat_id: str, updates: Dict[str, Any]):
+    """Update multiple user fields at once"""
+    session = Session()
+    try:
+        user = session.query(UserProfile).filter_by(chat_id=str(chat_id)).first()
+        if user:
+            for field, value in updates.items():
+                setattr(user, field, value)
+            session.commit()
+            return True
+        return False
+    finally:
+        session.close()
+
+def toggle_user_kink(chat_id: str, kink_id: str) -> bool:
+    """Toggle a kink preference, returns new value"""
+    session = Session()
+    try:
+        user = session.query(UserProfile).filter_by(chat_id=str(chat_id)).first()
+        if user and kink_id in HARLEY_KINKS:
+            current = getattr(user, kink_id, True)
+            setattr(user, kink_id, not current)
+            session.commit()
+            return not current
+        return None
+    finally:
+        session.close()
+
+def log_task_history(chat_id: str, task_description: str, status: str, 
+                     photo_url: str = None, feedback: str = None):
+    """Log a task to history"""
+    session = Session()
+    try:
+        history = TaskHistory(
+            chat_id=str(chat_id),
+            task_description=task_description,
+            status=status,
+            verification_photo_url=photo_url,
+            harley_feedback=feedback
+        )
+        session.add(history)
+        session.commit()
+    finally:
+        session.close()
+
+def log_conversation(chat_id: str, message: str, response: str):
+    """Log conversation for context"""
+    session = Session()
+    try:
+        log = ConversationLog(chat_id=str(chat_id), message=message, response=response)
+        session.add(log)
+        session.commit()
+    finally:
+        session.close()
+
+def get_task_history(chat_id: str, limit: int = 10):
+    """Get task history as list of dicts"""
+    session = Session()
+    try:
+        history = session.query(TaskHistory).filter_by(chat_id=str(chat_id))\
+            .order_by(TaskHistory.assigned_at.desc()).limit(limit).all()
+        
+        result = []
+        for h in history:
+            result.append({
+                'task_description': h.task_description,
+                'status': h.status,
+                'assigned_at': h.assigned_at,
+                'completed_at': h.completed_at,
+                'harley_feedback': h.harley_feedback
+            })
+        return result
+    finally:
+        session.close()
+
+def delete_all_user_data(chat_id: str):
+    """Delete all data for a user"""
+    session = Session()
+    try:
+        session.query(UserProfile).filter_by(chat_id=str(chat_id)).delete()
+        session.query(TaskHistory).filter_by(chat_id=str(chat_id)).delete()
+        session.query(ConversationLog).filter_by(chat_id=str(chat_id)).delete()
+        session.commit()
+        return True
+    finally:
+        session.close()
 
 # ==================== VENICE AI INTEGRATION ====================
 
@@ -162,7 +302,7 @@ def generate_harley_response(prompt: str, max_tokens: int = 500) -> str:
                 "Content-Type": "application/json"
             },
             json={
-                "model": VENVENICE_API_KEY,
+                "model": VENVENICE_MODEL,
                 "messages": [
                     {"role": "system", "content": harley_system_prompt},
                     {"role": "user", "content": prompt}
@@ -239,7 +379,6 @@ def verify_photo_with_ai(task_description: str, photo_url: str) -> tuple:
     COMMENT: [Harley's playful comment]"""
     
     # Note: In production, you'd download the image and send it to a vision-capable model
-    # For now, we'll simulate with text analysis
     result = generate_harley_response(prompt, max_tokens=150)
     
     if result:
@@ -258,45 +397,6 @@ def verify_photo_with_ai(task_description: str, photo_url: str) -> tuple:
     # Default to accepting if AI fails
     return True, "", "Ooh, looks good to me, puddin'!"
 
-# ==================== HELPER FUNCTIONS ====================
-
-def get_or_create_user(chat_id: str, username: str = None) -> UserProfile:
-    """Get existing user or create new one"""
-    session = Session()
-    try:
-        user = session.query(UserProfile).filter_by(chat_id=str(chat_id)).first()
-        if not user:
-            user = UserProfile(chat_id=str(chat_id), username=username)
-            session.add(user)
-            session.commit()
-            logger.info(f"Created new user: {chat_id}")
-        else:
-            user.last_active = datetime.utcnow()
-            if username and not user.username:
-                user.username = username
-            session.commit()
-        return user
-    finally:
-        session.close()
-
-def get_allowed_kinks(user: UserProfile) -> list:
-    """Get list of enabled kinks for user"""
-    allowed = []
-    for kink_id, kink_name in HARLEY_KINKS.items():
-        if getattr(user, kink_id, True):
-            allowed.append(kink_name)
-    return allowed
-
-def log_conversation(chat_id: str, message: str, response: str):
-    """Log conversation for context"""
-    session = Session()
-    try:
-        log = ConversationLog(chat_id=str(chat_id), message=message, response=response)
-        session.add(log)
-        session.commit()
-    finally:
-        session.close()
-
 # ==================== BOT COMMAND HANDLERS ====================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -311,7 +411,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Hee hee! Well well well, look what the bat dragged in! 
 I'm Harley Quinn, and you're gonna be my new favorite plaything! 
 
-*Your Chat ID:* `{chat_id}`
+*Your Chat ID:* `{user['chat_id']}`
 (Already saved, puddin'!)
 
 🃏 *What I do:*
@@ -341,7 +441,7 @@ async def kinks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     row = []
     
     for kink_id, kink_name in HARLEY_KINKS.items():
-        enabled = getattr(user, kink_id, True)
+        enabled = user.get(kink_id, True)
         emoji = "✅" if enabled else "❌"
         row.append(InlineKeyboardButton(
             f"{emoji} {kink_name}", 
@@ -379,39 +479,34 @@ async def toggle_kink_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("✨ All set! Let's have some fun!")
         return
     
-    session = Session()
-    try:
-        user = session.query(UserProfile).filter_by(chat_id=str(chat_id)).first()
-        if user and kink_id in HARLEY_KINKS:
-            current = getattr(user, kink_id, True)
-            setattr(user, kink_id, not current)
-            session.commit()
+    # Toggle the kink
+    new_value = toggle_user_kink(chat_id, kink_id)
+    
+    if new_value is not None:
+        # Refresh menu
+        user = get_or_create_user(chat_id)
+        keyboard = []
+        row = []
+        
+        for kid, kname in HARLEY_KINKS.items():
+            enabled = user.get(kid, True)
+            emoji = "✅" if enabled else "❌"
+            row.append(InlineKeyboardButton(
+                f"{emoji} {kname}", 
+                callback_data=f"toggle_{kid}"
+            ))
             
-            # Refresh menu
-            keyboard = []
-            row = []
-            
-            for kid, kname in HARLEY_KINKS.items():
-                enabled = getattr(user, kid, True)
-                emoji = "✅" if enabled else "❌"
-                row.append(InlineKeyboardButton(
-                    f"{emoji} {kname}", 
-                    callback_data=f"toggle_{kid}"
-                ))
-                
-                if len(row) == 2:
-                    keyboard.append(row)
-                    row = []
-            
-            if row:
+            if len(row) == 2:
                 keyboard.append(row)
-            
-            keyboard.append([InlineKeyboardButton("🔙 Done", callback_data="kinks_done")])
-            
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_reply_markup(reply_markup)
-    finally:
-        session.close()
+                row = []
+        
+        if row:
+            keyboard.append(row)
+        
+        keyboard.append([InlineKeyboardButton("🔙 Done", callback_data="kinks_done")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_reply_markup(reply_markup)
 
 async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generate and assign a new task"""
@@ -419,30 +514,31 @@ async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_or_create_user(chat_id)
     
     # Check if already has active task
-    if user.current_task and not user.task_completed:
+    if user.get('current_task') and not user.get('task_completed'):
         await update.message.reply_text(
             "🃏 *Slow down, sugar!* 🃏\n\n"
-            f"You already have a task pending:\n\n{user.current_task}\n\n"
+            f"You already have a task pending:\n\n{user['current_task']}\n\n"
             "Complete that one first before I give you more chaos!",
             parse_mode='Markdown'
         )
         return
     
+    # Get allowed kinks
+    allowed_kinks = []
+    for kink_id, kink_name in HARLEY_KINKS.items():
+        if user.get(kink_id, True):
+            allowed_kinks.append(kink_name)
+    
     # Generate new task
-    allowed_kinks = get_allowed_kinks(user)
     task = generate_task_with_ai(allowed_kinks)
     
     # Save to user
-    session = Session()
-    try:
-        user = session.query(UserProfile).filter_by(chat_id=str(chat_id)).first()
-        user.current_task = task
-        user.task_assigned_at = datetime.utcnow()
-        user.task_completed = False
-        user.photo_retry_count = 0
-        session.commit()
-    finally:
-        session.close()
+    update_user_fields(chat_id, {
+        'current_task': task,
+        'task_assigned_at': datetime.utcnow(),
+        'task_completed': False,
+        'photo_retry_count': 0
+    })
     
     # Create keyboard
     keyboard = [[
@@ -472,33 +568,31 @@ async def auto_clear_task(chat_id: str, timeout_minutes: int):
     """Auto-clear task after timeout with punishment"""
     await asyncio.sleep(timeout_minutes * 60)
     
-    session = Session()
-    try:
-        user = session.query(UserProfile).filter_by(chat_id=str(chat_id)).first()
-        if user and user.current_task and not user.task_completed:
-            # Punishment
-            user.total_tasks_failed += 1
-            user.current_streak = 0
-            user.harley_points = max(0, user.harley_points - 10)
-            
-            # Log as expired
-            history = TaskHistory(
-                chat_id=str(chat_id),
-                task_description=user.current_task,
-                status='expired',
-                harley_feedback="Too slow! Harley got bored waiting!"
-            )
-            session.add(history)
-            
-            # Clear current task
-            user.current_task = None
-            user.task_completed = False
-            session.commit()
-            
-            # Send message (would need bot instance in real implementation)
-            logger.info(f"Task expired for user {chat_id}")
-    finally:
-        session.close()
+    # Re-fetch user to check current state
+    user = get_or_create_user(chat_id)
+    
+    if user.get('current_task') and not user.get('task_completed'):
+        # Punishment
+        new_failed = user['total_tasks_failed'] + 1
+        new_points = max(0, user['harley_points'] - 10)
+        
+        update_user_fields(chat_id, {
+            'total_tasks_failed': new_failed,
+            'current_streak': 0,
+            'harley_points': new_points,
+            'current_task': None,
+            'task_completed': False
+        })
+        
+        # Log as expired
+        log_task_history(
+            chat_id, 
+            user['current_task'], 
+            'expired',
+            feedback="Too slow! Harley got bored waiting!"
+        )
+        
+        logger.info(f"Task expired for user {chat_id}")
 
 async def complete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle complete button - ask for photo"""
@@ -520,18 +614,26 @@ async def give_up_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     chat_id = update.effective_chat.id
     
-    session = Session()
-    try:
-        user = session.query(UserProfile).filter_by(chat_id=str(chat_id)).first()
-        if user:
-            user.total_tasks_failed += 1
-            user.current_streak = 0
-            user.harley_points = max(0, user.harley_points - 5)
-            user.current_task = None
-            user.task_completed = False
-            session.commit()
-    finally:
-        session.close()
+    user = get_or_create_user(chat_id)
+    
+    # Update stats
+    new_failed = user['total_tasks_failed'] + 1
+    new_points = max(0, user['harley_points'] - 5)
+    
+    log_task_history(
+        chat_id,
+        user.get('current_task', 'Unknown task'),
+        'failed',
+        feedback="Gave up on task"
+    )
+    
+    update_user_fields(chat_id, {
+        'total_tasks_failed': new_failed,
+        'current_streak': 0,
+        'harley_points': new_points,
+        'current_task': None,
+        'task_completed': False
+    })
     
     await query.edit_message_reply_markup(reply_markup=None)
     await query.message.reply_text(
@@ -547,7 +649,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = get_or_create_user(chat_id)
     
-    if not user.current_task:
+    if not user.get('current_task'):
         await update.message.reply_text(
             "🤨 *What am I looking at?* 🤨\n\n"
             "I didn't ask for a photo... yet! Use /task to get a mission first!",
@@ -556,87 +658,73 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Get photo
-    photo = update.message.photo[-1]  # Largest size
+    photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     photo_url = file.file_path
     
     # Verify with AI
     await update.message.reply_text("🎨 Let me take a look at this...")
     
-    success, reason, comment = verify_photo_with_ai(user.current_task, photo_url)
+    success, reason, comment = verify_photo_with_ai(user['current_task'], photo_url)
     
     if success:
         # Task completed!
-        session = Session()
-        try:
-            user = session.query(UserProfile).filter_by(chat_id=str(chat_id)).first()
-            user.total_tasks_completed += 1
-            user.current_streak += 1
-            user.longest_streak = max(user.longest_streak, user.current_streak)
-            user.harley_points += 20
-            user.task_completed = True
-            
-            # Log to history
-            history = TaskHistory(
-                chat_id=str(chat_id),
-                task_description=user.current_task,
-                completed_at=datetime.utcnow(),
-                status='completed',
-                verification_photo_url=photo_url,
-                harley_feedback=comment
-            )
-            session.add(history)
-            
-            # Clear current task
-            user.current_task = None
-            user.task_completed = False
-            session.commit()
-        finally:
-            session.close()
+        new_completed = user['total_tasks_completed'] + 1
+        new_streak = user['current_streak'] + 1
+        new_longest = max(user['longest_streak'], new_streak)
+        new_points = user['harley_points'] + 20
+        
+        log_task_history(
+            chat_id,
+            user['current_task'],
+            'completed',
+            photo_url=photo_url,
+            feedback=comment
+        )
+        
+        update_user_fields(chat_id, {
+            'total_tasks_completed': new_completed,
+            'current_streak': new_streak,
+            'longest_streak': new_longest,
+            'harley_points': new_points,
+            'current_task': None,
+            'task_completed': False,
+            'photo_retry_count': 0
+        })
         
         await update.message.reply_text(
             f"🎉 *GOOD PET!* 🎉\n\n"
             f"{comment}\n\n"
-            f"✨ Current Streak: {user.current_streak}\n"
-            f"💰 Harley Dollars: {user.harley_points}\n\n"
+            f"✨ Current Streak: {new_streak}\n"
+            f"💰 Harley Dollars: {new_points}\n\n"
             f"Want more chaos? Use /task",
             parse_mode='Markdown'
         )
         
     else:
         # Photo rejected
-        session = Session()
-        try:
-            user = session.query(UserProfile).filter_by(chat_id=str(chat_id)).first()
-            user.photo_retry_count += 1
-            session.commit()
-            retry_count = user.photo_retry_count
-        finally:
-            session.close()
+        new_retry = user.get('photo_retry_count', 0) + 1
         
-        if retry_count >= 2:
+        if new_retry >= 2:
             # Failed after retries
-            session = Session()
-            try:
-                user = session.query(UserProfile).filter_by(chat_id=str(chat_id)).first()
-                user.total_tasks_failed += 1
-                user.current_streak = 0
-                user.harley_points = max(0, user.harley_points - 10)
-                
-                history = TaskHistory(
-                    chat_id=str(chat_id),
-                    task_description=user.current_task,
-                    status='failed',
-                    harley_feedback=f"Failed verification: {reason}"
-                )
-                session.add(history)
-                
-                user.current_task = None
-                user.task_completed = False
-                user.photo_retry_count = 0
-                session.commit()
-            finally:
-                session.close()
+            new_failed = user['total_tasks_failed'] + 1
+            new_points = max(0, user['harley_points'] - 10)
+            
+            log_task_history(
+                chat_id,
+                user['current_task'],
+                'failed',
+                feedback=f"Failed verification: {reason}"
+            )
+            
+            update_user_fields(chat_id, {
+                'total_tasks_failed': new_failed,
+                'current_streak': 0,
+                'harley_points': new_points,
+                'current_task': None,
+                'task_completed': False,
+                'photo_retry_count': 0
+            })
             
             await update.message.reply_text(
                 f"❌ *NOPE!* ❌\n\n"
@@ -649,6 +737,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             # Offer retry
+            update_user_field(chat_id, 'photo_retry_count', new_retry)
+            
             keyboard = [[
                 InlineKeyboardButton("🔄 Try Again", callback_data="retry_photo"),
                 InlineKeyboardButton("🏳️ Give Up", callback_data="give_up_photo")
@@ -659,7 +749,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🤔 *Hmm, not quite right...* 🤔\n\n"
                 f"{comment}\n\n"
                 f"❌ Issue: {reason}\n\n"
-                f"You have {2 - retry_count} attempt(s) left!\n"
+                f"You have {2 - new_retry} attempt(s) left!\n"
                 f"Try again or give up?",
                 parse_mode='Markdown',
                 reply_markup=reply_markup
@@ -684,29 +774,26 @@ async def give_up_photo_callback(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
     
     chat_id = update.effective_chat.id
+    user = get_or_create_user(chat_id)
     
-    session = Session()
-    try:
-        user = session.query(UserProfile).filter_by(chat_id=str(chat_id)).first()
-        if user:
-            user.total_tasks_failed += 1
-            user.current_streak = 0
-            user.harley_points = max(0, user.harley_points - 10)
-            
-            history = TaskHistory(
-                chat_id=str(chat_id),
-                task_description=user.current_task,
-                status='failed',
-                harley_feedback="Gave up on verification"
-            )
-            session.add(history)
-            
-            user.current_task = None
-            user.task_completed = False
-            user.photo_retry_count = 0
-            session.commit()
-    finally:
-        session.close()
+    new_failed = user['total_tasks_failed'] + 1
+    new_points = max(0, user['harley_points'] - 10)
+    
+    log_task_history(
+        chat_id,
+        user.get('current_task', 'Unknown task'),
+        'failed',
+        feedback="Gave up on verification"
+    )
+    
+    update_user_fields(chat_id, {
+        'total_tasks_failed': new_failed,
+        'current_streak': 0,
+        'harley_points': new_points,
+        'current_task': None,
+        'task_completed': False,
+        'photo_retry_count': 0
+    })
     
     await query.edit_message_reply_markup(reply_markup=None)
     await query.message.reply_text(
@@ -723,28 +810,28 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_or_create_user(chat_id)
     
     current_task_text = ""
-    if user.current_task and not user.task_completed:
+    if user.get('current_task') and not user.get('task_completed'):
         time_left = ""
-        if user.task_assigned_at:
-            elapsed = datetime.utcnow() - user.task_assigned_at
+        if user.get('task_assigned_at'):
+            elapsed = datetime.utcnow() - user['task_assigned_at']
             remaining = timedelta(minutes=30) - elapsed
             if remaining.total_seconds() > 0:
                 mins = int(remaining.total_seconds() / 60)
                 time_left = f" ({mins}m left)"
         
-        current_task_text = f"\n🎯 *Current Task:*{time_left}\n{user.current_task}\n"
+        current_task_text = f"\n🎯 *Current Task:*{time_left}\n{user['current_task']}\n"
     
-    status_msg = f"""🎪 *H ARLEY'S PLAYTHING STATUS* 🎪
+    status_msg = f"""🎪 *HARLEY'S PLAYTHING STATUS* 🎪
 
-👤 User: {user.username or 'Anonymous'}
-🆔 Chat ID: `{user.chat_id}`
+👤 User: {user.get('username') or 'Anonymous'}
+🆔 Chat ID: `{user['chat_id']}`
 
 📊 *Stats:*
-✅ Tasks Completed: {user.total_tasks_completed}
-❌ Tasks Failed: {user.total_tasks_failed}
-🔥 Current Streak: {user.current_streak}
-🏆 Longest Streak: {user.longest_streak}
-💰 Harley Dollars: {user.harley_points}
+✅ Tasks Completed: {user['total_tasks_completed']}
+❌ Tasks Failed: {user['total_tasks_failed']}
+🔥 Current Streak: {user['current_streak']}
+🏆 Longest Streak: {user['longest_streak']}
+💰 Harley Dollars: {user['harley_points']}
 
 {current_task_text}
 Keep being a good pet! Hee hee!"""
@@ -755,31 +842,26 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show task history"""
     chat_id = update.effective_chat.id
     
-    session = Session()
-    try:
-        history = session.query(TaskHistory).filter_by(chat_id=str(chat_id))\
-            .order_by(TaskHistory.assigned_at.desc()).limit(10).all()
-        
-        if not history:
-            await update.message.reply_text(
-                "🤷 *No history yet!* 🤷\n\n"
-                "You haven't completed any tasks for me!\n"
-                "What are you waiting for? Use /task!",
-                parse_mode='Markdown'
-            )
-            return
-        
-        msg = "📜 *YOUR HARLEY HISTORY* 📜\n\n"
-        for i, h in enumerate(history, 1):
-            status_emoji = "✅" if h.status == 'completed' else "❌" if h.status == 'failed' else "⏰"
-            msg += f"{i}. {status_emoji} {h.task_description[:50]}...\n"
-            if h.harley_feedback:
-                msg += f"   💬 {h.harley_feedback[:50]}...\n"
-            msg += "\n"
-        
-        await update.message.reply_text(msg, parse_mode='Markdown')
-    finally:
-        session.close()
+    history = get_task_history(chat_id, limit=10)
+    
+    if not history:
+        await update.message.reply_text(
+            "🤷 *No history yet!* 🤷\n\n"
+            "You haven't completed any tasks for me!\n"
+            "What are you waiting for? Use /task!",
+            parse_mode='Markdown'
+        )
+        return
+    
+    msg = "📜 *YOUR HARLEY HISTORY* 📜\n\n"
+    for i, h in enumerate(history, 1):
+        status_emoji = "✅" if h['status'] == 'completed' else "❌" if h['status'] == 'failed' else "⏰"
+        msg += f"{i}. {status_emoji} {h['task_description'][:50]}...\n"
+        if h['harley_feedback']:
+            msg += f"   💬 {h['harley_feedback'][:50]}...\n"
+        msg += "\n"
+    
+    await update.message.reply_text(msg, parse_mode='Markdown')
 
 async def resetowner_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Reset all data for handoff"""
@@ -811,15 +893,7 @@ async def confirm_reset_callback(update: Update, context: ContextTypes.DEFAULT_T
     
     chat_id = update.effective_chat.id
     
-    session = Session()
-    try:
-        # Delete all user data
-        session.query(UserProfile).filter_by(chat_id=str(chat_id)).delete()
-        session.query(TaskHistory).filter_by(chat_id=str(chat_id)).delete()
-        session.query(ConversationLog).filter_by(chat_id=str(chat_id)).delete()
-        session.commit()
-    finally:
-        session.close()
+    delete_all_user_data(chat_id)
     
     await query.edit_message_text(
         "💥 *BOOM! ALL GONE!* 💥\n\n"
