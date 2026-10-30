@@ -49,12 +49,29 @@ IMAGE_FALLBACKS = [m.strip() for m in os.getenv("IMAGE_FALLBACKS", "nano-banana-
 IMAGE_FORMAT = os.getenv("IMAGE_FORMAT", "png").strip()
 IMAGE_UPSCALE = os.getenv("IMAGE_UPSCALE", "off").strip()
 IMAGE_ASPECT = os.getenv("IMAGE_ASPECT", "3:4").strip()
+IMAGE_RESOLUTION = os.getenv("IMAGE_RESOLUTION", "2K").strip()
 IMAGE_SHARPEN = os.getenv("IMAGE_SHARPEN", "1").strip()
-IMAGE_STEPS = os.getenv("IMAGE_STEPS", "10").strip()
+IMAGE_STEPS = os.getenv("IMAGE_STEPS", "30").strip()
 IMAGE_CFG = os.getenv("IMAGE_CFG", "5").strip()
 IMAGE_MAX_SIDE = os.getenv("IMAGE_MAX_SIDE", "1280").strip()
 MODEL_SPEC = {}
 MODEL_SPECS = {}
+
+# Used when the live spec is empty, so a failed /models fetch cannot cripple the payload.
+KNOWN_MODELS = {
+    "grok-imagine-image-quality": {
+        "mode": "ratio",
+        "ratios": ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "2:1", "1:2"],
+        "res": ["1K", "2K"],
+    },
+    "nano-banana-pro": {
+        "mode": "ratio",
+        "ratios": ["1:1", "4:3", "3:4", "16:9", "9:16", "3:2", "2:3"],
+        "res": ["1K", "2K"],
+    },
+    "chroma": {"mode": "pixels", "max_w": 1280, "max_h": 1280, "steps_max": 10},
+    "z-image-turbo": {"mode": "pixels", "max_w": 1280, "max_h": 1280},
+}
 
 SHARP_TAIL = "sharp focus, natural skin texture, directional studio light, 85mm"
 NEGATIVE_PROMPT = "blurry, soft focus, bokeh, plastic skin, extra fingers, fused fingers"
@@ -273,6 +290,8 @@ def normalize_for_telegram(image_bytes, max_side=1280, sharpen=True):
         return None
     try:
         logger.info(f"Decoded image size: {img.size}")
+        if min(img.size) < 400:
+            logger.warning(f"UNDERSIZED RENDER: {img.size} - model returned a thumbnail")
         img = img.convert("RGB")
         img.thumbnail((max_side, max_side), Image.LANCZOS)
         if sharpen:
@@ -834,7 +853,7 @@ def load_model_spec():
         targets.append(IMAGE_MODEL_REWARD)
     for m in targets:
         spec = get_spec(m)
-        logger.info(f"BOOT SPEC {m}: {json.dumps(spec) if spec else 'EMPTY'}")
+        logger.info(f"BOOT SPEC {m}: {json.dumps(spec) if spec else 'EMPTY (using KNOWN_MODELS)'}")
 
 def build_prompt(raw_prompt):
     """Strip soft-vocabulary, then append the sharpness tail. Single entry point."""
@@ -843,29 +862,30 @@ def build_prompt(raw_prompt):
     return f"{cleaned}, {SHARP_TAIL}"
 
 def _payload(prompt, model, negative=None):
-    """Only send the fields this model declares. Guessing produces black frames and mush."""
+    """Use live constraints when present, KNOWN_MODELS when the spec fetch failed."""
     c = (get_spec(model).get('constraints') or {})
+    known = KNOWN_MODELS.get(model, {})
+    ratio_mode = bool(c.get('aspectRatios')) or (not c and known.get('mode') == "ratio")
     data = {"model": model, "prompt": prompt, "format": IMAGE_FORMAT}
     if negative:
         data["negative_prompt"] = negative
-    ratios = c.get('aspectRatios') or []
-    if ratios:
-        data["aspect_ratio"] = IMAGE_ASPECT if IMAGE_ASPECT in ratios else c.get("defaultAspectRatio", ratios[0])
-        res = c.get('resolutions') or []
-        if res:
-            data["resolution"] = "2K" if "2K" in res else (c.get("defaultResolution") if c.get("defaultResolution") in res else res[-1])
+    if ratio_mode:
+        ratios = c.get('aspectRatios') or known.get("ratios") or ["3:4"]
+        data["aspect_ratio"] = IMAGE_ASPECT if IMAGE_ASPECT in ratios else ratios[0]
+        res = c.get('resolutions') or known.get("res") or ["1K", "2K"]
+        data["resolution"] = IMAGE_RESOLUTION if IMAGE_RESOLUTION in res else res[-1]
     else:
         div = max(1, int(c.get('widthHeightDivisor') or 8))
-        max_w = int(c.get('maxWidth') or 1280)
-        max_h = int(c.get('maxHeight') or 1280)
+        max_w = int(c.get('maxWidth') or known.get("max_w") or 1280)
+        max_h = int(c.get('maxHeight') or known.get("max_h") or 1280)
         w = min(int(os.getenv("IMAGE_WIDTH", "960")), max_w)
         h = min(int(os.getenv("IMAGE_HEIGHT", "1280")), max_h)
         data["width"] = max(div, (w // div) * div)
         data["height"] = max(div, (h // div) * div)
-        if c.get('steps'):
-            data["steps"] = min(int(IMAGE_STEPS), int((c.get('steps') or {}).get('max') or 10))
-        if c.get('cfgScale') or c.get('cfg_scale'):
-            data["cfg_scale"] = float(IMAGE_CFG)
+        step_spec = c.get('steps') or {}
+        max_steps = int(step_spec.get('max') or known.get("steps_max") or 30)
+        data["steps"] = min(int(IMAGE_STEPS), max_steps)
+        data["cfg_scale"] = float(IMAGE_CFG)
     return data
 
 def _prune_payload(data, body):
@@ -983,7 +1003,8 @@ async def _build_and_send(user, prompt, user_id=None, negative=None, chain=None)
     if user_id:
         await asyncio.to_thread(dump_debug, raw, user_id, "raw")
     raw = await _upscale(raw)
-    normalized = await asyncio.to_thread(normalize_for_telegram, raw, int(IMAGE_MAX_SIDE), IMAGE_SHARPEN == "1")
+    cap = min(int(IMAGE_MAX_SIDE), 1280)
+    normalized = await asyncio.to_thread(normalize_for_telegram, raw, cap, IMAGE_SHARPEN == "1")
     if normalized and user_id:
         await asyncio.to_thread(dump_debug, normalized, user_id, "norm")
         logger.info(f"Normalized {len(raw)}b -> {len(normalized)}b")
@@ -1035,7 +1056,7 @@ async def send_avatar_photo(context, chat_id, image_bytes, caption):
     return False
 
 async def _debug_send(context, user_id, label, prompt, negative, chain=None):
-    """Send raw and normalized variants as documents so Telegram's re-encode is bypassed."""
+    """Raw and normalized as documents, then normalized again as a photo for like-for-like."""
     raw = await _request_image(prompt, negative, chain)
     if not raw:
         await context.bot.send_message(chat_id=user_id, text=f"{label}: no image returned - check the log.")
@@ -1047,17 +1068,22 @@ async def _debug_send(context, user_id, label, prompt, negative, chain=None):
         )
     except Exception as e:
         await context.bot.send_message(chat_id=user_id, text=f"{label}: could not send raw - {e}")
-    norm = await asyncio.to_thread(normalize_for_telegram, raw, int(IMAGE_MAX_SIDE), IMAGE_SHARPEN == "1")
+    cap = min(int(IMAGE_MAX_SIDE), 1280)
+    norm = await asyncio.to_thread(normalize_for_telegram, raw, cap, IMAGE_SHARPEN == "1")
     if not norm:
         await context.bot.send_message(chat_id=user_id, text=f"{label}: normalize returned None")
         return
     try:
         await context.bot.send_document(
             chat_id=user_id, document=BytesIO(norm), filename=f"{label.lower()}_norm.jpg",
-            caption=f"{label} NORM | {len(norm)}b | cap {IMAGE_MAX_SIDE}px"
+            caption=f"{label} NORM | {len(norm)}b | cap {cap}px"
         )
     except Exception as e:
         await context.bot.send_message(chat_id=user_id, text=f"{label}: could not send normalized - {e}")
+    try:
+        await context.bot.send_photo(chat_id=user_id, photo=BytesIO(norm), caption=f"{label} NORM as photo")
+    except Exception as e:
+        await context.bot.send_message(chat_id=user_id, text=f"{label}: could not send photo - {e}")
 
 # ============ CUSTOM INPUT DISPATCHER ============
 async def custom_input_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1179,13 +1205,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         session.close()
 
+async def payload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Exactly what would be sent, without spending a generation."""
+    task_payload = json.dumps({k: v for k, v in _payload('x', IMAGE_MODEL).items() if k != 'prompt'})
+    reward_model = IMAGE_MODEL_REWARD or IMAGE_MODEL
+    reward_payload = json.dumps({k: v for k, v in _payload('x', reward_model).items() if k != 'prompt'})
+    await update.message.reply_text(
+        f"TASK {IMAGE_MODEL}\n{task_payload}\n\n"
+        f"REWARD {reward_model}\n{reward_payload}\n\n"
+        f"task spec: {json.dumps(MODEL_SPECS.get(IMAGE_MODEL, {})) or 'EMPTY'}\n"
+        f"reward spec: {json.dumps(MODEL_SPECS.get(reward_model, {})) or 'EMPTY'}"
+    )
+
 async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     session = get_session()
     try:
         user = session.query(UserState).filter_by(user_id=user_id).first()
         if user:
-            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_MODEL} | probes: {PROBE_MODELS}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE} | aspect: {IMAGE_ASPECT} | sharpen: {IMAGE_SHARPEN} | max_side: {IMAGE_MAX_SIDE} | steps: {IMAGE_STEPS} | cfg: {IMAGE_CFG}\nspec: {json.dumps(MODEL_SPEC) or 'EMPTY'}\nreward spec: {json.dumps(MODEL_SPECS.get(IMAGE_MODEL_REWARD, {})) or 'EMPTY'}\n\nTry saying 'hi' to test conversation!")
+            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_MODEL}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE} | aspect: {IMAGE_ASPECT} | res: {IMAGE_RESOLUTION} | sharpen: {IMAGE_SHARPEN} | max_side: {IMAGE_MAX_SIDE} | steps: {IMAGE_STEPS} | cfg: {IMAGE_CFG}\n\n/payload for the exact JSON")
         else:
             await update.message.reply_text("No user record found")
     finally:
@@ -2001,7 +2039,7 @@ async def avatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session.close()
 
 async def debugavatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Paired task and reward shot, raw and normalized, as documents."""
+    """Paired task and reward shot, raw and normalized, as documents plus a photo."""
     user_id = update.effective_user.id
     session = get_session()
     try:
@@ -2011,7 +2049,7 @@ async def debugavatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session.close()
     await update.message.reply_text(
         f"Debug pair - task then reward. Task model {IMAGE_MODEL}, reward model {IMAGE_MODEL_REWARD or 'same'}, "
-        f"variant {variant['label']}, cap {IMAGE_MAX_SIDE}px, cfg {IMAGE_CFG}."
+        f"variant {variant['label']}, cap {min(int(IMAGE_MAX_SIDE), 1280)}px, cfg {IMAGE_CFG}, steps {IMAGE_STEPS}."
     )
     dom = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
            f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
@@ -2149,7 +2187,7 @@ def main():
     logger.info("BOT STARTING")
     logger.info(f"Text: {TEXT_MODEL} | Vision: {VISION_MODEL} | Probes: {PROBE_MODELS}")
     logger.info(f"Task model: {IMAGE_MODEL} | Reward model: {IMAGE_MODEL_REWARD or 'same'} | fallbacks: {IMAGE_FALLBACKS}")
-    logger.info(f"Format: {IMAGE_FORMAT} | Upscale: {IMAGE_UPSCALE} | Aspect: {IMAGE_ASPECT} | Sharpen: {IMAGE_SHARPEN} | MaxSide: {IMAGE_MAX_SIDE} | Steps: {IMAGE_STEPS} | CFG: {IMAGE_CFG}")
+    logger.info(f"Format: {IMAGE_FORMAT} | Upscale: {IMAGE_UPSCALE} | Aspect: {IMAGE_ASPECT} | Res: {IMAGE_RESOLUTION} | Sharpen: {IMAGE_SHARPEN} | MaxSide: {IMAGE_MAX_SIDE} | Steps: {IMAGE_STEPS} | CFG: {IMAGE_CFG}")
     logger.info(f"Venue presets: {len(VENUE_BASELINE)}")
     logger.info(f"Cloudinary configured: {bool(os.getenv('CLOUDINARY_CLOUD_NAME'))} / {bool(os.getenv('CLOUDINARY_API_KEY'))} / {bool(os.getenv('CLOUDINARY_API_SECRET'))}")
     logger.info("=" * 60)
@@ -2160,6 +2198,7 @@ def main():
         job_kwargs={"misfire_grace_time": 180, "coalesce": True, "max_instances": 1}
     )
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("payload", payload_cmd))
     application.add_handler(CommandHandler("test", test_cmd))
     application.add_handler(CommandHandler("skip", skip_cmd))
     application.add_handler(CommandHandler("debugavatar", debugavatar_cmd))
