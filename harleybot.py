@@ -823,16 +823,18 @@ def get_spec(model):
     except Exception as e:
         logger.warning(f"Model spec error for {model}: {e}")
     MODEL_SPECS[model] = spec
-    logger.info(f"Spec {model}: {json.dumps(spec)[:400]}")
     if model == IMAGE_MODEL:
         MODEL_SPEC.clear()
         MODEL_SPEC.update(spec)
     return spec
 
 def load_model_spec():
-    get_spec(IMAGE_MODEL)
+    targets = [IMAGE_MODEL]
     if IMAGE_MODEL_REWARD and IMAGE_MODEL_REWARD != IMAGE_MODEL:
-        get_spec(IMAGE_MODEL_REWARD)
+        targets.append(IMAGE_MODEL_REWARD)
+    for m in targets:
+        spec = get_spec(m)
+        logger.info(f"BOOT SPEC {m}: {json.dumps(spec) if spec else 'EMPTY'}")
 
 def build_prompt(raw_prompt):
     """Strip soft-vocabulary, then append the sharpness tail. Single entry point."""
@@ -841,13 +843,11 @@ def build_prompt(raw_prompt):
     return f"{cleaned}, {SHARP_TAIL}"
 
 def _payload(prompt, model, negative=None):
-    data = {
-        "model": model,
-        "prompt": prompt,
-        "format": IMAGE_FORMAT,
-        "negative_prompt": negative or NEGATIVE_PROMPT,
-    }
+    """Only send the fields this model declares. Guessing produces black frames and mush."""
     c = (get_spec(model).get('constraints') or {})
+    data = {"model": model, "prompt": prompt, "format": IMAGE_FORMAT}
+    if negative:
+        data["negative_prompt"] = negative
     ratios = c.get('aspectRatios') or []
     if ratios:
         data["aspect_ratio"] = IMAGE_ASPECT if IMAGE_ASPECT in ratios else c.get("defaultAspectRatio", ratios[0])
@@ -862,10 +862,10 @@ def _payload(prompt, model, negative=None):
         h = min(int(os.getenv("IMAGE_HEIGHT", "1280")), max_h)
         data["width"] = max(div, (w // div) * div)
         data["height"] = max(div, (h // div) * div)
-        step_spec = c.get('steps') or {}
-        max_steps = int(step_spec.get('max') or 10)
-        data["steps"] = min(int(IMAGE_STEPS), max_steps)
-        data["cfg_scale"] = float(IMAGE_CFG)
+        if c.get('steps'):
+            data["steps"] = min(int(IMAGE_STEPS), int((c.get('steps') or {}).get('max') or 10))
+        if c.get('cfgScale') or c.get('cfg_scale'):
+            data["cfg_scale"] = float(IMAGE_CFG)
     return data
 
 def _prune_payload(data, body):
@@ -1185,7 +1185,7 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user = session.query(UserState).filter_by(user_id=user_id).first()
         if user:
-            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_MODEL} | probes: {PROBE_MODELS}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE} | aspect: {IMAGE_ASPECT} | sharpen: {IMAGE_SHARPEN} | max_side: {IMAGE_MAX_SIDE} | steps: {IMAGE_STEPS} | cfg: {IMAGE_CFG}\nspec: {json.dumps(MODEL_SPEC)[:400]}\n\nTry saying 'hi' to test conversation!")
+            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_MODEL} | probes: {PROBE_MODELS}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE} | aspect: {IMAGE_ASPECT} | sharpen: {IMAGE_SHARPEN} | max_side: {IMAGE_MAX_SIDE} | steps: {IMAGE_STEPS} | cfg: {IMAGE_CFG}\nspec: {json.dumps(MODEL_SPEC) or 'EMPTY'}\nreward spec: {json.dumps(MODEL_SPECS.get(IMAGE_MODEL_REWARD, {})) or 'EMPTY'}\n\nTry saying 'hi' to test conversation!")
         else:
             await update.message.reply_text("No user record found")
     finally:
