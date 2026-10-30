@@ -44,10 +44,11 @@ VISION_MODEL = os.getenv("VISION_MODEL", "claude-opus-4-8-fast").strip()
 PROBE_MODELS = [m.strip() for m in os.getenv("PROBE_MODELS", "openai-gpt-oss-120b,gemma-4-31b-it,mistral-small-3-2-24b-instruct").split(",") if m.strip()]
 # Tasks: sharp, R-rated. Rewards: explicit, softer. Grok hides genitals, chroma doesn't.
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "grok-imagine-image-quality").strip()
-IMAGE_MODEL_REWARD = os.getenv("IMAGE_MODEL_REWARD", "chroma").strip()
+IMAGE_MODEL_REWARD = os.getenv("IMAGE_MODEL_REWARD", "grok-imagine-image-2-0").strip()
 IMAGE_FALLBACKS = [m.strip() for m in os.getenv("IMAGE_FALLBACKS", "nano-banana-pro").split(",") if m.strip()]
 IMAGE_FORMAT = os.getenv("IMAGE_FORMAT", "png").strip()
-IMAGE_UPSCALE = os.getenv("IMAGE_UPSCALE", "off").strip()
+IMAGE_UPSCALE = os.getenv("IMAGE_UPSCALE", "2").strip()
+IMAGE_UPSCALE_CREATIVITY = os.getenv("IMAGE_UPSCALE_CREATIVITY", "0.4").strip()
 IMAGE_ASPECT = os.getenv("IMAGE_ASPECT", "3:4").strip()
 IMAGE_RESOLUTION = os.getenv("IMAGE_RESOLUTION", "2K").strip()
 IMAGE_SHARPEN = os.getenv("IMAGE_SHARPEN", "1").strip()
@@ -60,6 +61,11 @@ MODEL_SPECS = {}
 # Used when the live spec is empty, so a failed /models fetch cannot cripple the payload.
 KNOWN_MODELS = {
     "grok-imagine-image-quality": {
+        "mode": "ratio",
+        "ratios": ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "2:1", "1:2"],
+        "res": ["1K", "2K"],
+    },
+    "grok-imagine-image-2-0": {
         "mode": "ratio",
         "ratios": ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "2:1", "1:2"],
         "res": ["1K", "2K"],
@@ -291,6 +297,18 @@ def image_size(image_bytes):
     except Exception:
         return (0, 0)
 
+def check_render(size, data):
+    """Compare the returned render against what was asked for. Catches silent upscaling."""
+    w, h = size
+    req_w, req_h = data.get("width"), data.get("height")
+    if req_w and req_h:
+        if w > req_w * 1.2 or h > req_h * 1.2:
+            logger.warning(f"UPSCALED RENDER: asked {req_w}x{req_h}, got {w}x{h}")
+        elif w < req_w * 0.8 or h < req_h * 0.8:
+            logger.warning(f"UNDERSIZED RENDER: asked {req_w}x{req_h}, got {w}x{h}")
+    elif data.get("resolution") == "2K" and max(w, h) < 1500:
+        logger.warning(f"UNDERSIZED 2K RENDER: {w}x{h}")
+
 def normalize_for_telegram(image_bytes, max_side=1280, sharpen=True):
     """Decode any image format, cap the long edge, sharpen, re-encode as baseline JPEG."""
     try:
@@ -302,9 +320,7 @@ def normalize_for_telegram(image_bytes, max_side=1280, sharpen=True):
     try:
         logger.info(f"Decoded image size: {img.size}")
         if min(img.size) < 400:
-            logger.warning(f"UNDERSIZED RENDER: {img.size} - model returned a thumbnail")
-        if max(img.size) > 1280:
-            logger.warning(f"OVER-CAP RENDER: {img.size} - server upscaled, pixels are interpolated")
+            logger.warning(f"THUMBNAIL RENDER: {img.size} - model returned something tiny")
         img = img.convert("RGB")
         img.thumbnail((max_side, max_side), Image.LANCZOS)
         if sharpen:
@@ -994,6 +1010,7 @@ async def _request_image(prompt, negative=None, chain=None):
                     logger.error(f"No image data from {model}: {str(result)[:300]}")
                     break
                 logger.info(f"Raw image from {model}: {len(raw)} bytes, header {raw[:12]!r}")
+                await asyncio.to_thread(check_render, image_size(raw), data)
                 if model != chain[0]:
                     logger.warning(f"FALLBACK SERVED: {model} (primary {chain[0]} failed)")
                 return raw
@@ -1006,14 +1023,14 @@ async def _request_image(prompt, negative=None, chain=None):
     return None
 
 async def _upscale(raw):
-    """Add real detail server-side before any Pillow work. Falls back to the raw bytes."""
+    """Redraw detail server-side before any Pillow work. Falls back to the raw bytes."""
     if IMAGE_UPSCALE in ("off", "0", ""):
         return raw
     try:
         payload = {
             "image": base64.b64encode(raw).decode("utf-8"),
             "scale": int(IMAGE_UPSCALE),
-            "creativity": float(os.getenv("IMAGE_UPSCALE_CREATIVITY", "0.18")),
+            "creativity": float(IMAGE_UPSCALE_CREATIVITY),
         }
         r = await asyncio.to_thread(
             requests.post, VENICE_UPSCALE_URL,
@@ -1030,13 +1047,14 @@ async def _upscale(raw):
         logger.warning(f"Upscale error, keeping raw: {e}")
         return raw
 
-async def _build_and_send(user, prompt, user_id=None, negative=None, chain=None):
+async def _build_and_send(user, prompt, user_id=None, negative=None, chain=None, upscale=True):
     raw = await _request_image(prompt, negative, chain)
     if not raw:
         return None
     if user_id:
         await asyncio.to_thread(dump_debug, raw, user_id, "raw")
-    raw = await _upscale(raw)
+    if upscale:
+        raw = await _upscale(raw)
     cap = min(int(IMAGE_MAX_SIDE), 1280)
     normalized = await asyncio.to_thread(normalize_for_telegram, raw, cap, IMAGE_SHARPEN == "1")
     if normalized and user_id:
@@ -1050,11 +1068,11 @@ async def generate_avatar_pose(user, pose_type="dominant"):
     try:
         variant = harley_variant(user)
         if pose_type == "reward":
-            return await _build_and_send(user, reward_prompt(variant), user.user_id, reward_negative(variant), reward_chain())
+            return await _build_and_send(user, reward_prompt(variant), user.user_id, reward_negative(variant), reward_chain(), upscale=True)
         prompt = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
                   f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
                   f"framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}")
-        return await _build_and_send(user, prompt, user.user_id, NEGATIVE_PROMPT_SEXY + (variant.get("clothed_negative") or ""))
+        return await _build_and_send(user, prompt, user.user_id, NEGATIVE_PROMPT_SEXY + (variant.get("clothed_negative") or ""), upscale=False)
     except Exception as e:
         logger.error(f"Avatar error: {e}")
         import traceback
@@ -1064,7 +1082,7 @@ async def generate_avatar_pose(user, pose_type="dominant"):
 async def deliver_reward(context, user, wish=None, session=None):
     user_id = user.user_id
     variant = harley_variant(user)
-    image_bytes = await _build_and_send(user, reward_prompt(variant, wish), user_id, reward_negative(variant), reward_chain())
+    image_bytes = await _build_and_send(user, reward_prompt(variant, wish), user_id, reward_negative(variant), reward_chain(), upscale=True)
     if not image_bytes:
         await context.bot.send_message(chat_id=user_id, text="Couldn't get it out of the camera. Try /avatar.")
         return
@@ -1087,7 +1105,7 @@ async def send_avatar_photo(context, chat_id, image_bytes, caption):
         logger.error(f"Send photo error: {e}")
     return False
 
-async def _debug_send(context, user_id, label, prompt, negative, chain=None):
+async def _debug_send(context, user_id, label, prompt, negative, chain=None, upscale=False):
     """Raw and normalized as documents, then normalized again as a photo for like-for-like."""
     raw = await _request_image(prompt, negative, chain)
     if not raw:
@@ -1101,6 +1119,8 @@ async def _debug_send(context, user_id, label, prompt, negative, chain=None):
         )
     except Exception as e:
         await context.bot.send_message(chat_id=user_id, text=f"{label}: could not send raw - {e}")
+    if upscale:
+        raw = await _upscale(raw)
     cap = min(int(IMAGE_MAX_SIDE), 1280)
     norm = await asyncio.to_thread(normalize_for_telegram, raw, cap, IMAGE_SHARPEN == "1")
     if not norm:
@@ -1256,7 +1276,7 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user = session.query(UserState).filter_by(user_id=user_id).first()
         if user:
-            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_MODEL}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE} | aspect: {IMAGE_ASPECT} | res: {IMAGE_RESOLUTION} | sharpen: {IMAGE_SHARPEN} | max_side: {IMAGE_MAX_SIDE} | steps: {IMAGE_STEPS} | cfg: {IMAGE_CFG}\n\n/payload for the exact JSON")
+            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_MODEL}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY} | aspect: {IMAGE_ASPECT} | res: {IMAGE_RESOLUTION} | sharpen: {IMAGE_SHARPEN} | max_side: {IMAGE_MAX_SIDE} | steps: {IMAGE_STEPS} | cfg: {IMAGE_CFG}\n\n/payload for the exact JSON")
         else:
             await update.message.reply_text("No user record found")
     finally:
@@ -2082,14 +2102,15 @@ async def debugavatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session.close()
     await update.message.reply_text(
         f"Debug pair - task then reward. Task model {IMAGE_MODEL}, reward model {IMAGE_MODEL_REWARD or 'same'}, "
-        f"variant {variant['label']}, cap {min(int(IMAGE_MAX_SIDE), 1280)}px, cfg {IMAGE_CFG}, steps {IMAGE_STEPS}."
+        f"variant {variant['label']}, cap {min(int(IMAGE_MAX_SIDE), 1280)}px, cfg {IMAGE_CFG}, steps {IMAGE_STEPS}, "
+        f"upscale {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY}."
     )
     dom = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
            f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
            f"framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}")
-    await _debug_send(context, user_id, "TASK", dom, NEGATIVE_PROMPT_SEXY + (variant.get("clothed_negative") or ""))
+    await _debug_send(context, user_id, "TASK", dom, NEGATIVE_PROMPT_SEXY + (variant.get("clothed_negative") or ""), upscale=False)
     await asyncio.sleep(2)
-    await _debug_send(context, user_id, "REWARD", reward_prompt(variant), reward_negative(variant), reward_chain())
+    await _debug_send(context, user_id, "REWARD", reward_prompt(variant), reward_negative(variant), reward_chain(), upscale=True)
 
 async def testreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Force a reward shot without completing anything. Optional wish text after the command."""
@@ -2102,9 +2123,9 @@ async def testreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session.close()
     wish = " ".join(context.args).strip()[:120] if context.args else None
     await update.message.reply_text(f"Reward test - {wish or 'surprise'}...")
-    await _debug_send(context, user_id, "REWARD", reward_prompt(variant, wish), reward_negative(variant), reward_chain())
+    await _debug_send(context, user_id, "REWARD", reward_prompt(variant, wish), reward_negative(variant), reward_chain(), upscale=True)
 
-MODEL_CHOICES = ["grok-imagine-image-quality", "chroma", "z-image-turbo", "nano-banana-pro"]
+MODEL_CHOICES = ["grok-imagine-image-quality", "grok-imagine-image-2-0", "chroma", "z-image-turbo", "nano-banana-pro"]
 
 async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton(m, callback_data=f"setmodel_{m}")] for m in MODEL_CHOICES]
@@ -2120,6 +2141,24 @@ async def setmodel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     IMAGE_MODEL = m
     await asyncio.to_thread(get_spec, m)
     await query.edit_message_text(f"Task model: {m}. /debugavatar to test.\n\ngrok = sharpest, R-rated, hides genitals. chroma = explicit but soft. z-image = fast. nano-banana = sharp, rejects explicit.")
+
+async def rewardmodel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [[InlineKeyboardButton(m, callback_data=f"setreward_{m}")] for m in MODEL_CHOICES]
+    keyboard.append([InlineKeyboardButton("same as task", callback_data="setreward_same")])
+    await update.message.reply_text(
+        f"Reward model: {IMAGE_MODEL_REWARD or 'same'}\n\nPick one, then /testreward.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+async def setreward_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global IMAGE_MODEL_REWARD
+    query = update.callback_query
+    await query.answer()
+    m = query.data.replace("setreward_", "")
+    IMAGE_MODEL_REWARD = "" if m == "same" else m
+    if IMAGE_MODEL_REWARD:
+        await asyncio.to_thread(get_spec, IMAGE_MODEL_REWARD)
+    await query.edit_message_text(f"Reward model: {IMAGE_MODEL_REWARD or 'same'}. /testreward to check.")
 
 # ============ SCHEDULER ============
 async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2218,7 +2257,7 @@ def main():
     logger.info("BOT STARTING")
     logger.info(f"Text: {TEXT_MODEL} | Vision: {VISION_MODEL} | Probes: {PROBE_MODELS}")
     logger.info(f"Task model: {IMAGE_MODEL} | Reward model: {IMAGE_MODEL_REWARD or 'same'} | fallbacks: {IMAGE_FALLBACKS}")
-    logger.info(f"Format: {IMAGE_FORMAT} | Upscale: {IMAGE_UPSCALE} | Aspect: {IMAGE_ASPECT} | Res: {IMAGE_RESOLUTION} | Sharpen: {IMAGE_SHARPEN} | MaxSide: {IMAGE_MAX_SIDE} | Steps: {IMAGE_STEPS} | CFG: {IMAGE_CFG}")
+    logger.info(f"Format: {IMAGE_FORMAT} | Upscale: {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY} | Aspect: {IMAGE_ASPECT} | Res: {IMAGE_RESOLUTION} | Sharpen: {IMAGE_SHARPEN} | MaxSide: {IMAGE_MAX_SIDE} | Steps: {IMAGE_STEPS} | CFG: {IMAGE_CFG}")
     logger.info(f"Native caps: {NATIVE_CAPS}")
     logger.info(f"Venue presets: {len(VENUE_BASELINE)}")
     logger.info(f"Cloudinary configured: {bool(os.getenv('CLOUDINARY_CLOUD_NAME'))} / {bool(os.getenv('CLOUDINARY_API_KEY'))} / {bool(os.getenv('CLOUDINARY_API_SECRET'))}")
@@ -2236,6 +2275,7 @@ def main():
     application.add_handler(CommandHandler("debugavatar", debugavatar_cmd))
     application.add_handler(CommandHandler("testreward", testreward_cmd))
     application.add_handler(CommandHandler("model", model_cmd))
+    application.add_handler(CommandHandler("rewardmodel", rewardmodel_cmd))
     application.add_handler(CommandHandler("gender", gender_cmd))
     application.add_handler(CommandHandler("outfit", outfit_cmd))
     application.add_handler(CommandHandler("wherenow", wherenow_cmd))
@@ -2271,6 +2311,7 @@ def main():
     application.add_handler(CallbackQueryHandler(mercy_callback, pattern="^mercy_"))
     application.add_handler(CallbackQueryHandler(reward_surprise_callback, pattern="^reward_surprise$"))
     application.add_handler(CallbackQueryHandler(setmodel_callback, pattern="^setmodel_"))
+    application.add_handler(CallbackQueryHandler(setreward_callback, pattern="^setreward_"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_input_dispatcher))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.run_polling(
