@@ -3,7 +3,7 @@
 Harley Quinn Bot - Domme, chaotic, dangerously fun.
 Harley's voice comes from a local system prompt. No character_slug dependency.
 Fixed avatar with a penis/vagina toggle, real vision verification.
-Venue features are generated on the fly and cached per location.
+Venue features: static presets by default, AI extension when the API cooperates.
 """
 
 import os
@@ -41,7 +41,7 @@ VENICE_IMAGE_URL = "https://api.venice.ai/api/v1/image/generate"
 VENICE_UPSCALE_URL = "https://api.venice.ai/api/v1/image/upscale"
 TEXT_MODEL = os.getenv("TEXT_MODEL", "venice-uncensored-role-play").strip()
 VISION_MODEL = os.getenv("VISION_MODEL", "claude-opus-4-8-fast").strip()
-PROBE_MODEL = os.getenv("PROBE_MODEL", "openai-gpt-oss-120b").strip()
+PROBE_MODELS = [m.strip() for m in os.getenv("PROBE_MODELS", "openai-gpt-oss-120b,gemma-4-31b-it,mistral-small-3-2-24b-instruct").split(",") if m.strip()]
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "chroma").strip()
 IMAGE_MODEL_REWARD = os.getenv("IMAGE_MODEL_REWARD", "").strip()
 IMAGE_FALLBACKS = [m.strip() for m in os.getenv("IMAGE_FALLBACKS", "z-image-turbo,nano-banana-pro").split(",") if m.strip()]
@@ -330,33 +330,72 @@ def weighted_risk(max_risk=5):
     weights = [RISK_WEIGHTS[l] for l in levels]
     return random.choices(levels, weights=weights, k=1)[0]
 
-# Fallbacks only - live venue features are generated and cached in the row.
-LOCATION_PROBES = {
-    "Hotel": [("gym", "🏋️ Gym"), ("pool", "🏊 Pool"), ("sauna", "🧖 Sauna"), ("corridor", "🚪 Corridor"), ("elevator", "🛗 Lift"), ("lobby", "🛎️ Lobby"), ("balcony", "🌤️ Balcony"), ("bathtub", "🛁 Bathtub"), ("parking", "🅿️ Parking"), ("laundry", "🧺 Laundry room")],
-    "Home": [("garden", "🌳 Garden"), ("garage", "🚗 Garage"), ("balcony", "🌤️ Balcony"), ("shed", "🏚️ Shed"), ("bathroom", "🛁 Bathroom"), ("hallway", "🚪 Hallway"), ("laundry", "🧺 Laundry room"), ("stairs", "🪜 Stairs"), ("attic", "📦 Attic")],
-    "Bar": [("terrace", "🚬 Terrace"), ("toilets", "🚻 Toilets"), ("corridor", "🚪 Back corridor"), ("booth", "🪑 Booth"), ("counter", "🍸 Bar counter"), ("doorway", "🚪 Doorway"), ("coat", "🧥 Coat hooks")],
-    "Retail Store": [("dressing", "🚪 Changing room"), ("backroom", "📦 Stockroom"), ("bathroom", "🚻 Store bathroom"), ("parking", "🅿️ Parking lot"), ("alley", "🌑 Alley"), ("loading", "🚚 Loading dock")],
-    "Vehicle": [("empty_lot", "🅿️ Empty lot"), ("busy_lot", "🚗 Busy lot"), ("rest_stop", "🛑 Rest stop"), ("gas", "⛽ Petrol station"), ("backseat", "🪑 Back seat"), ("highway", "🛣️ Highway")],
-    "Work": [("office", "🚪 Private office"), ("stairwell", "🪜 Stairwell"), ("conference", "🪑 Empty meeting room"), ("bathroom", "🚻 Bathroom"), ("garage", "🅿️ Parking garage"), ("rooftop", "🏙️ Rooftop"), ("elevator", "🛗 Lift")],
-    "Generic": [("window", "🪟 Window"), ("doorway", "🚪 Doorway"), ("mirror", "🪞 Mirror"), ("bathroom", "🛁 Bathroom"), ("outside", "🌤️ Outside"), ("floor", "🧎 Floor")]
+VENUE_ALIASES = {
+    "Home": ["home", "house", "flat", "apartment", "bedroom", "living room", "kitchen"],
+    "Hotel": ["hotel", "motel", "hostel", "b&b", "airbnb"],
+    "Bar": ["bar", "pub", "tavern", "cocktail", "wine bar", "brewery", "nightclub"],
+    "Restaurant": ["restaurant", "diner", "bistro", "cafe", "café", "coffee shop", "brasserie"],
+    "Gym": ["gym", "fitness", "weights room"],
+    "Cinema": ["cinema", "movie", "theatre", "theater", "screening"],
+    "Supermarket": ["supermarket", "grocery", "shopping", "mall"],
+    "Park": ["park", "garden", "common", "woods", "forest"],
+    "Beach": ["beach", "shore", "seafront", "coast"],
+    "Train": ["train", "railway", "carriage", "platform"],
+    "Bus": ["bus", "coach"],
+    "Plane": ["plane", "aircraft", "flight"],
+    "Airport": ["airport", "terminal"],
+    "Library": ["library"],
+    "Museum": ["museum", "gallery"],
+    "Pool": ["pool", "swimming", "lido"],
+    "Sauna": ["sauna", "steam room"],
+    "Work": ["work", "office", "workplace", "cubicle"],
+    "Vehicle": ["car", "vehicle", "van", "motorhome"],
+    "Retail Store": ["shop", "retail", "boutique", "store"],
+    "Church": ["church", "cathedral", "chapel"],
+    "Doctor": ["doctor", "clinic", "dentist", "hospital", "waiting room"],
 }
+
+_ALIAS_ORDER = sorted(
+    ((a, k) for k, aliases in VENUE_ALIASES.items() for a in aliases),
+    key=lambda x: -len(x[0])
+)
 
 VENUE_BASELINE = {
     "Home": "kitchen counter and table, bathroom mirror and shower, bed, sofa, dining chairs, wardrobe mirror, hallway, stairs, windows",
     "Hotel": "bed, bathroom mirror, shower, bathtub, wardrobe, desk and chair, window, corridor, lift",
     "Bar": "bar counter and stools, high tables, corner booths, corridor to the toilets, fire door at the back, terrace or doorway, optics mirror behind the bar, coat hooks",
-    "Retail Store": "changing room, shop floor rails, mirror, stockroom, trolley, till counter, car park",
+    "Restaurant": "table and chairs, booth seating, cutlery and napkins, corridor to the toilets, cloakroom, bar area, doorway to the street, mirror by the coats",
+    "Gym": "changing room benches, lockers, shower cubicles, mirror wall, squat rack, treadmill, sauna door, water fountain",
+    "Cinema": "back row seating, aisle steps, screen glow, corridor to the toilets, foyer, poster wall, stairwell",
+    "Supermarket": "aisle shelving, changing room, toilets, loading bay, car park, trolley, freezer aisle",
+    "Park": "bench, tree trunk, hedges, bandstand, path, gate, bins, bushes",
+    "Beach": "dune grass, breakwater rocks, beach hut, lifeguard post, shoreline, promenade railings",
+    "Train": "carriage vestibule, fold-down table, window, luggage rack, toilet cubicle, platform bench",
+    "Bus": "back seat, window, handrail, upper deck, bus stop shelter",
+    "Plane": "window seat, tray table, cabin aisle, blanket, toilet cubicle",
+    "Airport": "gate seating, boarding desk, toilets, moving walkway, window over the apron",
+    "Library": "stack aisle, reading table, study carrel, returns trolley, window seat",
+    "Museum": "gallery bench, plinth, alcove, stairwell, cloakroom, roped-off corner",
+    "Pool": "changing cubicle, poolside lounger, lane ropes, showers, spectator bench",
+    "Sauna": "wooden bench, towel hook, glass door, water bucket",
+    "Work": "desk, office chair, meeting room table, stairwell, kitchen, photocopier, window, lift",
     "Vehicle": "driver seat, back seat, boot, wing mirror, dashboard, car park, roadside",
-    "Work": "desk, office chair, meeting room table, stairwell, kitchen, printer, window, lift",
-    "Generic": "door, mirror, window, chair, floor, wall, table",
+    "Retail Store": "changing room, shop floor rails, mirror, stockroom, trolley, till counter, car park",
+    "Church": "pew, side aisle, stone pillar, porch, font",
+    "Doctor": "waiting room chair, examination couch, curtain rail, sink, corridor",
+    "Generic": "door, doorway, mirror, window, chair, table, floor, wall, corridor, stairs, lift, bin, coat hooks, sink",
 }
 
 def get_probe_key(location):
     low = (location or "").lower()
-    for key in VENUE_BASELINE:
-        if key != "Generic" and key.lower() in low:
+    for alias, key in _ALIAS_ORDER:
+        if alias in low:
             return key
     return "Generic"
+
+def baseline_chips(location):
+    raw = VENUE_BASELINE.get(get_probe_key(location), VENUE_BASELINE["Generic"])
+    return [c.strip() for c in raw.split(",") if c.strip()]
 
 KINK_CATEGORIES = {
     "kink_exposure": ("📸 Exposure", "Being seen/photographed"),
@@ -474,6 +513,9 @@ def get_title(avatar_gender=None):
 def harley_variant(user):
     return HARLEY_VARIANTS.get(getattr(user, "harley_variant", None) or "vagina", HARLEY_VARIANTS["vagina"])
 
+def variant_phrase(variant):
+    return f", {variant['clothed']}" if variant["clothed"] else ""
+
 def probes_for(user):
     return json.loads(user.location_probes or '[]')
 
@@ -515,37 +557,50 @@ async def generate_ai_response(prompt, temperature=0.9):
         logger.error(f"AI error: {e}")
         return None
 
+def _parse_probe_lines(content):
+    out, seen = [], set()
+    for line in content.splitlines():
+        t = re.sub(r"^[\-\*\d\.\)]+\s*", "", line.strip()).strip(" .")
+        if not t or len(t) > 45:
+            continue
+        k = t.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(t)
+    return out
+
 async def generate_probes(location):
-    """Concrete physical features of a venue, for chips and for the task baseline."""
+    """Extra venue features. Empty list on failure - callers already have the static baseline."""
     prompt = (f"List 10 concrete physical features of a {location} that someone could use for "
               f"exposure or bondage play. Real, specific, mundane: \"the coat hooks\", "
               f"\"the mirror over the sink\", \"the wedge under the fire door\". "
               f"No abstractions. One per line, no numbering, no explanation.")
-    try:
-        raw = await asyncio.to_thread(
-            requests.post, f"{VENICE_API_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {VENICE_API_KEY}", "Content-Type": "application/json"},
-            json={"model": PROBE_MODEL, "messages": [{"role": "user", "content": prompt}],
-                  "temperature": 0.8, "max_tokens": 220},
-            timeout=25
-        )
-        if raw.status_code != 200:
-            logger.error(f"Probe gen error: {raw.status_code} - {raw.text[:150]}")
-            return []
-        out, seen = [], set()
-        for line in raw.json()['choices'][0]['message']['content'].splitlines():
-            t = re.sub(r"^[\-\*\d\.\)]+\s*", "", line.strip()).strip(" .")
-            if not t or len(t) > 40:
+    for model in PROBE_MODELS:
+        for attempt in range(2):
+            try:
+                raw = await asyncio.to_thread(
+                    requests.post, f"{VENICE_API_URL}/chat/completions",
+                    headers={"Authorization": f"Bearer {VENICE_API_KEY}", "Content-Type": "application/json"},
+                    json={"model": model, "messages": [{"role": "user", "content": prompt}],
+                          "temperature": 0.8, "max_tokens": 220},
+                    timeout=25
+                )
+            except Exception as e:
+                logger.warning(f"Probe gen {model} exception: {e}")
+                break
+            if raw.status_code == 429 and attempt == 0:
+                await asyncio.sleep(1.5)
                 continue
-            k = t.lower()
-            if k in seen:
-                continue
-            seen.add(k)
-            out.append(t)
-        return out[:10]
-    except Exception as e:
-        logger.error(f"Probe gen error: {e}")
-        return []
+            if raw.status_code != 200:
+                logger.warning(f"Probe gen {model}: {raw.status_code} - {raw.text[:120]}")
+                break
+            items = _parse_probe_lines(raw.json()['choices'][0]['message']['content'])
+            if len(items) >= 4:
+                return items[:10]
+            logger.warning(f"Probe gen {model} returned {len(items)} usable lines, trying next")
+            break
+    return []
 
 async def analyze_image(image_bytes, task_desc, followup_target=None):
     """Returns raw verifier text, or None on transport failure."""
@@ -919,9 +974,6 @@ async def _build_and_send(user, prompt, user_id=None, negative=None, chain=None)
         logger.error("Normalization returned None")
     return normalized
 
-def variant_phrase(variant):
-    return f", {variant['clothed']}" if variant["clothed"] else ""
-
 async def generate_avatar_pose(user, pose_type="dominant"):
     try:
         variant = harley_variant(user)
@@ -1105,7 +1157,7 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user = session.query(UserState).filter_by(user_id=user_id).first()
         if user:
-            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_MODEL} | probe: {PROBE_MODEL}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE} | aspect: {IMAGE_ASPECT} | sharpen: {IMAGE_SHARPEN} | steps: {IMAGE_STEPS} | cfg: {IMAGE_CFG}\nspec: {json.dumps(MODEL_SPEC)[:400]}\n\nTry saying 'hi' to test conversation!")
+            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_MODEL} | probes: {PROBE_MODELS}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE} | aspect: {IMAGE_ASPECT} | sharpen: {IMAGE_SHARPEN} | steps: {IMAGE_STEPS} | cfg: {IMAGE_CFG}\nspec: {json.dumps(MODEL_SPEC)[:400]}\n\nTry saying 'hi' to test conversation!")
         else:
             await update.message.reply_text("No user record found")
     finally:
@@ -1328,17 +1380,24 @@ async def privacy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user.context_privacy = privacy
         user.awaiting_location_detail = True
         location = user.custom_location or user.location or "room"
-        probes = probes_for(user)
-        if not probes:
-            await query.edit_message_text("Have a look round...")
-            probes = await generate_probes(location)
-            user.location_probes = json.dumps(probes)
+        probes = probes_for(user) or baseline_chips(location)
+        user.location_probes = json.dumps(probes)
         session.commit()
         await query.edit_message_text(
             f"Last thing - anything about {location} I should know?\n\n"
             f"What's within reach, how busy it is, anything you could grab. Tick what's there, or /skip.",
             reply_markup=probe_keyboard(probes, [])
         )
+        extra = await generate_probes(location)
+        if extra:
+            seen = {p.lower() for p in probes}
+            merged = probes + [p for p in extra if p.lower() not in seen]
+            user.location_probes = json.dumps(merged[:16])
+            session.commit()
+            try:
+                await query.edit_message_reply_markup(reply_markup=probe_keyboard(merged[:16], []))
+            except Exception as e:
+                logger.warning(f"Could not refresh probe keyboard: {e}")
     finally:
         session.close()
 
@@ -1362,7 +1421,8 @@ def probe_keyboard(probes, selected):
     keyboard = []
     for i, label in enumerate(probes):
         mark = "✅ " if label in selected else ""
-        keyboard.append([InlineKeyboardButton(f"{mark}{label}", callback_data=f"probe_{i}")])
+        short = label if len(label) <= 28 else label[:27].rstrip() + "…"
+        keyboard.append([InlineKeyboardButton(f"{mark}{short}", callback_data=f"probe_{i}")])
     keyboard.append([InlineKeyboardButton("✔️ That's all", callback_data="probe_done")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -2071,9 +2131,10 @@ async def reset_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     logger.info("=" * 60)
     logger.info("BOT STARTING")
-    logger.info(f"Text: {TEXT_MODEL} | Vision: {VISION_MODEL} | Probe: {PROBE_MODEL}")
+    logger.info(f"Text: {TEXT_MODEL} | Vision: {VISION_MODEL} | Probes: {PROBE_MODELS}")
     logger.info(f"Image model: {IMAGE_MODEL} | fallbacks: {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}")
     logger.info(f"Format: {IMAGE_FORMAT} | Upscale: {IMAGE_UPSCALE} | Aspect: {IMAGE_ASPECT} | Sharpen: {IMAGE_SHARPEN}")
+    logger.info(f"Venue presets: {len(VENUE_BASELINE)}")
     logger.info(f"Cloudinary configured: {bool(os.getenv('CLOUDINARY_CLOUD_NAME'))} / {bool(os.getenv('CLOUDINARY_API_KEY'))} / {bool(os.getenv('CLOUDINARY_API_SECRET'))}")
     logger.info("=" * 60)
     load_model_spec()
