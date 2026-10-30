@@ -47,8 +47,10 @@ IMAGE_MODEL = os.getenv("IMAGE_MODEL", "grok-imagine-image-quality").strip()
 IMAGE_MODEL_REWARD = os.getenv("IMAGE_MODEL_REWARD", "grok-imagine-image-2-0").strip()
 IMAGE_FALLBACKS = [m.strip() for m in os.getenv("IMAGE_FALLBACKS", "nano-banana-pro").split(",") if m.strip()]
 IMAGE_FORMAT = os.getenv("IMAGE_FORMAT", "png").strip()
-IMAGE_UPSCALE = os.getenv("IMAGE_UPSCALE", "2").strip()
-IMAGE_UPSCALE_CREATIVITY = os.getenv("IMAGE_UPSCALE_CREATIVITY", "0.4").strip()
+# Literal, not env - the Railway variable layer has proved unreliable and the upscaler
+# only ever existed for chroma. Re-enable by changing these two lines.
+IMAGE_UPSCALE = "off"
+IMAGE_UPSCALE_CREATIVITY = "0.2"
 IMAGE_ASPECT = os.getenv("IMAGE_ASPECT", "3:4").strip()
 IMAGE_RESOLUTION = os.getenv("IMAGE_RESOLUTION", "2K").strip()
 IMAGE_SHARPEN = os.getenv("IMAGE_SHARPEN", "1").strip()
