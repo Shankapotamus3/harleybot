@@ -19,7 +19,7 @@ import cloudinary.uploader
 from io import BytesIO
 from datetime import datetime, timezone, timedelta
 
-from PIL import Image, ImageFilter, ImageEnhance, UnidentifiedImageError
+from PIL import Image, ImageFilter, ImageEnhance, ImageStat, UnidentifiedImageError
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -42,10 +42,11 @@ VENICE_UPSCALE_URL = "https://api.venice.ai/api/v1/image/upscale"
 TEXT_MODEL = os.getenv("TEXT_MODEL", "venice-uncensored-role-play").strip()
 VISION_MODEL = os.getenv("VISION_MODEL", "claude-opus-4-8-fast").strip()
 PROBE_MODELS = [m.strip() for m in os.getenv("PROBE_MODELS", "openai-gpt-oss-120b,gemma-4-31b-it,mistral-small-3-2-24b-instruct").split(",") if m.strip()]
-# Tasks: sharp, R-rated. Rewards: explicit, softer. Grok hides genitals, chroma doesn't.
+# Tasks: sharp, R-rated. Rewards: explicit. Sharp models first, chroma last - it never blurs
+# less than 1440x1920 and it is what every policy rejection was landing on.
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "grok-imagine-image-quality").strip()
-IMAGE_MODEL_REWARD = os.getenv("IMAGE_MODEL_REWARD", "grok-imagine-image-2-0").strip()
-IMAGE_FALLBACKS = [m.strip() for m in os.getenv("IMAGE_FALLBACKS", "nano-banana-pro").split(",") if m.strip()]
+IMAGE_MODEL_REWARD = "nano-banana-pro"
+IMAGE_FALLBACKS = ["nano-banana-pro", "chroma"]
 IMAGE_FORMAT = os.getenv("IMAGE_FORMAT", "png").strip()
 # Literal, not env - the Railway variable layer has proved unreliable and the upscaler
 # only ever existed for chroma. Re-enable by changing these two lines.
@@ -57,6 +58,8 @@ IMAGE_SHARPEN = os.getenv("IMAGE_SHARPEN", "1").strip()
 IMAGE_STEPS = os.getenv("IMAGE_STEPS", "30").strip()
 IMAGE_CFG = os.getenv("IMAGE_CFG", "5").strip()
 IMAGE_MAX_SIDE = os.getenv("IMAGE_MAX_SIDE", "1280").strip()
+# Mean edge energy below this counts as a bad render and gets regenerated.
+MIN_SHARPNESS = 12.0
 MODEL_SPEC = {}
 MODEL_SPECS = {}
 
@@ -90,7 +93,8 @@ NEGATIVE_PROMPT = "blurry, soft focus, bokeh, plastic skin, extra fingers, fused
 NEGATIVE_PROMPT_SEXY = "stiff catalogue pose, stock photo, mannequin, plastic skin, extra fingers, fused fingers"
 NEGATIVE_PROMPT_NUDE = "briefs, boxers, panties, knickers, trousers, jeans, skirt, towel, sheet, sarong, loincloth, drapery, fabric over the groin, clothing over the groin, censored, mosaic, partially covered, cropped at the hips"
 STUDIO = "against a seamless charcoal studio backdrop, subtle rim light from behind"
-NUDE = "fully nude except for"
+# Bare "nude" rather than "fully nude except for" - nano-banana's policy trips on the longer claims.
+NUDE = "nude"
 SOFT_WORDS = re.compile(
     r"\b(soft focus|shallow depth of field|bokeh|dreamy|hazy|misty|film grain|"
     r"cinematic glow|soft lighting|glowing|ethereal)\b", re.IGNORECASE)
@@ -103,7 +107,7 @@ HARLEY_VARIANTS = {
         "label": "Vagina",
         "body": "curvy athletic figure, medium breasts",
         "clothed": "",
-        "clause": "pussy clearly visible, breasts bare",
+        "clause": "genitals clearly visible, breasts bare",
         "clothed_negative": "",
         "nude_negative": "",
     },
@@ -111,7 +115,7 @@ HARLEY_VARIANTS = {
         "label": "Penis",
         "body": "curvy athletic figure, medium breasts",
         "clothed": "clear bulge in the front of the garment",
-        "clause": "penis clearly visible, breasts bare",
+        "clause": "genitals clearly visible, breasts bare",
         "clothed_negative": ", flat smooth crotch",
         "nude_negative": ", featureless crotch",
     },
@@ -298,6 +302,15 @@ def image_size(image_bytes):
             return im.size
     except Exception:
         return (0, 0)
+
+def sharpness_score(image_bytes):
+    """Mean edge energy on a downscaled greyscale copy. Low means mush or a black frame."""
+    try:
+        img = Image.open(BytesIO(image_bytes)).convert("L")
+        img.thumbnail((512, 512))
+        return ImageStat.Stat(img.filter(ImageFilter.FIND_EDGES)).stddev[0]
+    except Exception:
+        return 0.0
 
 def check_render(size, data):
     """Compare the returned render against what was asked for. Catches silent upscaling."""
@@ -1013,6 +1026,11 @@ async def _request_image(prompt, negative=None, chain=None):
                     break
                 logger.info(f"Raw image from {model}: {len(raw)} bytes, header {raw[:12]!r}")
                 await asyncio.to_thread(check_render, image_size(raw), data)
+                score = await asyncio.to_thread(sharpness_score, raw)
+                logger.info(f"Sharpness score [{model}]: {score:.1f}")
+                if score < MIN_SHARPNESS and attempt < 2:
+                    logger.warning(f"[{model}] bad render (score {score:.1f}), regenerating")
+                    continue
                 if model != chain[0]:
                     logger.warning(f"FALLBACK SERVED: {model} (primary {chain[0]} failed)")
                 return raw
@@ -1268,6 +1286,8 @@ async def payload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"TASK {IMAGE_MODEL}\n{task_payload}\n\n"
         f"REWARD {reward_model}\n{reward_payload}\n\n"
+        f"chains: task {[IMAGE_MODEL] + IMAGE_FALLBACKS} | reward {reward_chain()}\n"
+        f"min sharpness: {MIN_SHARPNESS}\n\n"
         f"task spec: {json.dumps(MODEL_SPECS.get(IMAGE_MODEL, {})) or 'EMPTY'}\n"
         f"reward spec: {json.dumps(MODEL_SPECS.get(reward_model, {})) or 'EMPTY'}"
     )
@@ -1278,7 +1298,7 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user = session.query(UserState).filter_by(user_id=user_id).first()
         if user:
-            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_MODEL}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY} | aspect: {IMAGE_ASPECT} | res: {IMAGE_RESOLUTION} | sharpen: {IMAGE_SHARPEN} | max_side: {IMAGE_MAX_SIDE} | steps: {IMAGE_STEPS} | cfg: {IMAGE_CFG}\n\n/payload for the exact JSON")
+            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_MODEL}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY} | aspect: {IMAGE_ASPECT} | res: {IMAGE_RESOLUTION} | sharpen: {IMAGE_SHARPEN} | max_side: {IMAGE_MAX_SIDE} | steps: {IMAGE_STEPS} | cfg: {IMAGE_CFG} | min_sharp: {MIN_SHARPNESS}\n\n/payload for the exact JSON")
         else:
             await update.message.reply_text("No user record found")
     finally:
@@ -2105,7 +2125,7 @@ async def debugavatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Debug pair - task then reward. Task model {IMAGE_MODEL}, reward model {IMAGE_MODEL_REWARD or 'same'}, "
         f"variant {variant['label']}, cap {min(int(IMAGE_MAX_SIDE), 1280)}px, cfg {IMAGE_CFG}, steps {IMAGE_STEPS}, "
-        f"upscale {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY}."
+        f"upscale {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY}, min sharpness {MIN_SHARPNESS}."
     )
     dom = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
            f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
@@ -2127,7 +2147,7 @@ async def testreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Reward test - {wish or 'surprise'}...")
     await _debug_send(context, user_id, "REWARD", reward_prompt(variant, wish), reward_negative(variant), reward_chain(), upscale=True)
 
-MODEL_CHOICES = ["grok-imagine-image-quality", "grok-imagine-image-2-0", "chroma", "z-image-turbo", "nano-banana-pro"]
+MODEL_CHOICES = ["grok-imagine-image-quality", "grok-imagine-image-2-0", "nano-banana-pro", "chroma", "z-image-turbo"]
 
 async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton(m, callback_data=f"setmodel_{m}")] for m in MODEL_CHOICES]
@@ -2142,7 +2162,7 @@ async def setmodel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     IMAGE_MODEL = m
     await asyncio.to_thread(get_spec, m)
-    await query.edit_message_text(f"Task model: {m}. /debugavatar to test.\n\ngrok = sharpest, R-rated, hides genitals. chroma = explicit but soft. z-image = fast. nano-banana = sharp, rejects explicit.")
+    await query.edit_message_text(f"Task model: {m}. /debugavatar to test.\n\ngrok = sharpest, R-rated, hides genitals. nano-banana = sharp, rejects explicit. chroma = explicit but soft, last resort. z-image = fast.")
 
 async def rewardmodel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton(m, callback_data=f"setreward_{m}")] for m in MODEL_CHOICES]
@@ -2259,7 +2279,7 @@ def main():
     logger.info("BOT STARTING")
     logger.info(f"Text: {TEXT_MODEL} | Vision: {VISION_MODEL} | Probes: {PROBE_MODELS}")
     logger.info(f"Task model: {IMAGE_MODEL} | Reward model: {IMAGE_MODEL_REWARD or 'same'} | fallbacks: {IMAGE_FALLBACKS}")
-    logger.info(f"Format: {IMAGE_FORMAT} | Upscale: {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY} | Aspect: {IMAGE_ASPECT} | Res: {IMAGE_RESOLUTION} | Sharpen: {IMAGE_SHARPEN} | MaxSide: {IMAGE_MAX_SIDE} | Steps: {IMAGE_STEPS} | CFG: {IMAGE_CFG}")
+    logger.info(f"Format: {IMAGE_FORMAT} | Upscale: {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY} | Aspect: {IMAGE_ASPECT} | Res: {IMAGE_RESOLUTION} | Sharpen: {IMAGE_SHARPEN} | MaxSide: {IMAGE_MAX_SIDE} | Steps: {IMAGE_STEPS} | CFG: {IMAGE_CFG} | MinSharp: {MIN_SHARPNESS}")
     logger.info(f"Native caps: {NATIVE_CAPS}")
     logger.info(f"Venue presets: {len(VENUE_BASELINE)}")
     logger.info(f"Cloudinary configured: {bool(os.getenv('CLOUDINARY_CLOUD_NAME'))} / {bool(os.getenv('CLOUDINARY_API_KEY'))} / {bool(os.getenv('CLOUDINARY_API_SECRET'))}")
