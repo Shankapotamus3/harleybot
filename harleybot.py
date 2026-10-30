@@ -3,6 +3,7 @@
 Harley Quinn Bot - Domme, chaotic, dangerously fun.
 Harley's voice comes from a local system prompt. No character_slug dependency.
 Fixed avatar with a penis/vagina toggle, real vision verification.
+Venue features are generated on the fly and cached per location.
 """
 
 import os
@@ -40,18 +41,22 @@ VENICE_IMAGE_URL = "https://api.venice.ai/api/v1/image/generate"
 VENICE_UPSCALE_URL = "https://api.venice.ai/api/v1/image/upscale"
 TEXT_MODEL = os.getenv("TEXT_MODEL", "venice-uncensored-role-play").strip()
 VISION_MODEL = os.getenv("VISION_MODEL", "claude-opus-4-8-fast").strip()
-IMAGE_MODEL = os.getenv("IMAGE_MODEL", "nano-banana-pro").strip()
+PROBE_MODEL = os.getenv("PROBE_MODEL", "openai-gpt-oss-120b").strip()
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "chroma").strip()
 IMAGE_MODEL_REWARD = os.getenv("IMAGE_MODEL_REWARD", "").strip()
-IMAGE_FALLBACKS = [m.strip() for m in os.getenv("IMAGE_FALLBACKS", "chroma").split(",") if m.strip()]
+IMAGE_FALLBACKS = [m.strip() for m in os.getenv("IMAGE_FALLBACKS", "z-image-turbo,nano-banana-pro").split(",") if m.strip()]
 IMAGE_FORMAT = os.getenv("IMAGE_FORMAT", "png").strip()
 IMAGE_UPSCALE = os.getenv("IMAGE_UPSCALE", "off").strip()
 IMAGE_ASPECT = os.getenv("IMAGE_ASPECT", "3:4").strip()
 IMAGE_SHARPEN = os.getenv("IMAGE_SHARPEN", "1").strip()
+IMAGE_STEPS = os.getenv("IMAGE_STEPS", "10").strip()
+IMAGE_CFG = os.getenv("IMAGE_CFG", "7").strip()
 MODEL_SPEC = {}
 MODEL_SPECS = {}
 
-SHARP_TAIL = "editorial portrait photograph, sharp focus on the eyes and face, deep focus, natural skin texture, crisp fabric detail, flattering directional light, professional studio lighting, 85mm lens"
-NEGATIVE_PROMPT = "blurry, soft focus, bokeh, shallow focus, out of focus, motion blur, low detail, smeared, airbrushed, smooth plastic skin, beauty filter, harsh flash, blown out highlights, overexposed, grainy"
+SHARP_TAIL = "sharp focus, natural skin texture, directional studio light, 85mm"
+NEGATIVE_PROMPT = "blurry, soft focus, bokeh, plastic skin, extra fingers, fused fingers"
+NEGATIVE_PROMPT_SEXY = "stiff catalogue pose, stock photo, mannequin, plastic skin, extra fingers, fused fingers"
 NEGATIVE_PROMPT_NUDE = "briefs, boxers, panties, knickers, trousers, jeans, skirt, towel, sheet, sarong, loincloth, drapery, fabric over the groin, clothing over the groin, censored, mosaic, partially covered, cropped at the hips"
 STUDIO = "against a seamless charcoal studio backdrop, subtle rim light from behind"
 NUDE = "fully nude except for"
@@ -60,11 +65,25 @@ SOFT_WORDS = re.compile(
     r"cinematic glow|soft lighting|glowing|ethereal)\b", re.IGNORECASE)
 
 # Look only. Interpolated into every avatar prompt - keep it to physical description.
-HARLEY_BASE = "Harley Quinn, white skin, blonde hair in pigtails with red and blue dyed tips, athletic slim build, red and black jester makeup, blue and red eyeshadow"
+HARLEY_BASE = "Harley Quinn, white skin, blonde hair in pigtails with red and blue dyed tips, athletic slim build, lean muscular arms, red and black jester makeup, blue and red eyeshadow"
 
 HARLEY_VARIANTS = {
-    "vagina": {"label": "Vagina", "body": "curvy athletic figure, medium breasts", "clause": "pussy clearly visible, breasts bare"},
-    "penis": {"label": "Penis", "body": "curvy athletic figure, medium breasts, medium penis", "clause": "cock and breasts clearly visible"},
+    "vagina": {
+        "label": "Vagina",
+        "body": "curvy athletic figure, medium breasts",
+        "clothed": "",
+        "clause": "pussy clearly visible, breasts bare",
+        "clothed_negative": "",
+        "nude_negative": "",
+    },
+    "penis": {
+        "label": "Penis",
+        "body": "curvy athletic figure, medium breasts",
+        "clothed": "clear bulge in the front of the garment",
+        "clause": "penis clearly visible, breasts bare",
+        "clothed_negative": ", flat smooth crotch",
+        "nude_negative": ", featureless crotch",
+    },
 }
 
 # Voice only. Fed to the text model. Never goes near an image prompt.
@@ -115,6 +134,7 @@ class UserState(Base):
     location = Column(String(50), default=None)
     custom_location = Column(String(100), default=None)
     location_detail = Column(Text, default=None)
+    location_probes = Column(Text, default=None)
     context_alone = Column(Boolean, default=True)
     context_others = Column(String(100), default=None)
     context_privacy = Column(String(20), default='private')
@@ -139,6 +159,7 @@ class UserState(Base):
     awaiting_custom_location = Column(Boolean, default=False)
     awaiting_location_detail = Column(Boolean, default=False)
     awaiting_interval = Column(Boolean, default=False)
+    awaiting_reward_wish = Column(Boolean, default=False)
     last_avatar_sent_at = Column(DateTime(timezone=True), nullable=True)
     avatar_interval_minutes = Column(Integer, default=60)
     avatar_enabled = Column(Boolean, default=True)
@@ -301,18 +322,38 @@ RISK_LEVELS = {
     5: {"name": "Extreme", "description": "Public-adjacent (hallways, stairwells, high exposure possible)"}
 }
 
+# Rolled against max_risk, then renormalised to whatever ceiling the user set.
+RISK_WEIGHTS = {1: 5, 2: 5, 3: 20, 4: 30, 5: 40}
+
+def weighted_risk(max_risk=5):
+    levels = [l for l in RISK_WEIGHTS if l <= max(1, max_risk)]
+    weights = [RISK_WEIGHTS[l] for l in levels]
+    return random.choices(levels, weights=weights, k=1)[0]
+
+# Fallbacks only - live venue features are generated and cached in the row.
 LOCATION_PROBES = {
     "Hotel": [("gym", "🏋️ Gym"), ("pool", "🏊 Pool"), ("sauna", "🧖 Sauna"), ("corridor", "🚪 Corridor"), ("elevator", "🛗 Lift"), ("lobby", "🛎️ Lobby"), ("balcony", "🌤️ Balcony"), ("bathtub", "🛁 Bathtub"), ("parking", "🅿️ Parking"), ("laundry", "🧺 Laundry room")],
     "Home": [("garden", "🌳 Garden"), ("garage", "🚗 Garage"), ("balcony", "🌤️ Balcony"), ("shed", "🏚️ Shed"), ("bathroom", "🛁 Bathroom"), ("hallway", "🚪 Hallway"), ("laundry", "🧺 Laundry room"), ("stairs", "🪜 Stairs"), ("attic", "📦 Attic")],
+    "Bar": [("terrace", "🚬 Terrace"), ("toilets", "🚻 Toilets"), ("corridor", "🚪 Back corridor"), ("booth", "🪑 Booth"), ("counter", "🍸 Bar counter"), ("doorway", "🚪 Doorway"), ("coat", "🧥 Coat hooks")],
     "Retail Store": [("dressing", "🚪 Changing room"), ("backroom", "📦 Stockroom"), ("bathroom", "🚻 Store bathroom"), ("parking", "🅿️ Parking lot"), ("alley", "🌑 Alley"), ("loading", "🚚 Loading dock")],
     "Vehicle": [("empty_lot", "🅿️ Empty lot"), ("busy_lot", "🚗 Busy lot"), ("rest_stop", "🛑 Rest stop"), ("gas", "⛽ Petrol station"), ("backseat", "🪑 Back seat"), ("highway", "🛣️ Highway")],
     "Work": [("office", "🚪 Private office"), ("stairwell", "🪜 Stairwell"), ("conference", "🪑 Empty meeting room"), ("bathroom", "🚻 Bathroom"), ("garage", "🅿️ Parking garage"), ("rooftop", "🏙️ Rooftop"), ("elevator", "🛗 Lift")],
     "Generic": [("window", "🪟 Window"), ("doorway", "🚪 Doorway"), ("mirror", "🪞 Mirror"), ("bathroom", "🛁 Bathroom"), ("outside", "🌤️ Outside"), ("floor", "🧎 Floor")]
 }
 
+VENUE_BASELINE = {
+    "Home": "kitchen counter and table, bathroom mirror and shower, bed, sofa, dining chairs, wardrobe mirror, hallway, stairs, windows",
+    "Hotel": "bed, bathroom mirror, shower, bathtub, wardrobe, desk and chair, window, corridor, lift",
+    "Bar": "bar counter and stools, high tables, corner booths, corridor to the toilets, fire door at the back, terrace or doorway, optics mirror behind the bar, coat hooks",
+    "Retail Store": "changing room, shop floor rails, mirror, stockroom, trolley, till counter, car park",
+    "Vehicle": "driver seat, back seat, boot, wing mirror, dashboard, car park, roadside",
+    "Work": "desk, office chair, meeting room table, stairwell, kitchen, printer, window, lift",
+    "Generic": "door, mirror, window, chair, floor, wall, table",
+}
+
 def get_probe_key(location):
     low = (location or "").lower()
-    for key in LOCATION_PROBES:
+    for key in VENUE_BASELINE:
         if key != "Generic" and key.lower() in low:
             return key
     return "Generic"
@@ -371,17 +412,13 @@ CONTEXT_OPTIONS = {
 }
 
 HARLEY_POSES = [
-    "three-quarter shot from the knees up, hands on hips, dominant stance",
-    "three-quarter shot, arms crossed, looking down at camera, powerful",
-    "three-quarter shot resting an oversized mallet over one shoulder, cocky grin",
-    "three-quarter shot swinging a baseball bat one-handed, mid-laugh",
-    "three-quarter shot seated on the edge of a chair, legs crossed, commanding",
-    "three-quarter shot holding a leash, expectant expression",
-    "three-quarter shot leaning against a doorframe, arms folded, chin lifted",
-    "three-quarter shot, one hand on hip, weight on one leg, superior",
-    "three-quarter shot from a low angle, looking down, dominant posture",
-    "waist-up shot, finger pointing at camera, commanding gesture",
-    "medium close-up from the chest up, direct eye contact, cold expression",
+    "hip cocked, chin down, eyes up at the lens",
+    "leaning in toward the lens, spine arched",
+    "mallet over one shoulder, smirk",
+    "straddling a chair backwards",
+    "one knee up on a stool, hand in hair",
+    "thumbs in her waistband, pulling it down",
+    "one strap off the shoulder, head tilted",
 ]
 
 HARLEY_OUTFITS = [
@@ -398,12 +435,12 @@ HARLEY_OUTFITS = [
 ]
 
 REWARD_POSES = [
-    "kneeling upright, hands clasped behind back, chest pushed forward",
-    "kneeling with thighs apart, hands flat on thighs, looking up at camera",
-    "reclining on one elbow, hips turned toward camera, legs bent",
-    "sitting back on heels, arms stretched above head",
-    "on all fours, back arched, looking over the shoulder at camera",
-    "kneeling, one hand in hair, chin lifted, throat exposed",
+    "kneeling, one knee forward, hips back",
+    "reclining on one elbow, top leg open",
+    "on all fours, back arched, looking over her shoulder",
+    "lying back on both elbows, knees up",
+    "sitting back on her heels, arms overhead",
+    "kneeling, hand in hair, throat exposed",
 ]
 REWARD_GEAR = [
     "a black leather chest harness",
@@ -437,6 +474,15 @@ def get_title(avatar_gender=None):
 def harley_variant(user):
     return HARLEY_VARIANTS.get(getattr(user, "harley_variant", None) or "vagina", HARLEY_VARIANTS["vagina"])
 
+def probes_for(user):
+    return json.loads(user.location_probes or '[]')
+
+def venue_baseline(user, location):
+    stored = probes_for(user)
+    if stored:
+        return ", ".join(stored)
+    return VENUE_BASELINE.get(get_probe_key(location), VENUE_BASELINE["Generic"])
+
 def task_keyboard(task_id, title):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"📸 Done, {title}", callback_data=f"complete_{task_id}")],
@@ -468,6 +514,38 @@ async def generate_ai_response(prompt, temperature=0.9):
     except Exception as e:
         logger.error(f"AI error: {e}")
         return None
+
+async def generate_probes(location):
+    """Concrete physical features of a venue, for chips and for the task baseline."""
+    prompt = (f"List 10 concrete physical features of a {location} that someone could use for "
+              f"exposure or bondage play. Real, specific, mundane: \"the coat hooks\", "
+              f"\"the mirror over the sink\", \"the wedge under the fire door\". "
+              f"No abstractions. One per line, no numbering, no explanation.")
+    try:
+        raw = await asyncio.to_thread(
+            requests.post, f"{VENICE_API_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {VENICE_API_KEY}", "Content-Type": "application/json"},
+            json={"model": PROBE_MODEL, "messages": [{"role": "user", "content": prompt}],
+                  "temperature": 0.8, "max_tokens": 220},
+            timeout=25
+        )
+        if raw.status_code != 200:
+            logger.error(f"Probe gen error: {raw.status_code} - {raw.text[:150]}")
+            return []
+        out, seen = [], set()
+        for line in raw.json()['choices'][0]['message']['content'].splitlines():
+            t = re.sub(r"^[\-\*\d\.\)]+\s*", "", line.strip()).strip(" .")
+            if not t or len(t) > 40:
+                continue
+            k = t.lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(t)
+        return out[:10]
+    except Exception as e:
+        logger.error(f"Probe gen error: {e}")
+        return []
 
 async def analyze_image(image_bytes, task_desc, followup_target=None):
     """Returns raw verifier text, or None on transport failure."""
@@ -541,7 +619,7 @@ async def generate_task_text(user, session=None, depth=0):
     location = user.custom_location or user.location or "Unknown"
     others = user.context_others or "alone"
     privacy = user.context_privacy or "private"
-    actual_risk = random.randint(1, max_risk)
+    actual_risk = weighted_risk(max_risk)
     if others == "kids":
         actual_risk = min(2, actual_risk)
         max_risk = min(2, max_risk)
@@ -592,7 +670,8 @@ async def generate_task_text(user, session=None, depth=0):
     prompt = f"""Write ONE task for a {gender} sub. You are Harley - stay in her voice, but obey the format exactly.
 
 Location: {location}
-Venue detail and props within reach: {detail or "nothing beyond the basic space"}
+Obvious features of a place like this: {venue_baseline(user, location)}
+Extra detail from the sub: {detail or "none"}
 Context: {others}, {privacy} privacy
 Risk: {actual_risk}/5 - {risk_desc}
 Wearing: {user.current_outfit} - {outfit_text}
@@ -605,7 +684,7 @@ RECENTLY USED HERE - prefer variety, but reuse is fine if it genuinely fits bett
 {recent_text}
 
 Work in this order:
-1. Silently list 10 specific settings this exact place contains. Use the venue detail first, then the props in reach, then what the place obviously has. Be concrete: "the luggage rack", "the bathroom door left ajar", "the wardrobe mirror" - not "the room".
+1. Silently list 10 concrete settings. Most of them should come from the obvious features - a kitchen has a counter, a bathroom has a mirror. Use the extra detail as additions, not as the limit. Be concrete: "the kitchen counter edge", "the wardrobe mirror", not "the room".
 2. Cross off anything ruled out by the blockers.
 3. Choose the setting that best supports risk {actual_risk}/5, leaning towards whatever has been used least. Exposure settings are not automatically better - a mirror, a piece of furniture or a specific corner usually beats another window.
 4. Write the task around that setting, in Harley's voice - orders, not suggestions.
@@ -617,6 +696,8 @@ Rules:
 - The sub photographs with ONE hand. If the action needs both hands, state a concrete way to take the shot (propped phone, timer, mirror).
 - Name the setting explicitly in the task
 - Trust the outfit description over the outfit label. If she says no underwear, do not reference panties.
+- Vary across the whole place. Do not let it drift to one room.
+- If a setting is in RECENTLY USED, prefer a different one unless it genuinely fits much better.
 - Favour the specific and unexpected over the generic
 
 Reply in this format:
@@ -713,8 +794,8 @@ def _payload(prompt, model, negative=None):
         data["height"] = max(div, (h // div) * div)
         step_spec = c.get('steps') or {}
         max_steps = int(step_spec.get('max') or 10)
-        data["steps"] = min(int(os.getenv("IMAGE_STEPS", str(max_steps))), max_steps)
-        data["cfg_scale"] = float(os.getenv("IMAGE_CFG", "6.5"))
+        data["steps"] = min(int(IMAGE_STEPS), max_steps)
+        data["cfg_scale"] = float(IMAGE_CFG)
     return data
 
 def _prune_payload(data, body):
@@ -838,26 +919,52 @@ async def _build_and_send(user, prompt, user_id=None, negative=None, chain=None)
         logger.error("Normalization returned None")
     return normalized
 
+def variant_phrase(variant):
+    return f", {variant['clothed']}" if variant["clothed"] else ""
+
 async def generate_avatar_pose(user, pose_type="dominant"):
     try:
         variant = harley_variant(user)
         if pose_type == "reward":
             pose = random.choice(REWARD_POSES)
             gear = random.choice(REWARD_GEAR)
-            prompt = f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}, {NUDE} {gear}, {variant['clause']}, {pose}, submissive and exposed, framed from the thighs up, face filling the upper third, {STUDIO}"
+            neg = NEGATIVE_PROMPT_NUDE + variant["nude_negative"]
+            prompt = f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}, {NUDE} {gear}, {variant['clause']}, {pose}, framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}"
             reward_chain = None
             if IMAGE_MODEL_REWARD:
                 reward_chain = [IMAGE_MODEL_REWARD] + [m for m in IMAGE_FALLBACKS if m != IMAGE_MODEL_REWARD]
-            return await _build_and_send(user, prompt, user.user_id, NEGATIVE_PROMPT_NUDE, reward_chain)
+            return await _build_and_send(user, prompt, user.user_id, neg, reward_chain)
         pose = random.choice(HARLEY_POSES)
         outfit = random.choice(HARLEY_OUTFITS)
-        prompt = f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}, wearing {outfit}, {pose}, dominant attitude, face filling the upper third, {STUDIO}"
-        return await _build_and_send(user, prompt, user.user_id)
+        prompt = f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, wearing {outfit}, {pose}, framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}"
+        return await _build_and_send(user, prompt, user.user_id, NEGATIVE_PROMPT_SEXY + variant["clothed_negative"])
     except Exception as e:
         logger.error(f"Avatar error: {e}")
         import traceback
         logger.error(traceback.format_exc())
         return None
+
+async def deliver_reward(context, user, wish=None, session=None):
+    user_id = user.user_id
+    variant = harley_variant(user)
+    pose = random.choice(REWARD_POSES)
+    gear = random.choice(REWARD_GEAR)
+    neg = NEGATIVE_PROMPT_NUDE + variant["nude_negative"]
+    wish_text = f", {wish}" if wish else ""
+    prompt = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}, {NUDE} {gear}, "
+              f"{variant['clause']}, {pose}{wish_text}, framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}")
+    chain = None
+    if IMAGE_MODEL_REWARD:
+        chain = [IMAGE_MODEL_REWARD] + [m for m in IMAGE_FALLBACKS if m != IMAGE_MODEL_REWARD]
+    image_bytes = await _build_and_send(user, prompt, user_id, neg, chain)
+    if not image_bytes:
+        await context.bot.send_message(chat_id=user_id, text="Couldn't get it out of the camera. Try /avatar.")
+        return
+    cloud = await upload_to_cloudinary(image_bytes, user_id, image_type='reward')
+    await send_avatar_photo(context, user_id, image_bytes, "🎁 Your reward.")
+    if cloud and session:
+        session.add(UserImage(user_id=user_id, telegram_file_id='generated', cloudinary_url=cloud['url'], cloudinary_public_id=cloud['public_id'], image_type='reward'))
+        session.commit()
 
 async def send_avatar_photo(context, chat_id, image_bytes, caption):
     try:
@@ -881,7 +988,10 @@ async def custom_input_dispatcher(update: Update, context: ContextTypes.DEFAULT_
         if not user:
             await chat_handler(update, context)
             return
-        if user.awaiting_custom_outfit:
+        if user.awaiting_reward_wish:
+            await handle_reward_wish(update, context)
+            return
+        elif user.awaiting_custom_outfit:
             await handle_custom_outfit(update, context)
             return
         elif user.awaiting_outfit_detail:
@@ -972,7 +1082,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user = session.query(UserState).filter_by(user_id=user_id).first()
         if not user:
-            user = UserState(user_id=user_id, username=username)
+            user = UserState(
+                user_id=user_id,
+                username=username,
+                next_task_time=datetime.now(timezone.utc) + timedelta(minutes=random.randint(30, 180)),
+            )
             session.add(user)
             session.commit()
             keyboard = [[InlineKeyboardButton("👨 Male", callback_data="gender_male")], [InlineKeyboardButton("👩 Female", callback_data="gender_female")], [InlineKeyboardButton("⚧ Trans", callback_data="gender_trans")], [InlineKeyboardButton("🌈 Non-binary", callback_data="gender_nonbinary")]]
@@ -991,7 +1105,7 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user = session.query(UserState).filter_by(user_id=user_id).first()
         if user:
-            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}\n\nlocation: {user.custom_location or 'Not set'}\ndetail: {user.location_detail or 'none'}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_MODEL}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE} | aspect: {IMAGE_ASPECT} | sharpen: {IMAGE_SHARPEN}\nspec: {json.dumps(MODEL_SPEC)[:400]}\n\nTry saying 'hi' to test conversation!")
+            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_MODEL} | probe: {PROBE_MODEL}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE} | aspect: {IMAGE_ASPECT} | sharpen: {IMAGE_SHARPEN} | steps: {IMAGE_STEPS} | cfg: {IMAGE_CFG}\nspec: {json.dumps(MODEL_SPEC)[:400]}\n\nTry saying 'hi' to test conversation!")
         else:
             await update.message.reply_text("No user record found")
     finally:
@@ -1127,7 +1241,7 @@ async def handle_outfit_detail(update: Update, context: ContextTypes.DEFAULT_TYP
         session.close()
 
 async def wherenow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton("🏪 Store", callback_data="ctx_store")], [InlineKeyboardButton("🏠 Home", callback_data="ctx_home")], [InlineKeyboardButton("🏨 Hotel", callback_data="ctx_hotel")], [InlineKeyboardButton("🚗 Vehicle", callback_data="ctx_car")], [InlineKeyboardButton("🏢 Work", callback_data="ctx_work")], [InlineKeyboardButton("✏️ Custom", callback_data="ctx_custom")]]
+    keyboard = [[InlineKeyboardButton("🏪 Store", callback_data="ctx_store")], [InlineKeyboardButton("🏠 Home", callback_data="ctx_home")], [InlineKeyboardButton("🏨 Hotel", callback_data="ctx_hotel")], [InlineKeyboardButton("🍸 Bar", callback_data="ctx_bar")], [InlineKeyboardButton("🚗 Vehicle", callback_data="ctx_car")], [InlineKeyboardButton("🏢 Work", callback_data="ctx_work")], [InlineKeyboardButton("✏️ Custom", callback_data="ctx_custom")]]
     await update.message.reply_text("📍 Where are you?", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def context_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1146,7 +1260,7 @@ async def context_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finally:
             session.close()
         return
-    loc_map = {"store": "Retail Store", "home": "Home", "hotel": "Hotel", "car": "Vehicle", "work": "Work"}
+    loc_map = {"store": "Retail Store", "home": "Home", "hotel": "Hotel", "bar": "Bar", "car": "Vehicle", "work": "Work"}
     location = loc_map.get(ctx_type, "Unknown")
     session = get_session()
     try:
@@ -1155,6 +1269,7 @@ async def context_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user.location = location
             user.custom_location = location
             user.location_detail = None
+            user.location_probes = None
             session.commit()
     finally:
         session.close()
@@ -1172,6 +1287,7 @@ async def handle_custom_location(update: Update, context: ContextTypes.DEFAULT_T
         user.custom_location = update.message.text.strip()[:100]
         user.location = "Custom"
         user.location_detail = None
+        user.location_probes = None
         session.commit()
         keyboard = [[InlineKeyboardButton("🧍 Alone", callback_data="present_alone")], [InlineKeyboardButton("💑 Partner", callback_data="present_partner")], [InlineKeyboardButton("🏠 Roommates", callback_data="present_roommates")], [InlineKeyboardButton("👥 Public", callback_data="present_public")]]
         await update.message.reply_text(f"📍 {user.custom_location}\n\nWho is present?", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -1211,12 +1327,17 @@ async def privacy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         user.context_privacy = privacy
         user.awaiting_location_detail = True
+        location = user.custom_location or user.location or "room"
+        probes = probes_for(user)
+        if not probes:
+            await query.edit_message_text("Have a look round...")
+            probes = await generate_probes(location)
+            user.location_probes = json.dumps(probes)
         session.commit()
-        location = user.custom_location or user.location or "this place"
         await query.edit_message_text(
             f"Last thing - anything about {location} I should know?\n\n"
-            f"What's within reach, how busy it is, anything you could grab to use. Type it, or /skip.",
-            reply_markup=probe_keyboard(location, [])
+            f"What's within reach, how busy it is, anything you could grab. Tick what's there, or /skip.",
+            reply_markup=probe_keyboard(probes, [])
         )
     finally:
         session.close()
@@ -1237,11 +1358,11 @@ async def handle_location_detail(update: Update, context: ContextTypes.DEFAULT_T
         session.close()
 
 # ============ VENUE CHIPS ============
-def probe_keyboard(location, selected):
+def probe_keyboard(probes, selected):
     keyboard = []
-    for key, label in LOCATION_PROBES.get(get_probe_key(location), LOCATION_PROBES["Generic"]):
-        mark = "✅ " if key in selected else ""
-        keyboard.append([InlineKeyboardButton(f"{mark}{label}", callback_data=f"probe_{key}")])
+    for i, label in enumerate(probes):
+        mark = "✅ " if label in selected else ""
+        keyboard.append([InlineKeyboardButton(f"{mark}{label}", callback_data=f"probe_{i}")])
     keyboard.append([InlineKeyboardButton("✔️ That's all", callback_data="probe_done")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -1261,19 +1382,24 @@ async def probe_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session.commit()
             await query.edit_message_text("Good - that gives me something to work with.\n\nUse /kinks if you haven't set preferences, then /task.")
             return
-        feature = query.data.replace("probe_", "")
-        labels = dict(LOCATION_PROBES.get(get_probe_key(location), LOCATION_PROBES["Generic"]))
-        token = labels.get(feature, feature).split(" ", 1)[-1]
+        probes = probes_for(user)
+        try:
+            idx = int(query.data.replace("probe_", ""))
+        except ValueError:
+            return
+        if idx >= len(probes):
+            return
+        token = probes[idx]
         detail = user.location_detail or ""
         if token.lower() in detail.lower():
             user.location_detail = re.sub(re.escape(token), "", detail, flags=re.IGNORECASE).strip(", ") or None
         else:
             user.location_detail = f"{detail}, {token}" if detail else token
         session.commit()
-        current = [k for k, v in labels.items() if v.split(" ", 1)[-1].lower() in (user.location_detail or "").lower()]
+        current = [p for p in probes if p.lower() in (user.location_detail or "").lower()]
         await query.edit_message_text(
             f"Noted. Anything else about {location or 'this place'}, or /skip when you're done.",
-            reply_markup=probe_keyboard(location, current)
+            reply_markup=probe_keyboard(probes, current)
         )
     finally:
         session.close()
@@ -1641,20 +1767,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user.consecutive_failures = 0
             user.challenges_since_reward += 1
             session.commit()
-            title = get_title()
             if user.challenges_since_reward >= random.randint(5, 10):
                 user.challenges_since_reward = 0
+                user.awaiting_reward_wish = True
                 session.commit()
-                await update.message.reply_text(f"✅ +{10 * task.risk_level} points! Streak: {user.streak}\n\n🎁 Reward earned!")
-                reward_bytes = await generate_avatar_pose(user, "reward")
-                if reward_bytes:
-                    reward_cloudinary = await upload_to_cloudinary(reward_bytes, user_id, image_type='reward')
-                    await send_avatar_photo(context, user_id, reward_bytes, f"🎁 Your reward. {title} is pleased.")
-                    if reward_cloudinary:
-                        session.add(UserImage(user_id=user_id, telegram_file_id='generated', cloudinary_url=reward_cloudinary['url'], cloudinary_public_id=reward_cloudinary['public_id'], image_type='reward'))
-                        session.commit()
-                else:
-                    await update.message.reply_text("🎁 Reward earned!")
+                await update.message.reply_text(
+                    f"✅ +{10 * task.risk_level} points! Streak: {user.streak}\n\n"
+                    f"🎁 You earned a reward, puddin'. What do you wanna see?",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎲 Surprise me", callback_data="reward_surprise")]])
+                )
             else:
                 await update.message.reply_text(f"✅ +{10 * task.risk_level} points! Streak: {user.streak}")
         else:
@@ -1679,6 +1800,37 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Photo error: {e}")
         await update.message.reply_text("Error processing photo.")
+    finally:
+        session.close()
+
+async def handle_reward_wish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    session = get_session()
+    try:
+        user = session.query(UserState).filter_by(user_id=user_id).first()
+        if not user:
+            return
+        wish = update.message.text.strip()[:200]
+        user.awaiting_reward_wish = False
+        session.commit()
+        await update.message.reply_text("Comin' right up...")
+        await deliver_reward(context, user, wish, session)
+    finally:
+        session.close()
+
+async def reward_surprise_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    session = get_session()
+    try:
+        user = session.query(UserState).filter_by(user_id=user_id).first()
+        if not user:
+            return
+        user.awaiting_reward_wish = False
+        session.commit()
+        await query.edit_message_text("Comin' right up...")
+        await deliver_reward(context, user, None, session)
     finally:
         session.close()
 
@@ -1771,7 +1923,10 @@ async def debugavatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session.close()
     await update.message.reply_text("Generating debug avatar...")
     raw = await _request_image(
-        f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}, wearing black latex catsuit with red harlequin diamonds, three-quarter shot, hands on hips, cocky grin, {STUDIO}"
+        f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
+        f"wearing black latex catsuit with red harlequin diamonds, hip cocked, chin down, eyes up at the lens, "
+        f"framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}",
+        NEGATIVE_PROMPT_SEXY + variant["clothed_negative"]
     )
     if not raw:
         await update.message.reply_text("No image returned - check the log.")
@@ -1796,13 +1951,30 @@ async def debugavatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if norm:
         try:
             await context.bot.send_document(
-                chat_id=user_id, document=norm and BytesIO(norm), filename="normalized.jpg",
+                chat_id=user_id, document=BytesIO(norm), filename="normalized.jpg",
                 caption=f"NORMALIZED | {len(norm)} bytes"
             )
         except Exception as e:
             await update.message.reply_text(f"Could not send normalized: {e}")
     else:
         await update.message.reply_text("Normalize returned None - see log.")
+
+MODEL_CHOICES = ["chroma", "z-image-turbo", "nano-banana-pro", "grok-imagine-image-quality"]
+
+async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [[InlineKeyboardButton(m, callback_data=f"setmodel_{m}")] for m in MODEL_CHOICES]
+    await update.message.reply_text(f"Image model: {IMAGE_MODEL}\n\nPick one, then /debugavatar to test.", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def setmodel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global IMAGE_MODEL
+    query = update.callback_query
+    await query.answer()
+    m = query.data.replace("setmodel_", "")
+    if m not in MODEL_CHOICES:
+        return
+    IMAGE_MODEL = m
+    await asyncio.to_thread(get_spec, m)
+    await query.edit_message_text(f"Model: {m}. /debugavatar to test.\n\nchroma = filthiest. z-image = fast, decent skin. nano-banana = sharpest, flattest, rejects explicit. grok = R-rated only, hides genitals.")
 
 # ============ SCHEDULER ============
 async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1840,7 +2012,7 @@ async def scheduled_task_check(context: ContextTypes.DEFAULT_TYPE):
         session.commit()
         users = session.query(UserState).filter(
             UserState.scheduling_enabled == True,
-            UserState.next_task_time <= now
+            or_(UserState.next_task_time.is_(None), UserState.next_task_time <= now)
         ).all()
         for user in users:
             active = session.query(Task).filter_by(user_id=user.user_id, status="pending").first()
@@ -1862,25 +2034,6 @@ async def scheduled_task_check(context: ContextTypes.DEFAULT_TYPE):
                     session.commit()
                 except Exception as e:
                     logger.error(f"Auto-task error: {e}")
-        avatar_users = session.query(UserState).filter(
-            UserState.avatar_enabled == True,
-            or_(
-                UserState.last_avatar_sent_at.is_(None),
-                UserState.last_avatar_sent_at
-                + func.make_interval(0, 0, 0, 0, 0, UserState.avatar_interval_minutes)
-                <= func.now()
-            )
-        ).all()
-        for user in avatar_users:
-            try:
-                avatar_bytes = await generate_avatar_pose(user, "dominant")
-                if avatar_bytes:
-                    captions = ["Thinkin' of you, puddin'...", "I'm watchin' you, doll.", "Don't keep me waitin'.", "Ready to be useful?", "Got plans for you today..."]
-                    await send_avatar_photo(context, user.user_id, avatar_bytes, random.choice(captions))
-                    user.last_avatar_sent_at = now
-                    session.commit()
-            except Exception as e:
-                logger.error(f"Periodic avatar error for user {user.user_id}: {e}")
     except Exception as e:
         logger.error(f"Scheduled check error: {e}")
     finally:
@@ -1918,7 +2071,7 @@ async def reset_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     logger.info("=" * 60)
     logger.info("BOT STARTING")
-    logger.info(f"Text: {TEXT_MODEL} | Vision: {VISION_MODEL}")
+    logger.info(f"Text: {TEXT_MODEL} | Vision: {VISION_MODEL} | Probe: {PROBE_MODEL}")
     logger.info(f"Image model: {IMAGE_MODEL} | fallbacks: {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}")
     logger.info(f"Format: {IMAGE_FORMAT} | Upscale: {IMAGE_UPSCALE} | Aspect: {IMAGE_ASPECT} | Sharpen: {IMAGE_SHARPEN}")
     logger.info(f"Cloudinary configured: {bool(os.getenv('CLOUDINARY_CLOUD_NAME'))} / {bool(os.getenv('CLOUDINARY_API_KEY'))} / {bool(os.getenv('CLOUDINARY_API_SECRET'))}")
@@ -1933,6 +2086,7 @@ def main():
     application.add_handler(CommandHandler("test", test_cmd))
     application.add_handler(CommandHandler("skip", skip_cmd))
     application.add_handler(CommandHandler("debugavatar", debugavatar_cmd))
+    application.add_handler(CommandHandler("model", model_cmd))
     application.add_handler(CommandHandler("gender", gender_cmd))
     application.add_handler(CommandHandler("outfit", outfit_cmd))
     application.add_handler(CommandHandler("wherenow", wherenow_cmd))
@@ -1966,6 +2120,8 @@ def main():
     application.add_handler(CallbackQueryHandler(schedule_callback, pattern="^sched_"))
     application.add_handler(CallbackQueryHandler(reset_callback, pattern="^reset_"))
     application.add_handler(CallbackQueryHandler(mercy_callback, pattern="^mercy_"))
+    application.add_handler(CallbackQueryHandler(reward_surprise_callback, pattern="^reward_surprise$"))
+    application.add_handler(CallbackQueryHandler(setmodel_callback, pattern="^setmodel_"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_input_dispatcher))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.run_polling(
