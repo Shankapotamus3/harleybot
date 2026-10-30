@@ -50,7 +50,8 @@ IMAGE_UPSCALE = os.getenv("IMAGE_UPSCALE", "off").strip()
 IMAGE_ASPECT = os.getenv("IMAGE_ASPECT", "3:4").strip()
 IMAGE_SHARPEN = os.getenv("IMAGE_SHARPEN", "1").strip()
 IMAGE_STEPS = os.getenv("IMAGE_STEPS", "10").strip()
-IMAGE_CFG = os.getenv("IMAGE_CFG", "7").strip()
+IMAGE_CFG = os.getenv("IMAGE_CFG", "5").strip()
+IMAGE_MAX_SIDE = os.getenv("IMAGE_MAX_SIDE", "1280").strip()
 MODEL_SPEC = {}
 MODEL_SPECS = {}
 
@@ -261,8 +262,8 @@ def sniff_ext(b):
         return "png"
     return "bin"
 
-def normalize_for_telegram(image_bytes, max_side=2048, sharpen=True):
-    """Decode any image format, resize, add micro-detail, re-encode as baseline JPEG."""
+def normalize_for_telegram(image_bytes, max_side=1280, sharpen=True):
+    """Decode any image format, cap the long edge, sharpen, re-encode as baseline JPEG."""
     try:
         img = Image.open(BytesIO(image_bytes))
         img.load()
@@ -274,11 +275,11 @@ def normalize_for_telegram(image_bytes, max_side=2048, sharpen=True):
         img = img.convert("RGB")
         img.thumbnail((max_side, max_side), Image.LANCZOS)
         if sharpen:
-            img = img.filter(ImageFilter.UnsharpMask(radius=1.2, percent=105, threshold=4))
+            img = img.filter(ImageFilter.UnsharpMask(radius=1.0, percent=140, threshold=3))
             img = ImageEnhance.Contrast(img).enhance(1.04)
-            img = ImageEnhance.Sharpness(img).enhance(1.08)
+            img = ImageEnhance.Sharpness(img).enhance(1.10)
         out = BytesIO()
-        img.save(out, format="JPEG", quality=95, progressive=False, optimize=True)
+        img.save(out, format="JPEG", quality=90, progressive=False, optimize=True)
         return out.getvalue()
     except Exception as e:
         logger.error(f"Image normalize error: {e}")
@@ -475,11 +476,11 @@ HARLEY_OUTFITS = [
 
 REWARD_POSES = [
     "kneeling, one knee forward, hips back",
-    "reclining on one elbow, top leg open",
-    "on all fours, back arched, looking over her shoulder",
-    "lying back on both elbows, knees up",
+    "kneeling upright, hands behind head, chest forward",
     "sitting back on her heels, arms overhead",
     "kneeling, hand in hair, throat exposed",
+    "reclining on one elbow, top leg open, face turned to the lens",
+    "lying back on both elbows, knees up, chin tucked to the chest",
 ]
 REWARD_GEAR = [
     "a black leather chest harness",
@@ -524,6 +525,17 @@ def venue_baseline(user, location):
     if stored:
         return ", ".join(stored)
     return VENUE_BASELINE.get(get_probe_key(location), VENUE_BASELINE["Generic"])
+
+def reward_chain():
+    if IMAGE_MODEL_REWARD:
+        return [IMAGE_MODEL_REWARD] + [m for m in IMAGE_FALLBACKS if m != IMAGE_MODEL_REWARD]
+    return None
+
+def reward_prompt(variant, wish=None):
+    wish_text = f", {wish[:120]}" if wish else ""
+    return (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}, {NUDE} {random.choice(REWARD_GEAR)}, "
+            f"{variant['clause']}, {random.choice(REWARD_POSES)}{wish_text}, framed from the hips up, "
+            f"face filling the upper third, {STUDIO}, {SHARP_TAIL}")
 
 def task_keyboard(task_id, title):
     return InlineKeyboardMarkup([
@@ -925,6 +937,8 @@ async def _request_image(prompt, negative=None, chain=None):
                     logger.error(f"No image data from {model}: {str(result)[:300]}")
                     break
                 logger.info(f"Raw image from {model}: {len(raw)} bytes, header {raw[:12]!r}")
+                if model != chain[0]:
+                    logger.warning(f"FALLBACK SERVED: {model} (primary {chain[0]} failed)")
                 return raw
             if response.status_code == 400 and attempt < 2 and _prune_payload(data, response.text):
                 logger.warning(f"[{model}] rejected, pruned to {sorted(data.keys())}: {response.text[:200]}")
@@ -966,7 +980,7 @@ async def _build_and_send(user, prompt, user_id=None, negative=None, chain=None)
     if user_id:
         await asyncio.to_thread(dump_debug, raw, user_id, "raw")
     raw = await _upscale(raw)
-    normalized = await asyncio.to_thread(normalize_for_telegram, raw, 2048, IMAGE_SHARPEN == "1")
+    normalized = await asyncio.to_thread(normalize_for_telegram, raw, int(IMAGE_MAX_SIDE), IMAGE_SHARPEN == "1")
     if normalized and user_id:
         await asyncio.to_thread(dump_debug, normalized, user_id, "norm")
         logger.info(f"Normalized {len(raw)}b -> {len(normalized)}b")
@@ -978,17 +992,11 @@ async def generate_avatar_pose(user, pose_type="dominant"):
     try:
         variant = harley_variant(user)
         if pose_type == "reward":
-            pose = random.choice(REWARD_POSES)
-            gear = random.choice(REWARD_GEAR)
             neg = NEGATIVE_PROMPT_NUDE + variant["nude_negative"]
-            prompt = f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}, {NUDE} {gear}, {variant['clause']}, {pose}, framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}"
-            reward_chain = None
-            if IMAGE_MODEL_REWARD:
-                reward_chain = [IMAGE_MODEL_REWARD] + [m for m in IMAGE_FALLBACKS if m != IMAGE_MODEL_REWARD]
-            return await _build_and_send(user, prompt, user.user_id, neg, reward_chain)
-        pose = random.choice(HARLEY_POSES)
-        outfit = random.choice(HARLEY_OUTFITS)
-        prompt = f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, wearing {outfit}, {pose}, framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}"
+            return await _build_and_send(user, reward_prompt(variant), user.user_id, neg, reward_chain())
+        prompt = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
+                  f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
+                  f"framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}")
         return await _build_and_send(user, prompt, user.user_id, NEGATIVE_PROMPT_SEXY + variant["clothed_negative"])
     except Exception as e:
         logger.error(f"Avatar error: {e}")
@@ -999,16 +1007,8 @@ async def generate_avatar_pose(user, pose_type="dominant"):
 async def deliver_reward(context, user, wish=None, session=None):
     user_id = user.user_id
     variant = harley_variant(user)
-    pose = random.choice(REWARD_POSES)
-    gear = random.choice(REWARD_GEAR)
     neg = NEGATIVE_PROMPT_NUDE + variant["nude_negative"]
-    wish_text = f", {wish}" if wish else ""
-    prompt = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}, {NUDE} {gear}, "
-              f"{variant['clause']}, {pose}{wish_text}, framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}")
-    chain = None
-    if IMAGE_MODEL_REWARD:
-        chain = [IMAGE_MODEL_REWARD] + [m for m in IMAGE_FALLBACKS if m != IMAGE_MODEL_REWARD]
-    image_bytes = await _build_and_send(user, prompt, user_id, neg, chain)
+    image_bytes = await _build_and_send(user, reward_prompt(variant, wish), user_id, neg, reward_chain())
     if not image_bytes:
         await context.bot.send_message(chat_id=user_id, text="Couldn't get it out of the camera. Try /avatar.")
         return
@@ -1030,6 +1030,31 @@ async def send_avatar_photo(context, chat_id, image_bytes, caption):
     except Exception as e:
         logger.error(f"Send photo error: {e}")
     return False
+
+async def _debug_send(context, user_id, label, prompt, negative, chain=None):
+    """Send raw and normalized variants as documents so Telegram's re-encode is bypassed."""
+    raw = await _request_image(prompt, negative, chain)
+    if not raw:
+        await context.bot.send_message(chat_id=user_id, text=f"{label}: no image returned - check the log.")
+        return
+    try:
+        await context.bot.send_document(
+            chat_id=user_id, document=BytesIO(raw), filename=f"{label.lower()}_raw.{sniff_ext(raw)}",
+            caption=f"{label} RAW | {len(raw)}b | {raw[:12]!r}"
+        )
+    except Exception as e:
+        await context.bot.send_message(chat_id=user_id, text=f"{label}: could not send raw - {e}")
+    norm = await asyncio.to_thread(normalize_for_telegram, raw, int(IMAGE_MAX_SIDE), IMAGE_SHARPEN == "1")
+    if not norm:
+        await context.bot.send_message(chat_id=user_id, text=f"{label}: normalize returned None")
+        return
+    try:
+        await context.bot.send_document(
+            chat_id=user_id, document=BytesIO(norm), filename=f"{label.lower()}_norm.jpg",
+            caption=f"{label} NORM | {len(norm)}b | cap {IMAGE_MAX_SIDE}px"
+        )
+    except Exception as e:
+        await context.bot.send_message(chat_id=user_id, text=f"{label}: could not send normalized - {e}")
 
 # ============ CUSTOM INPUT DISPATCHER ============
 async def custom_input_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1157,7 +1182,7 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user = session.query(UserState).filter_by(user_id=user_id).first()
         if user:
-            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_MODEL} | probes: {PROBE_MODELS}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE} | aspect: {IMAGE_ASPECT} | sharpen: {IMAGE_SHARPEN} | steps: {IMAGE_STEPS} | cfg: {IMAGE_CFG}\nspec: {json.dumps(MODEL_SPEC)[:400]}\n\nTry saying 'hi' to test conversation!")
+            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_MODEL} | probes: {PROBE_MODELS}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE} | aspect: {IMAGE_ASPECT} | sharpen: {IMAGE_SHARPEN} | max_side: {IMAGE_MAX_SIDE} | steps: {IMAGE_STEPS} | cfg: {IMAGE_CFG}\nspec: {json.dumps(MODEL_SPEC)[:400]}\n\nTry saying 'hi' to test conversation!")
         else:
             await update.message.reply_text("No user record found")
     finally:
@@ -1973,7 +1998,7 @@ async def avatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session.close()
 
 async def debugavatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate one avatar and return raw, upscaled and normalized bytes as documents."""
+    """Paired task and reward shot, raw and normalized, as documents."""
     user_id = update.effective_user.id
     session = get_session()
     try:
@@ -1981,43 +2006,30 @@ async def debugavatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         variant = harley_variant(user) if user else HARLEY_VARIANTS["vagina"]
     finally:
         session.close()
-    await update.message.reply_text("Generating debug avatar...")
-    raw = await _request_image(
-        f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
-        f"wearing black latex catsuit with red harlequin diamonds, hip cocked, chin down, eyes up at the lens, "
-        f"framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}",
-        NEGATIVE_PROMPT_SEXY + variant["clothed_negative"]
+    await update.message.reply_text(
+        f"Debug pair - task then reward. Model {IMAGE_MODEL}, variant {variant['label']}, cap {IMAGE_MAX_SIDE}px, cfg {IMAGE_CFG}."
     )
-    if not raw:
-        await update.message.reply_text("No image returned - check the log.")
-        return
+    dom = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
+           f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
+           f"framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}")
+    await _debug_send(context, user_id, "TASK", dom, NEGATIVE_PROMPT_SEXY + variant["clothed_negative"])
+    await asyncio.sleep(2)
+    await _debug_send(context, user_id, "REWARD", reward_prompt(variant),
+                      NEGATIVE_PROMPT_NUDE + variant["nude_negative"], reward_chain())
+
+async def testreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Force a reward shot without completing anything. Optional wish text after the command."""
+    user_id = update.effective_user.id
+    session = get_session()
     try:
-        await context.bot.send_document(
-            chat_id=user_id, document=BytesIO(raw), filename=f"raw_image.{sniff_ext(raw)}",
-            caption=f"RAW | {len(raw)} bytes | header {raw[:12]!r}"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"Could not send raw: {e}")
-    up = await _upscale(raw)
-    if up is not raw:
-        try:
-            await context.bot.send_document(
-                chat_id=user_id, document=BytesIO(up), filename=f"upscaled.{sniff_ext(up)}",
-                caption=f"UPSCALED | {len(up)} bytes"
-            )
-        except Exception as e:
-            await update.message.reply_text(f"Could not send upscaled: {e}")
-    norm = await asyncio.to_thread(normalize_for_telegram, up, 2048, IMAGE_SHARPEN == "1")
-    if norm:
-        try:
-            await context.bot.send_document(
-                chat_id=user_id, document=BytesIO(norm), filename="normalized.jpg",
-                caption=f"NORMALIZED | {len(norm)} bytes"
-            )
-        except Exception as e:
-            await update.message.reply_text(f"Could not send normalized: {e}")
-    else:
-        await update.message.reply_text("Normalize returned None - see log.")
+        user = session.query(UserState).filter_by(user_id=user_id).first()
+        variant = harley_variant(user) if user else HARLEY_VARIANTS["vagina"]
+    finally:
+        session.close()
+    wish = " ".join(context.args).strip()[:120] if context.args else None
+    await update.message.reply_text(f"Reward test - {wish or 'surprise'}...")
+    await _debug_send(context, user_id, "REWARD", reward_prompt(variant, wish),
+                      NEGATIVE_PROMPT_NUDE + variant["nude_negative"], reward_chain())
 
 MODEL_CHOICES = ["chroma", "z-image-turbo", "nano-banana-pro", "grok-imagine-image-quality"]
 
@@ -2133,7 +2145,7 @@ def main():
     logger.info("BOT STARTING")
     logger.info(f"Text: {TEXT_MODEL} | Vision: {VISION_MODEL} | Probes: {PROBE_MODELS}")
     logger.info(f"Image model: {IMAGE_MODEL} | fallbacks: {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}")
-    logger.info(f"Format: {IMAGE_FORMAT} | Upscale: {IMAGE_UPSCALE} | Aspect: {IMAGE_ASPECT} | Sharpen: {IMAGE_SHARPEN}")
+    logger.info(f"Format: {IMAGE_FORMAT} | Upscale: {IMAGE_UPSCALE} | Aspect: {IMAGE_ASPECT} | Sharpen: {IMAGE_SHARPEN} | MaxSide: {IMAGE_MAX_SIDE} | Steps: {IMAGE_STEPS} | CFG: {IMAGE_CFG}")
     logger.info(f"Venue presets: {len(VENUE_BASELINE)}")
     logger.info(f"Cloudinary configured: {bool(os.getenv('CLOUDINARY_CLOUD_NAME'))} / {bool(os.getenv('CLOUDINARY_API_KEY'))} / {bool(os.getenv('CLOUDINARY_API_SECRET'))}")
     logger.info("=" * 60)
@@ -2147,6 +2159,7 @@ def main():
     application.add_handler(CommandHandler("test", test_cmd))
     application.add_handler(CommandHandler("skip", skip_cmd))
     application.add_handler(CommandHandler("debugavatar", debugavatar_cmd))
+    application.add_handler(CommandHandler("testreward", testreward_cmd))
     application.add_handler(CommandHandler("model", model_cmd))
     application.add_handler(CommandHandler("gender", gender_cmd))
     application.add_handler(CommandHandler("outfit", outfit_cmd))
