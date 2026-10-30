@@ -882,6 +882,11 @@ def _payload(prompt, model, negative=None):
         h = min(int(os.getenv("IMAGE_HEIGHT", "1280")), max_h)
         data["width"] = max(div, (w // div) * div)
         data["height"] = max(div, (h // div) * div)
+        # Chroma declares defaultResolution but no resolutions array - without this it renders at 1K
+        # and the API upscales. Sending resolution is what stops that.
+        if c.get('resolutions') or c.get('defaultResolution'):
+            res = c.get('resolutions') or ["1K", "2K"]
+            data["resolution"] = IMAGE_RESOLUTION if IMAGE_RESOLUTION in res else res[-1]
         step_spec = c.get('steps') or {}
         max_steps = int(step_spec.get('max') or known.get("steps_max") or 30)
         data["steps"] = min(int(IMAGE_STEPS), max_steps)
