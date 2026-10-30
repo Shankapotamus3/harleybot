@@ -42,9 +42,10 @@ VENICE_UPSCALE_URL = "https://api.venice.ai/api/v1/image/upscale"
 TEXT_MODEL = os.getenv("TEXT_MODEL", "venice-uncensored-role-play").strip()
 VISION_MODEL = os.getenv("VISION_MODEL", "claude-opus-4-8-fast").strip()
 PROBE_MODELS = [m.strip() for m in os.getenv("PROBE_MODELS", "openai-gpt-oss-120b,gemma-4-31b-it,mistral-small-3-2-24b-instruct").split(",") if m.strip()]
-IMAGE_MODEL = os.getenv("IMAGE_MODEL", "chroma").strip()
-IMAGE_MODEL_REWARD = os.getenv("IMAGE_MODEL_REWARD", "").strip()
-IMAGE_FALLBACKS = [m.strip() for m in os.getenv("IMAGE_FALLBACKS", "z-image-turbo,nano-banana-pro").split(",") if m.strip()]
+# Tasks: sharp, R-rated. Rewards: explicit, softer. Grok hides genitals, chroma doesn't.
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "grok-imagine-image-quality").strip()
+IMAGE_MODEL_REWARD = os.getenv("IMAGE_MODEL_REWARD", "chroma").strip()
+IMAGE_FALLBACKS = [m.strip() for m in os.getenv("IMAGE_FALLBACKS", "nano-banana-pro").split(",") if m.strip()]
 IMAGE_FORMAT = os.getenv("IMAGE_FORMAT", "png").strip()
 IMAGE_UPSCALE = os.getenv("IMAGE_UPSCALE", "off").strip()
 IMAGE_ASPECT = os.getenv("IMAGE_ASPECT", "3:4").strip()
@@ -830,6 +831,8 @@ def get_spec(model):
 
 def load_model_spec():
     get_spec(IMAGE_MODEL)
+    if IMAGE_MODEL_REWARD and IMAGE_MODEL_REWARD != IMAGE_MODEL:
+        get_spec(IMAGE_MODEL_REWARD)
 
 def build_prompt(raw_prompt):
     """Strip soft-vocabulary, then append the sharpness tail. Single entry point."""
@@ -2007,7 +2010,8 @@ async def debugavatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         session.close()
     await update.message.reply_text(
-        f"Debug pair - task then reward. Model {IMAGE_MODEL}, variant {variant['label']}, cap {IMAGE_MAX_SIDE}px, cfg {IMAGE_CFG}."
+        f"Debug pair - task then reward. Task model {IMAGE_MODEL}, reward model {IMAGE_MODEL_REWARD or 'same'}, "
+        f"variant {variant['label']}, cap {IMAGE_MAX_SIDE}px, cfg {IMAGE_CFG}."
     )
     dom = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
            f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
@@ -2031,11 +2035,11 @@ async def testreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _debug_send(context, user_id, "REWARD", reward_prompt(variant, wish),
                       NEGATIVE_PROMPT_NUDE + variant["nude_negative"], reward_chain())
 
-MODEL_CHOICES = ["chroma", "z-image-turbo", "nano-banana-pro", "grok-imagine-image-quality"]
+MODEL_CHOICES = ["grok-imagine-image-quality", "chroma", "z-image-turbo", "nano-banana-pro"]
 
 async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton(m, callback_data=f"setmodel_{m}")] for m in MODEL_CHOICES]
-    await update.message.reply_text(f"Image model: {IMAGE_MODEL}\n\nPick one, then /debugavatar to test.", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(f"Task model: {IMAGE_MODEL}\nReward model: {IMAGE_MODEL_REWARD or 'same'}\n\nPick one, then /debugavatar to test.", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def setmodel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global IMAGE_MODEL
@@ -2046,7 +2050,7 @@ async def setmodel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     IMAGE_MODEL = m
     await asyncio.to_thread(get_spec, m)
-    await query.edit_message_text(f"Model: {m}. /debugavatar to test.\n\nchroma = filthiest. z-image = fast, decent skin. nano-banana = sharpest, flattest, rejects explicit. grok = R-rated only, hides genitals.")
+    await query.edit_message_text(f"Task model: {m}. /debugavatar to test.\n\ngrok = sharpest, R-rated, hides genitals. chroma = explicit but soft. z-image = fast. nano-banana = sharp, rejects explicit.")
 
 # ============ SCHEDULER ============
 async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2144,7 +2148,7 @@ def main():
     logger.info("=" * 60)
     logger.info("BOT STARTING")
     logger.info(f"Text: {TEXT_MODEL} | Vision: {VISION_MODEL} | Probes: {PROBE_MODELS}")
-    logger.info(f"Image model: {IMAGE_MODEL} | fallbacks: {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}")
+    logger.info(f"Task model: {IMAGE_MODEL} | Reward model: {IMAGE_MODEL_REWARD or 'same'} | fallbacks: {IMAGE_FALLBACKS}")
     logger.info(f"Format: {IMAGE_FORMAT} | Upscale: {IMAGE_UPSCALE} | Aspect: {IMAGE_ASPECT} | Sharpen: {IMAGE_SHARPEN} | MaxSide: {IMAGE_MAX_SIDE} | Steps: {IMAGE_STEPS} | CFG: {IMAGE_CFG}")
     logger.info(f"Venue presets: {len(VENUE_BASELINE)}")
     logger.info(f"Cloudinary configured: {bool(os.getenv('CLOUDINARY_CLOUD_NAME'))} / {bool(os.getenv('CLOUDINARY_API_KEY'))} / {bool(os.getenv('CLOUDINARY_API_SECRET'))}")
