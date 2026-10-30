@@ -821,77 +821,87 @@ SETTING: <the setting, 2-5 words>"""
     return fallbacks.get(actual_risk, fallbacks[1]), actual_risk
 
 # ============ AVATAR ============
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "grok-imagine-image-quality").strip()
+IMAGE_MODEL_REWARD = os.getenv("IMAGE_MODEL_REWARD", "chroma").strip()
+IMAGE_FORMAT = os.getenv("IMAGE_FORMAT", "png").strip()
+IMAGE_MAX_SIDE = os.getenv("IMAGE_MAX_SIDE", "1280").strip()
+IMAGE_SHARPEN = os.getenv("IMAGE_SHARPEN", "1").strip()
+IMAGE_ASPECT = "3:4"
+IMAGE_RES = "2K"
+_API_BASE = os.getenv("VENICE_BASE_URL", "https://api.venice.ai/api/v1")
+
+TASK_CHAIN = [IMAGE_MODEL, "chroma", "z-image-turbo"]
+REWARD_CHAIN = [IMAGE_MODEL_REWARD, "z-image-turbo", "chroma"]
+
+# Models that render near 1K and merely upscale when `resolution` is present.
+# They get their real maximum box instead, so the pixels are native.
+NATIVE_CAPS = {"chroma": (960, 1280)}
+
+KNOWN_MODELS = {
+    "grok-imagine-image-quality": {"mode": "ratio", "ratios": ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "2:1", "1:2"], "res": ["1K", "2K"]},
+    "nano-banana-pro": {"mode": "ratio", "ratios": ["1:1", "4:3", "3:4", "16:9", "9:16", "3:2", "2:3"], "res": ["1K", "2K"]},
+    "gpt-image-2": {"mode": "ratio", "ratios": ["1:1", "3:4", "4:3", "16:9", "9:16"], "res": ["1K", "2K"]},
+    "chroma": {"mode": "pixels", "max_w": 1280, "max_h": 1280, "steps_max": 10},
+    "z-image-turbo": {"mode": "pixels", "max_w": 1280, "max_h": 1280},
+}
+
+_spec_cache = {}
+
 def get_spec(model):
-    """Per-model constraints, fetched once and cached."""
-    if model in MODEL_SPECS:
-        return MODEL_SPECS[model]
+    if model in _spec_cache:
+        return _spec_cache[model]
     spec = {}
     try:
         r = requests.get(
-            f"{VENICE_API_URL}/models?type=image",
-            headers={"Authorization": f"Bearer {VENICE_API_KEY}"}, timeout=30
+            f"{_API_BASE}/models",
+            headers={"Authorization": f"Bearer {VENICE_API_KEY}"},
+            params={"type": "image"}, timeout=20,
         )
         if r.status_code == 200:
-            payload = r.json()
-            for m in (payload.get('data') or payload):
-                if m.get('id') == model:
-                    spec = m.get('model_spec') or {}
+            for m in r.json().get("data", []):
+                if m.get("id") == model:
+                    spec = m.get("model_spec") or {}
                     break
-        else:
-            logger.warning(f"Model spec fetch failed: HTTP {r.status_code}")
     except Exception as e:
-        logger.warning(f"Model spec error for {model}: {e}")
-    MODEL_SPECS[model] = spec
-    if model == IMAGE_MODEL:
-        MODEL_SPEC.clear()
-        MODEL_SPEC.update(spec)
+        logger.warning("Spec fetch failed for %s: %s", model, e)
+    _spec_cache[model] = spec
     return spec
 
-def load_model_spec():
-    targets = [IMAGE_MODEL]
-    if IMAGE_MODEL_REWARD and IMAGE_MODEL_REWARD != IMAGE_MODEL:
-        targets.append(IMAGE_MODEL_REWARD)
-    for m in targets:
-        spec = get_spec(m)
-        logger.info(f"BOOT SPEC {m}: {json.dumps(spec) if spec else 'EMPTY (using KNOWN_MODELS)'}")
-
-def build_prompt(raw_prompt):
-    """Strip soft-vocabulary, then append the sharpness tail. Single entry point."""
-    cleaned = SOFT_WORDS.sub("", raw_prompt)
-    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip().strip(",").strip()
-    return f"{cleaned}, {SHARP_TAIL}"
+def _apply_native_caps(data, model):
+    native = NATIVE_CAPS.get(model)
+    if not native:
+        return data
+    data.pop("resolution", None)
+    data["width"], data["height"] = native
+    return data
 
 def _payload(prompt, model, negative=None):
-    """Use live constraints when present, KNOWN_MODELS when the spec fetch failed."""
-    c = (get_spec(model).get('constraints') or {})
+    c = (get_spec(model).get("constraints") or {})
     known = KNOWN_MODELS.get(model, {})
-    ratio_mode = bool(c.get('aspectRatios')) or (not c and known.get('mode') == "ratio")
+    ratios = c.get("aspectRatios") or known.get("ratios") or []
+    res = c.get("resolutions") or known.get("res") or []
     data = {"model": model, "prompt": prompt, "format": IMAGE_FORMAT}
     if negative:
         data["negative_prompt"] = negative
-    if ratio_mode:
-        ratios = c.get('aspectRatios') or known.get("ratios") or ["3:4"]
+
+    if ratios:
         data["aspect_ratio"] = IMAGE_ASPECT if IMAGE_ASPECT in ratios else ratios[0]
-        res = c.get('resolutions') or known.get("res") or ["1K", "2K"]
-        data["resolution"] = IMAGE_RESOLUTION if IMAGE_RESOLUTION in res else res[-1]
-    else:
-        div = max(1, int(c.get('widthHeightDivisor') or 8))
-        max_w = int(c.get('maxWidth') or known.get("max_w") or 1280)
-        max_h = int(c.get('maxHeight') or known.get("max_h") or 1280)
-        w = min(int(os.getenv("IMAGE_WIDTH", "960")), max_w)
-        h = min(int(os.getenv("IMAGE_HEIGHT", "1280")), max_h)
-        data["width"] = max(div, (w // div) * div)
-        data["height"] = max(div, (h // div) * div)
-        # Chroma declares defaultResolution but no resolutions array - without this it renders at 1K
-        # and the API upscales. Sending resolution is what stops that.
-        if c.get('resolutions') or c.get('defaultResolution'):
-            res = c.get('resolutions') or ["1K", "2K"]
-            data["resolution"] = IMAGE_RESOLUTION if IMAGE_RESOLUTION in res else res[-1]
-        step_spec = c.get('steps') or {}
-        max_steps = int(step_spec.get('max') or known.get("steps_max") or 30)
-        data["steps"] = min(int(IMAGE_STEPS), max_steps)
-        data["cfg_scale"] = float(IMAGE_CFG)
-    return data
+        if res:
+            fallback_res = c.get("defaultResolution")
+            data["resolution"] = IMAGE_RES if IMAGE_RES in res else (fallback_res if fallback_res in res else res[-1])
+        return _apply_native_caps(data, model)
+
+    div = max(1, int(c.get("widthHeightDivisor") or known.get("divisor") or 8))
+    max_w = int(c.get("maxWidth") or known.get("max_w") or 1280)
+    max_h = int(c.get("maxHeight") or known.get("max_h") or 1280)
+    w = min(int(os.getenv("IMAGE_WIDTH", "960")), max_w)
+    h = min(int(os.getenv("IMAGE_HEIGHT", "1280")), max_h)
+    data["width"] = max(div, (w // div) * div)
+    data["height"] = max(div, (h // div) * div)
+    max_steps = int((c.get("steps") or {}).get("max") or known.get("steps_max") or 10)
+    data["steps"] = min(int(os.getenv("IMAGE_STEPS", str(max_steps))), max_steps)
+    data["cfg_scale"] = float(os.getenv("IMAGE_CFG", "6.5"))
+    return _apply_native_caps(data, model)
 
 def _prune_payload(data, body):
     """Drop or clamp whatever the endpoint rejected. True if the payload changed."""
@@ -899,20 +909,20 @@ def _prune_payload(data, body):
         err = json.loads(body)
     except Exception:
         return False
-    changed = False
-    issues = err.get('issues') or err.get('errors') or []
+    issues = err.get("issues") or err.get("errors") or []
     if not isinstance(issues, list):
         return False
+    changed = False
     for issue in issues:
         if not isinstance(issue, dict):
             continue
-        path = issue.get('path') or []
-        keys = list(issue.get('keys') or [])
+        path = issue.get("path") or []
+        keys = list(issue.get("keys") or [])
         if isinstance(path, list) and path:
             keys.append(str(path[-1]))
-        if issue.get('code') in ('too_big', 'too_small') and isinstance(path, list) and path:
+        if issue.get("code") in ("too_big", "too_small") and isinstance(path, list) and path:
             k = str(path[-1])
-            bound = issue.get('maximum') if issue.get('code') == 'too_big' else issue.get('minimum')
+            bound = issue.get("maximum") if issue.get("code") == "too_big" else issue.get("minimum")
             if k in data and bound is not None:
                 try:
                     data[k] = type(data[k])(bound)
@@ -921,175 +931,218 @@ def _prune_payload(data, body):
                 except Exception:
                     pass
         for k in keys:
-            k = str(k).split('.')[-1]
-            if k in data and k != "prompt":
+            k = str(k).split(".")[-1]
+            if k in data:
                 data.pop(k, None)
                 changed = True
     return changed
 
-def _extract_bytes(result):
-    if not result.get('images'):
+def _brief(data):
+    return " ".join(f"{k}={v}" for k, v in data.items() if k not in ("prompt", "negative_prompt"))
+
+def _decode_size(raw):
+    try:
+        with Image.open(BytesIO(raw)) as im:
+            return im.size
+    except Exception:
+        return (0, 0)
+
+def _extract(result):
+    if not result.get("images"):
+        logger.error("Image API returned no images: %s", str(result)[:300])
         return None
-    image_data = result['images'][0]
+    image_data = result["images"][0]
+    if isinstance(image_data, str) and image_data.startswith("http"):
+        r = requests.get(image_data, timeout=30)
+        return r.content if r.status_code == 200 else None
+    if isinstance(image_data, str) and image_data.startswith("data:image"):
+        return base64.b64decode(image_data.split(",", 1)[1])
+    if isinstance(image_data, str):
+        try:
+            return base64.b64decode(image_data)
+        except Exception:
+            return None
     if isinstance(image_data, bytes):
         return image_data
-    if not isinstance(image_data, str):
-        return None
-    if image_data.startswith('http'):
-        r = requests.get(image_data, timeout=60)
-        return r.content if r.status_code == 200 else None
-    if image_data.startswith('data:image'):
-        return base64.b64decode(image_data.split(',')[1])
-    try:
-        return base64.b64decode(image_data)
-    except Exception:
-        return None
-
-async def _request_image(prompt, negative=None, chain=None):
-    headers = {"Authorization": f"Bearer {VENICE_API_KEY}", "Content-Type": "application/json"}
-    prompt = build_prompt(prompt)
-    if not chain:
-        chain = [IMAGE_MODEL] + [m for m in IMAGE_FALLBACKS if m != IMAGE_MODEL]
-    for model in chain:
-        data = _payload(prompt, model, negative)
-        for attempt in range(3):
-            logger.info(f"Image payload [{model}]: {json.dumps({k: v for k, v in data.items() if k not in ('prompt', 'negative_prompt')})}")
-            response = await asyncio.to_thread(
-                requests.post, VENICE_IMAGE_URL, headers=headers, json=data, timeout=180
-            )
-            logger.info(f"Image API status [{model}]: {response.status_code}")
-            if response.status_code == 200:
-                result = response.json()
-                raw = await asyncio.to_thread(_extract_bytes, result)
-                if not raw:
-                    logger.error(f"No image data from {model}: {str(result)[:300]}")
-                    break
-                logger.info(f"Raw image from {model}: {len(raw)} bytes, header {raw[:12]!r}")
-                if model != chain[0]:
-                    logger.warning(f"FALLBACK SERVED: {model} (primary {chain[0]} failed)")
-                return raw
-            if response.status_code == 400 and attempt < 2 and _prune_payload(data, response.text):
-                logger.warning(f"[{model}] rejected, pruned to {sorted(data.keys())}: {response.text[:200]}")
-                continue
-            logger.error(f"Image API error [{model}]: {response.status_code} - {response.text[:300]}")
-            break
-    logger.error(f"All image models failed: {chain}")
     return None
 
-async def _upscale(raw):
-    """Add real detail server-side before any Pillow work. Falls back to the raw bytes."""
-    if IMAGE_UPSCALE in ("off", "0", ""):
-        return raw
-    try:
-        payload = {
-            "image": base64.b64encode(raw).decode("utf-8"),
-            "scale": int(IMAGE_UPSCALE),
-            "creativity": float(os.getenv("IMAGE_UPSCALE_CREATIVITY", "0.18")),
-        }
-        r = await asyncio.to_thread(
-            requests.post, VENICE_UPSCALE_URL,
-            headers={"Authorization": f"Bearer {VENICE_API_KEY}", "Content-Type": "application/json"},
-            json=payload, timeout=180
+async def _post_image(data):
+    headers = {"Authorization": f"Bearer {VENICE_API_KEY}", "Content-Type": "application/json"}
+    for attempt in range(3):
+        response = await asyncio.to_thread(
+            requests.post, VENICE_IMAGE_URL, headers=headers, json=data, timeout=180
         )
-        logger.info(f"Upscale status: {r.status_code}")
-        if r.status_code != 200:
-            logger.warning(f"Upscale failed, keeping raw: {r.status_code} - {r.text[:200]}")
+        logger.info("Image API %s | %s | %s", response.status_code, data.get("model"), _brief(data))
+        if response.status_code == 200:
+            w, h = _decode_size(b"")
+            return _extract(await asyncio.to_thread(response.json))
+        if response.status_code == 400 and attempt < 2 and _prune_payload(data, response.text):
+            logger.info("Pruned payload, retrying: %s", _brief(data))
+            continue
+        if response.status_code == 422:
+            logger.warning("422 on %s: %s", data.get("model"), response.text[:200])
+            return None
+        logger.error("Image API error %s: %s", response.status_code, response.text[:300])
+        return None
+    return None
+
+async def _request_image(prompt, negative=None, chain=None):
+    models = []
+    for m in (chain or TASK_CHAIN):
+        if m and m not in models:
+            models.append(m)
+    for model in models:
+        data = _payload(prompt, model, negative)
+        data["seed"] = random.randint(1, 1_000_000)
+        raw = await _post_image(data)
+        if raw:
+            if model != models[0]:
+                logger.warning("FALLBACK SERVED by %s (asked %s)", model, models[0])
             return raw
-        logger.info(f"Upscaled {len(raw)}b -> {len(r.content)}b ({r.headers.get('content-type')})")
-        return r.content
-    except Exception as e:
-        logger.warning(f"Upscale error, keeping raw: {e}")
-        return raw
+    logger.error("All image models failed: %s", models)
+    return None
 
 async def _build_and_send(user, prompt, user_id=None, negative=None, chain=None):
     raw = await _request_image(prompt, negative, chain)
     if not raw:
         return None
+    w, h = _decode_size(raw)
+    logger.info("Decoded %sx%s from %sb", w, h, len(raw))
+    if w > 1280 or h > 1280:
+        logger.warning("Server returned %sx%s over the cap - that is an upscale", w, h)
     if user_id:
         await asyncio.to_thread(dump_debug, raw, user_id, "raw")
-    raw = await _upscale(raw)
-    cap = min(int(IMAGE_MAX_SIDE), 1280)
-    normalized = await asyncio.to_thread(normalize_for_telegram, raw, cap, IMAGE_SHARPEN == "1")
+    normalized = await asyncio.to_thread(
+        normalize_for_telegram, raw, int(IMAGE_MAX_SIDE), IMAGE_SHARPEN == "1"
+    )
     if normalized and user_id:
         await asyncio.to_thread(dump_debug, normalized, user_id, "norm")
-        logger.info(f"Normalized {len(raw)}b -> {len(normalized)}b")
-    elif not normalized:
-        logger.error("Normalization returned None")
+    logger.info("Raw %sb -> normalized %sb", len(raw), len(normalized or b""))
     return normalized
 
+DOMINANT_POSES = [
+    "standing hip cocked, arms folded, chin down, looking straight down the lens",
+    "sitting on a stool, legs crossed, leaning forward with elbows on knees",
+    "standing side on, glancing back over one shoulder",
+    "leaning against the wall with one boot flat, arms loose",
+    "crouched low, forearms on knees, smirk",
+]
+
 async def generate_avatar_pose(user, pose_type="dominant"):
-    try:
-        variant = harley_variant(user)
-        if pose_type == "reward":
-            neg = NEGATIVE_PROMPT_NUDE + variant["nude_negative"]
-            return await _build_and_send(user, reward_prompt(variant), user.user_id, neg, reward_chain())
-        prompt = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
-                  f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
-                  f"framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}")
-        return await _build_and_send(user, prompt, user.user_id, NEGATIVE_PROMPT_SEXY + variant["clothed_negative"])
-    except Exception as e:
-        logger.error(f"Avatar error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return None
+    variant = harley_variant(user)
+    pose = random.choice(DOMINANT_POSES)
+    prompt = (
+        f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}, "
+        f"wearing {variant['outfit']}, {pose}, {variant['clause']}, "
+        f"framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}"
+    )
+    return await _build_and_send(user, prompt, user.user_id, NEGATIVE_PROMPT, TASK_CHAIN)
+
+async def generate_avatar_pose_image(user, pose_type="dominant"):
+    return await generate_avatar_pose(user, pose_type)
 
 async def deliver_reward(context, user, wish=None, session=None):
-    user_id = user.user_id
     variant = harley_variant(user)
+    pose = random.choice(REWARD_POSES)
+    gear = random.choice(REWARD_GEAR)
     neg = NEGATIVE_PROMPT_NUDE + variant["nude_negative"]
-    image_bytes = await _build_and_send(user, reward_prompt(variant, wish), user_id, neg, reward_chain())
-    if not image_bytes:
-        await context.bot.send_message(chat_id=user_id, text="Couldn't get it out of the camera. Try /avatar.")
+    wish_text = f", {wish}" if wish else ""
+    prompt = (
+        f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}, {NUDE}, {gear}, "
+        f"{GENITAL_CLAUSE.get(variant['key'], 'genitals clearly visible')}, {pose}{wish_text}, "
+        f"framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}"
+    )
+    image = await _build_and_send(user, prompt, user.user_id, neg, REWARD_CHAIN)
+    if not image:
+        await context.bot.send_message(
+            chat_id=user.user_id, text="Camera's playin' up. Gimme a minute and ask again, puddin'."
+        )
         return
-    cloud = await upload_to_cloudinary(image_bytes, user_id, image_type='reward')
-    await send_avatar_photo(context, user_id, image_bytes, "🎁 Your reward.")
-    if cloud and session:
-        session.add(UserImage(user_id=user_id, telegram_file_id='generated', cloudinary_url=cloud['url'], cloudinary_public_id=cloud['public_id'], image_type='reward'))
-        session.commit()
-
-async def send_avatar_photo(context, chat_id, image_bytes, caption):
     try:
-        if not image_bytes or len(image_bytes) < 1000:
-            logger.error(f"Invalid image bytes: {len(image_bytes) if image_bytes else 'None'}")
-            return False
-        buf = BytesIO(image_bytes)
-        buf.seek(0)
-        await context.bot.send_photo(chat_id=chat_id, photo=buf, caption=caption)
-        return True
+        await asyncio.to_thread(upload_to_cloudinary, image, user.user_id)
     except Exception as e:
-        logger.error(f"Send photo error: {e}")
-    return False
+        logger.warning("Cloudinary upload failed: %s", e)
+    await context.bot.send_photo(chat_id=user.user_id, photo=BytesIO(image), caption="For you. 💋")
 
 async def _debug_send(context, user_id, label, prompt, negative, chain=None):
-    """Raw and normalized as documents, then normalized again as a photo for like-for-like."""
     raw = await _request_image(prompt, negative, chain)
     if not raw:
-        await context.bot.send_message(chat_id=user_id, text=f"{label}: no image returned - check the log.")
+        await context.bot.send_message(chat_id=user_id, text=f"{label}: no image - check the log.")
         return
-    try:
-        await context.bot.send_document(
-            chat_id=user_id, document=BytesIO(raw), filename=f"{label.lower()}_raw.{sniff_ext(raw)}",
-            caption=f"{label} RAW | {len(raw)}b | {raw[:12]!r}"
-        )
-    except Exception as e:
-        await context.bot.send_message(chat_id=user_id, text=f"{label}: could not send raw - {e}")
-    cap = min(int(IMAGE_MAX_SIDE), 1280)
-    norm = await asyncio.to_thread(normalize_for_telegram, raw, cap, IMAGE_SHARPEN == "1")
+    w, h = _decode_size(raw)
+    await context.bot.send_document(
+        chat_id=user_id, document=BytesIO(raw), filename=f"{label.lower()}_raw.{sniff_ext(raw)}",
+        caption=f"{label} RAW | {w}x{h} | {len(raw)}b"
+    )
+    norm = await asyncio.to_thread(
+        normalize_for_telegram, raw, int(IMAGE_MAX_SIDE), IMAGE_SHARPEN == "1"
+    )
     if not norm:
         await context.bot.send_message(chat_id=user_id, text=f"{label}: normalize returned None")
         return
-    try:
-        await context.bot.send_document(
-            chat_id=user_id, document=BytesIO(norm), filename=f"{label.lower()}_norm.jpg",
-            caption=f"{label} NORM | {len(norm)}b | cap {cap}px"
-        )
-    except Exception as e:
-        await context.bot.send_message(chat_id=user_id, text=f"{label}: could not send normalized - {e}")
-    try:
-        await context.bot.send_photo(chat_id=user_id, photo=BytesIO(norm), caption=f"{label} NORM as photo")
-    except Exception as e:
-        await context.bot.send_message(chat_id=user_id, text=f"{label}: could not send photo - {e}")
+    await context.bot.send_document(
+        chat_id=user_id, document=BytesIO(norm), filename=f"{label.lower()}_norm.jpg",
+        caption=f"{label} NORM | {len(norm)}b | {chain[0] if chain else IMAGE_MODEL}"
+    )
 
+async def debugavatar_cmd(update, context):
+    user_id = update.effective_user.id
+    session = get_session()
+    try:
+        user = session.query(UserState).filter_by(user_id=user_id).first()
+        if not user:
+            await update.message.reply_text("Send /start first.")
+            return
+        variant = harley_variant(user)
+        await update.message.reply_text(f"Generating a pair on {TASK_CHAIN[0]} / {REWARD_CHAIN[0]}...")
+        task_prompt = (
+            f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}, "
+            f"wearing {variant['outfit']}, {random.choice(DOMINANT_POSES)}, {variant['clause']}, "
+            f"framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}"
+        )
+        await _debug_send(context, user_id, "TASK", task_prompt, NEGATIVE_PROMPT, TASK_CHAIN)
+        reward_prompt = (
+            f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}, {NUDE}, "
+            f"{random.choice(REWARD_GEAR)}, "
+            f"{GENITAL_CLAUSE.get(variant['key'], 'genitals clearly visible')}, "
+            f"{random.choice(REWARD_POSES)}, framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}"
+        )
+        await _debug_send(
+            context, user_id, "REWARD", reward_prompt,
+            NEGATIVE_PROMPT_NUDE + variant["nude_negative"], REWARD_CHAIN
+        )
+    finally:
+        session.close()
+
+async def payload_cmd(update, context):
+    session = get_session()
+    try:
+        user = session.query(UserState).filter_by(user_id=update.effective_user.id).first()
+        if not user:
+            await update.message.reply_text("Send /start first.")
+            return
+        lines = []
+        for label, model in (("TASK", TASK_CHAIN[0]), ("REWARD", REWARD_CHAIN[0])):
+            data = _payload("x", model)
+            data.pop("prompt", None)
+            data.pop("seed", None)
+            lines.append(f"{label} {model}\n{json.dumps(data)}")
+        await update.message.reply_text("\n\n".join(lines))
+    finally:
+        session.close()
+
+async def testreward_cmd(update, context):
+    session = get_session()
+    try:
+        user = session.query(UserState).filter_by(user_id=update.effective_user.id).first()
+        if not user:
+            await update.message.reply_text("Send /start first.")
+            return
+        wish = (context.args and " ".join(context.args).strip()) or None
+        await update.message.reply_text("Comin' right up...")
+        await deliver_reward(context, user, wish, session)
+    finally:
+        session.close()
 # ============ CUSTOM INPUT DISPATCHER ============
 async def custom_input_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
