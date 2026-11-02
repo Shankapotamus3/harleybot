@@ -4,6 +4,9 @@ Harley Quinn task bot.
 
 Changelog
 ---------
+- Removed output_format and sampler from the generate payload; the endpoint
+  rejects unknown keys. b64 PNG is the default response, sampler is per-model.
+- /test and /status aliases.
 - ensure_schema(): idempotent ADD COLUMN migration for Postgres. create_all
   never alters existing tables, so the old user_states row killed post_init
   and polling never started.
@@ -14,8 +17,8 @@ Changelog
   TOKEN; loud boot failure naming the vars that do exist.
 - Vision: default model in code, fallback chain, word-boundary verdict parse,
   max_tokens 64, directive prompt.
-- Imaging contract inlined: PNG only, native boxes, unclipped 1024-edge
-  Laplacian, best-of-N selection, upscale-the-winner.
+- Imaging contract inlined: native boxes, unclipped 1024-edge Laplacian,
+  best-of-N selection, upscale-the-winner.
 - Reward path requires BARE and filters the chain to explicit-capable models.
 - Negative prompt split: imaging vocabulary for sharpness, garment nouns
   only where clothing is actually being enforced.
@@ -113,7 +116,6 @@ VISION_CHAIN = [m for m in (
 MAX_PARALLEL = 4
 MEASURE_EDGE = 1024
 TARGET_LONG_EDGE = 1920
-DEFAULT_SAMPLER = "DPM++ 2M"
 
 IMAGE_CFG = _env_float("IMAGE_CFG", 5.0)
 IMAGE_STEPS = int(_env_float("IMAGE_STEPS", 32))
@@ -149,7 +151,6 @@ MODEL_CHOICES = [
 ]
 MODEL_EXPLICIT = {"lustify-v8", "chroma", "wai-illu"}
 MODEL_NO_NEGATIVE = {"gpt-image-2", "gpt-image-2-edit"}
-MODEL_NO_SAMPLER = {"gpt-image-2", "gpt-image-2-edit", "nano-banana-pro"}
 
 MODEL_MIN_SHARPNESS = {
     "lustify-v8": _env_float("LUSTIFY_MIN_SHARPNESS", 100.0),
@@ -213,14 +214,11 @@ def _payload(model, prompt, negative, box, seed=None) -> dict:
         "height": box[1],
         "steps": steps_for(model),
         "cfg_scale": cfg_for(model),
-        "output_format": "png",
         "hide_watermark": True,
         "safe_mode": False,
     }
     if negative and model not in MODEL_NO_NEGATIVE:
         body["negative_prompt"] = negative
-    if model not in MODEL_NO_SAMPLER:
-        body["sampler"] = DEFAULT_SAMPLER
     if seed is not None:
         body["seed"] = seed
     return body
@@ -1138,6 +1136,10 @@ async def debugavatar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await debugavatar(update, context)
+
+
 async def resetowner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     with db() as s:
@@ -1249,8 +1251,10 @@ def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
+    app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("task", task_command))
     app.add_handler(CommandHandler("tryn", tryn))
+    app.add_handler(CommandHandler("test", tryn))
     app.add_handler(CommandHandler("tryreward", tryreward))
     app.add_handler(CommandHandler("testreward", testreward))
     app.add_handler(CommandHandler("imgmodels", imgmodels))
