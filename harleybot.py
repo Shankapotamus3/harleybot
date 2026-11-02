@@ -964,6 +964,16 @@ def task_keyboard(task_id, title):
         [InlineKeyboardButton("Mercy", callback_data=f"mercy_{task_id}")],
     ])
 
+def room_keyboard(venue, selected):
+    rows = []
+    for key in rooms_for_venue(venue):
+        mark = "Y " if key in selected else ""
+        rows.append([InlineKeyboardButton(f"{mark}{key.title()}", callback_data=f"room_{key}")])
+    rows.append([
+        InlineKeyboardButton("Add a room", callback_data="room_custom"),
+        InlineKeyboardButton("That's the lot", callback_data="room_done"),
+    ])
+    return InlineKeyboardMarkup(rows)
 
 def present_keyboard(venue, rooms, selected):
     rows, row = [], []
@@ -1972,8 +1982,18 @@ async def custom_rooms_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.effective_message.reply_text("Nothing usable there. Try again.")
         return
 
-    state["rooms"] = supplied
     state["pending"] = None
+
+    if rooms_for_venue(venue):
+        for room in supplied:
+            if room not in state["rooms"]:
+                state["rooms"].append(room)
+        await update.effective_message.reply_text(
+            "Added. Anything else?",
+            reply_markup=room_keyboard(venue, state["rooms"]))
+        return
+
+    state["rooms"] = supplied
     await update.effective_message.reply_text(
         "Now the features inside those rooms.",
         reply_markup=present_keyboard(venue, supplied, []))
