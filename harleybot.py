@@ -6,27 +6,24 @@ Fixed avatar with a penis/vagina toggle, real vision verification.
 Venue features: static presets by default, AI extension when the API cooperates.
 
 IMAGING CHANGED ONLY. Everything else is the original file.
-Imaging: PNG out, no JPEG re-encode, variance-of-Laplacian gate, best-of-N
-selection, BARE gate with vision fallback chain, upscale after select,
-document delivery instead of photo.
 
 Changelog since last send:
-- testreward runs the real path (floor + BARE gate), not a raw batch
-- reward model defaults to lustify-v8, fallbacks to chroma
-- MODEL_EXPLICIT filter on the reward chain (nano-banana 422s on explicit)
-- scheduler gated on gender/outfit/location, pushes next_task_time on skip
-- MODEL_ID_RE / _models_from_env rejects pasted code in env vars
-- boot logs the resolved model set
-- candidate loop short-circuits at 4 so a good early draw stops the batch
+- image concurrency capped (IMAGE_CONCURRENCY, default 4) with 429 backoff
+- fallback tracks the best draw regardless of floor, so a soft batch still
+  delivers instead of returning nothing
+- testreward distinguishes "no images returned" from "all under floor"
+- RENDER_ATTEMPTS default down to 8
 """
 
 import os
 import re
 import json
+import time
 import logging
 import asyncio
 import base64
 import random
+import threading
 import requests
 import cloudinary
 import cloudinary.uploader
@@ -95,10 +92,13 @@ IMAGE_MAX_SIDE = os.getenv("IMAGE_MAX_SIDE", "1280").strip()
 MEASURE_EDGE = 1024
 VISION_EDGE = 768
 TARGET_LONG_EDGE = 1920
-RENDER_ATTEMPTS = int(os.getenv("RENDER_ATTEMPTS", "12"))
+RENDER_ATTEMPTS = int(os.getenv("RENDER_ATTEMPTS", "8"))
 RENDER_ROUNDS = int(os.getenv("RENDER_ROUNDS", "2"))
 RENDER_MAX_CANDS = int(os.getenv("RENDER_MAX_CANDS", "4"))
 TASK_IMAGE_CHANCE = float(os.getenv("TASK_IMAGE_CHANCE", "0.3"))
+IMAGE_CONCURRENCY = int(os.getenv("IMAGE_CONCURRENCY", "4"))
+
+_image_sem = threading.Semaphore(IMAGE_CONCURRENCY)
 
 
 def _envf(name, default):
@@ -1088,17 +1088,22 @@ def _extract_bytes(result):
 
 
 def _post_image(data, model):
-    """One request, with the 400 prune-retry. Returns bytes or None."""
+    """One request, throttled, with 429 backoff and the 400 prune-retry."""
     headers = {"Authorization": f"Bearer {VENICE_API_KEY}", "Content-Type": "application/json"}
     for attempt in range(3):
         try:
-            response = requests.post(VENICE_IMAGE_URL, headers=headers, json=data, timeout=180)
+            with _image_sem:
+                response = requests.post(VENICE_IMAGE_URL, headers=headers, json=data, timeout=180)
         except Exception as e:
             logger.error(f"Image transport error [{model}]: {e}")
             return None
         logger.info(f"Image API status [{model}]: {response.status_code}")
         if response.status_code == 200:
             return _extract_bytes(response.json())
+        if response.status_code == 429 and attempt < 2:
+            logger.warning(f"[{model}] throttled, backing off")
+            time.sleep(2 * (attempt + 1))
+            continue
         if response.status_code == 400 and attempt < 2 and _prune_payload(data, response.text):
             logger.warning(f"[{model}] rejected, pruned to {sorted(data.keys())}")
             continue
@@ -1141,11 +1146,12 @@ async def _render_batch(prompt, negative, chain=None):
 
 
 async def _render_best(prompt, negative, chain=None, require_bare=False):
-    """Best-of-N over the floor, BARE-gated, with a sharpest-draw fallback."""
+    """Best-of-N over the floor, BARE-gated, with a best-any fallback."""
     prompt = build_prompt(prompt)
     if not chain:
         chain = [IMAGE_MODEL] + [m for m in IMAGE_FALLBACKS if m != IMAGE_MODEL]
     fallback = None
+    received = 0
     for rnd in range(RENDER_ROUNDS):
         for model in chain:
             floor = MODEL_MIN_SHARPNESS.get(model, DEFAULT_MIN_SHARPNESS)
@@ -1159,8 +1165,11 @@ async def _render_best(prompt, negative, chain=None, require_bare=False):
             for r in results:
                 if isinstance(r, Exception) or not r:
                     continue
+                received += 1
                 score = _score_bytes(r)
                 logger.info(f"{model} r{rnd} sharp {score:.1f} bytes {len(r)}")
+                if fallback is None or score > fallback[0]:
+                    fallback = (score, r)
                 if score >= floor:
                     cands.append((score, r))
                     if len(cands) >= RENDER_MAX_CANDS:
@@ -1169,8 +1178,6 @@ async def _render_best(prompt, negative, chain=None, require_bare=False):
             if not cands:
                 continue
             cands.sort(key=lambda c: c[0], reverse=True)
-            if fallback is None or cands[0][0] > fallback[0]:
-                fallback = cands[0]
             if not require_bare:
                 return cands[0][1], cands[0][0], "SKIPPED"
             for score, raw in cands[:3]:
@@ -1179,8 +1186,9 @@ async def _render_best(prompt, negative, chain=None, require_bare=False):
                 if verdict == "BARE":
                     return raw, score, verdict
     if fallback:
-        logger.info(f"fallback delivery {fallback[0]:.0f}, no BARE")
+        logger.info(f"fallback delivery {fallback[0]:.0f}, below floor")
         return fallback[1], fallback[0], "UNSURE"
+    logger.info(f"no images received at all ({received} draws)")
     return None, 0.0, "FAILED"
 
 
@@ -1465,7 +1473,7 @@ async def payload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"TASK {IMAGE_MODEL}\n{task_payload}\n\n"
         f"REWARD {reward_model}\n{reward_payload}\n\n"
-        f"attempts {RENDER_ATTEMPTS} x {RENDER_ROUNDS} max {RENDER_MAX_CANDS} | floors {MODEL_MIN_SHARPNESS}\n"
+        f"attempts {RENDER_ATTEMPTS} x {RENDER_ROUNDS} max {RENDER_MAX_CANDS} conc {IMAGE_CONCURRENCY} | floors {MODEL_MIN_SHARPNESS}\n"
         f"task spec: {json.dumps(MODEL_SPECS.get(IMAGE_MODEL, {})) or 'EMPTY'}\n"
         f"reward spec: {json.dumps(MODEL_SPECS.get(reward_model, {})) or 'EMPTY'}"
     )
@@ -1477,7 +1485,7 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user = session.query(UserState).filter_by(user_id=user_id).first()
         if user:
-            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_CHAIN}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE} | sharpen: {IMAGE_SHARPEN} | max_side: {IMAGE_MAX_SIDE}\nattempts: {RENDER_ATTEMPTS}x{RENDER_ROUNDS} max {RENDER_MAX_CANDS} | floors: {MODEL_MIN_SHARPNESS}\n\n/payload for the exact JSON")
+            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_CHAIN}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE} | sharpen: {IMAGE_SHARPEN} | max_side: {IMAGE_MAX_SIDE}\nattempts: {RENDER_ATTEMPTS}x{RENDER_ROUNDS} max {RENDER_MAX_CANDS} conc {IMAGE_CONCURRENCY} | floors: {MODEL_MIN_SHARPNESS}\n\n/payload for the exact JSON")
         else:
             await update.message.reply_text("No user record found")
     finally:
@@ -2380,7 +2388,7 @@ async def testreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reward_prompt(variant, wish), NEGATIVE_PROMPT_NUDE + variant["nude_negative"],
             reward_chain(), require_bare=True)
         if not raw:
-            await update.message.reply_text("All draws under floor.")
+            await update.message.reply_text("No images came back at all - check the log.")
             return
         final = await asyncio.to_thread(finalize_png, raw)
         await send_render(context, user_id, final, f"REWARD {score:.0f} | {verdict}")
@@ -2519,7 +2527,7 @@ def main():
     logger.info(f"Text: {TEXT_MODEL} | Vision: {VISION_CHAIN} | Probes: {PROBE_MODELS}")
     logger.info(f"Task model: {IMAGE_MODEL} | Reward model: {IMAGE_MODEL_REWARD or 'same'} | fallbacks: {IMAGE_FALLBACKS}")
     logger.info(f"Format: {IMAGE_FORMAT} | Upscale: {IMAGE_UPSCALE} | Aspect: {IMAGE_ASPECT} | Res: {IMAGE_RESOLUTION} | Sharpen: {IMAGE_SHARPEN} | MaxSide: {IMAGE_MAX_SIDE}")
-    logger.info(f"Attempts: {RENDER_ATTEMPTS}x{RENDER_ROUNDS} max {RENDER_MAX_CANDS} | Floors: {MODEL_MIN_SHARPNESS} | Task image chance: {TASK_IMAGE_CHANCE}")
+    logger.info(f"Attempts: {RENDER_ATTEMPTS}x{RENDER_ROUNDS} max {RENDER_MAX_CANDS} conc {IMAGE_CONCURRENCY} | Floors: {MODEL_MIN_SHARPNESS} | Task image chance: {TASK_IMAGE_CHANCE}")
     logger.info(f"Venue presets: {len(VENUE_BASELINE)}")
     logger.info(f"Cloudinary configured: {bool(os.getenv('CLOUDINARY_CLOUD_NAME'))} / {bool(os.getenv('CLOUDINARY_API_KEY'))} / {bool(os.getenv('CLOUDINARY_API_SECRET'))}")
     logger.info("=" * 60)
