@@ -190,10 +190,11 @@ HARLEY_VARIANTS = {
     "penis": {
         "label": "Penis",
         "body": "curvy athletic figure, medium breasts, futanari",
-        "clothed": "clear bulge in the front of the garment, visible cock outline",
-        "clause": "large erect penis clearly visible over the pussy, balls hanging, breasts bare",
+        "clothed": "obvious bulge in the front of her clothes, visibly packing, cock outline through the fabric",
+        "lead": "futanari, penis, balls",
+        "clause": "penis and balls clearly visible",
         "clothed_negative": ", flat smooth crotch",
-        "nude_negative": ", female genitals only, flat crotch, no penis",
+        "nude_negative": ", flat crotch, smooth crotch, tucked",
     },
 }
 
