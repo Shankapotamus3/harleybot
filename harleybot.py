@@ -4,6 +4,10 @@ Harley Quinn task bot.
 
 Changelog
 ---------
+- ensure_schema(): idempotent ADD COLUMN migration for Postgres. create_all
+  never alters existing tables, so the old user_states row killed post_init
+  and polling never started.
+- post_init no longer dies on a schema error.
 - Env-driven tuning restored: IMAGE_CFG, IMAGE_STEPS, IMAGE_MAX_SIDE,
   IMAGE_UPSCALE, IMAGE_UPSCALE_CREATIVITY, per-model floors.
 - Token resolution accepts BOT_TOKEN / TELEGRAM_BOT_TOKEN / TELEGRAM_TOKEN /
@@ -18,7 +22,6 @@ Changelog
 - Kids Present removed; boot migration maps existing rows to 'alone'.
 - arm_timeout cancels duplicate timeout jobs; auto_clear_task guards on
   expires_at.
-- get_spec caches on 200 only and prefetches off the event loop.
 - scheduler skips users without gender/outfit/location and rolls back per user.
 """
 
@@ -39,7 +42,7 @@ import httpx
 from PIL import Image, ImageFilter, ImageStat
 from sqlalchemy import (
     BigInteger, Column, DateTime, Float, Integer, String, Text, create_engine,
-    select,
+    inspect, select, text,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 from telegram import (
@@ -312,12 +315,12 @@ _VERDICT_RE = re.compile(r"\b(BARE|COVERED|UNSURE)\b")
 async def nude_check(client: Client, png: bytes) -> str:
     for model in VISION_CHAIN:
         try:
-            text = (await client.chat_vision(model, NUDE_PROMPT, png)).upper()
+            text_ = (await client.chat_vision(model, NUDE_PROMPT, png)).upper()
         except Exception as exc:
             log.warning("nude_check %s failed: %s", model, exc)
             continue
-        log.info("nude_check %s reply %r", model, text[:80])
-        m = _VERDICT_RE.search(text)
+        log.info("nude_check %s reply %r", model, text_[:80])
+        m = _VERDICT_RE.search(text_)
         if m:
             return m.group(1)
         log.info("nude_check %s unparsed", model)
@@ -778,21 +781,21 @@ async def setup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def setup_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     uid = update.effective_user.id
-    text = (update.message.text or "").strip()
+    text_ = (update.message.text or "").strip()
     with db() as s:
         st = s.get(UserState, uid)
         if not st:
             return False
         if st.step == "location":
-            st.location = text[:128]
+            st.location = text_[:128]
             st.step = "context"
-            s.add(LocationConstraint(user_id=uid, label=text[:128]))
+            s.add(LocationConstraint(user_id=uid, label=text_[:128]))
             await update.message.reply_text(
                 "Who's around?", reply_markup=setup_context_kb()
             )
             return True
         if st.step == "partner":
-            st.partner = text[:64]
+            st.partner = text_[:64]
             st.step = "done"
             await update.message.reply_text("Ready. /task to start.")
             return True
@@ -808,9 +811,9 @@ async def issue_task(update_or_chat, context, uid: int, kind: str = "task"):
         st = s.get(UserState, uid)
         if not st or not st.gender or not st.outfit or not st.location:
             return None
-        text = generate_task_text(st)
+        body = generate_task_text(st)
         task = Task(
-            user_id=uid, kind=kind, text=text,
+            user_id=uid, kind=kind, text=body,
             expires_at=utcnow() + timedelta(hours=TASK_TTL_HOURS),
         )
         s.add(task)
@@ -820,7 +823,7 @@ async def issue_task(update_or_chat, context, uid: int, kind: str = "task"):
     arm_timeout(context, tid, uid)
     chat_id = getattr(update_or_chat, "chat_id", None) or getattr(
         getattr(update_or_chat, "chat", None), "id", uid)
-    await context.bot.send_message(chat_id, f"*{kind.upper()}*\n{text}",
+    await context.bot.send_message(chat_id, f"*{kind.upper()}*\n{body}",
                                    parse_mode=ParseMode.MARKDOWN)
     return tid
 
@@ -1043,7 +1046,7 @@ async def send_render(chat, context, prompt, negative, chain, *, bare):
     )
 
 
-async def tryn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _tryn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
     model = args[0] if args else IMAGE_MODEL
     n = int(args[1]) if len(args) > 1 and args[1].isdigit() else 5
@@ -1060,6 +1063,18 @@ async def tryn(update: Update, context: ContextTypes.DEFAULT_TYPE):
             io.BytesIO(png), filename=f"{score:.0f}.png",
             caption=f"{score:.1f} · {len(png)}B",
         )
+
+
+async def tryn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await _tryn(update, context)
+    except Exception as exc:
+        log.exception("tryn failed")
+        await update.message.reply_text(f"tryn crashed: {type(exc).__name__}: {exc}")
+
+
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"pong key={bool(VENICE_KEY)} args={context.args}")
 
 
 async def tryreward(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1137,25 +1152,91 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --------------------------------------------------------------------------- #
-# boot
+# schema
 # --------------------------------------------------------------------------- #
 
-def migrate_kids_context():
+COLUMN_DDL = {
+    "user_states": {
+        "step": "VARCHAR(32) DEFAULT 'gender'",
+        "gender": "VARCHAR(16)",
+        "outfit": "VARCHAR(16)",
+        "location": "VARCHAR(128)",
+        "context": "VARCHAR(16) DEFAULT 'alone'",
+        "partner": "VARCHAR(64)",
+        "avatar_slot": "INTEGER DEFAULT 0",
+        "owner_set": "INTEGER DEFAULT 0",
+        "completed": "INTEGER DEFAULT 0",
+        "reward_streak": "INTEGER DEFAULT 0",
+        "last_task_at": "TIMESTAMP",
+        "created_at": "TIMESTAMP",
+    },
+    "tasks": {
+        "kind": "VARCHAR(16) DEFAULT 'task'",
+        "text": "TEXT",
+        "status": "VARCHAR(16) DEFAULT 'pending'",
+        "reworks": "INTEGER DEFAULT 0",
+        "blocked_count": "INTEGER DEFAULT 0",
+        "blocked_task_id": "INTEGER",
+        "sharpness": "DOUBLE PRECISION",
+        "verdict": "VARCHAR(16)",
+        "created_at": "TIMESTAMP",
+        "expires_at": "TIMESTAMP",
+    },
+    "task_history": {"detail": "TEXT", "action": "VARCHAR(32)"},
+    "user_images": {
+        "file_id": "VARCHAR(256)", "sharpness": "DOUBLE PRECISION",
+        "verdict": "VARCHAR(16)", "task_id": "INTEGER",
+    },
+}
+
+
+def ensure_schema():
     Base.metadata.create_all(_engine)
+    insp = inspect(_engine)
+    tables = set(insp.get_table_names())
+    with _engine.begin() as conn:
+        for table, cols in COLUMN_DDL.items():
+            if table not in tables:
+                continue
+            have = {c["name"] for c in insp.get_columns(table)}
+            for col, ddl in cols.items():
+                if col not in have:
+                    log.warning("migrating: adding %s.%s", table, col)
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
+        conn.execute(text(
+            "UPDATE user_states SET step = 'done' "
+            "WHERE gender IS NOT NULL AND (step IS NULL OR step = 'gender')"
+        ))
+
+
+def migrate_kids_context():
     with db() as s:
         for st in s.scalars(select(UserState)).all():
             if st.context == "kids":
                 st.context = "alone"
 
 
+# --------------------------------------------------------------------------- #
+# boot
+# --------------------------------------------------------------------------- #
+
 async def post_init(app: Application):
-    migrate_kids_context()
+    try:
+        ensure_schema()
+        migrate_kids_context()
+    except Exception:
+        log.exception("schema migration failed")
     app.job_queue.run_repeating(scheduler_tick, interval=SCHEDULER_INTERVAL,
                                 first=60, name="scheduler")
     log.info(
         "booted cfg=%.1f steps=%d max_side=%d upscale=%.2f",
         IMAGE_CFG, IMAGE_STEPS, IMAGE_MAX_SIDE, IMAGE_UPSCALE,
     )
+
+
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cmd = (update.message.text or "").split()[0]
+    await update.message.reply_text(f"unknown: {cmd} | args={context.args}")
 
 
 def main():
@@ -1167,6 +1248,7 @@ def main():
     log.info("token %s…%s", BOT_TOKEN[:4], BOT_TOKEN[-4:])
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler("task", task_command))
     app.add_handler(CommandHandler("tryn", tryn))
     app.add_handler(CommandHandler("tryreward", tryreward))
@@ -1180,6 +1262,7 @@ def main():
     app.add_handler(CallbackQueryHandler(task_callback, pattern=r"^(rw|bl|dn):\d+$"))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_error_handler(error_handler)
     app.run_polling(drop_pending_updates=True)
 
