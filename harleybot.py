@@ -6,12 +6,14 @@ Fixed avatar with a penis/vagina toggle, real vision verification.
 Venue features: static presets by default, AI extension when the API cooperates.
 
 Changelog:
-- setreward_callback defined (was registered but missing)
-- reward_negative helper restored
-- _debug_send accepts upscale/gate; filename sanitised
-- lustify-v8 back to 1440x1920 / 50 steps; box defaults to the model maximum
+- safe_mode forced false (the API defaults it on and sanitises every render)
+- IMAGE_MINIMAL strips steps/cfg/negative so the payload matches the website
+- _request_image is single-attempt: no floor, one silent re-roll only on an upscaled render
+- byte-density check catches the server-side upscale mode; no longer a score gate
+- unsharp mask 80 -> 50 so soft renders stop getting crunchy
+- setreward_callback defined; reward_negative restored
+- lustify capped at 1280 so the request never exceeds the model's ceiling
 - duplicate /model handler removed; error_handler registered
-- probes_for guarded against bad JSON
 """
 
 import os
@@ -86,12 +88,21 @@ IMAGE_STEPS = os.getenv("IMAGE_STEPS", "45").strip()
 IMAGE_CFG = os.getenv("IMAGE_CFG", "7.5").strip()
 IMAGE_MAX_SIDE = os.getenv("IMAGE_MAX_SIDE", "1920").strip()
 
+# Strip the payload back to what the website sends: model, prompt, format,
+# safe_mode, box. Server defaults for steps and cfg, no negative.
+MINIMAL_PAYLOAD = os.getenv("IMAGE_MINIMAL", "0") == "1"
+
 MEASURE_EDGE = 1024
 VISION_EDGE = 768
 TARGET_LONG_EDGE = 1920
 RENDER_ATTEMPTS = int(os.getenv("RENDER_ATTEMPTS", "8"))
 TASK_IMAGE_CHANCE = float(os.getenv("TASK_IMAGE_CHANCE", "0.3"))
 IMAGE_CONCURRENCY = int(os.getenv("IMAGE_CONCURRENCY", "4"))
+
+# An upscaled render collapses in bytes while keeping its dimensions. Sharp
+# photographic PNG runs about 2.4 bytes/px, an upscale about 0.2. 1.0 sits
+# between them. Set 0 to disable the re-roll entirely.
+MUSH_BYTES_PER_PX = float(os.getenv("MUSH_BYTES_PER_PX", "1.0"))
 
 _image_sem = threading.Semaphore(IMAGE_CONCURRENCY)
 
@@ -104,7 +115,7 @@ def _envf(name, default):
 
 
 MODEL_MIN_SHARPNESS = {
-    "lustify-v8": _envf("LUSTIFY_MIN_SHARPNESS", 250.0),
+    "lustify-v8": _envf("LUSTIFY_MIN_SHARPNESS", 120.0),
     "chroma": _envf("CHROMA_MIN_SHARPNESS", 60.0),
     "grok-imagine-image": _envf("GROK_MIN_SHARPNESS", 250.0),
     "z-image-turbo": _envf("ZIMAGE_MIN_SHARPNESS", 250.0),
@@ -127,8 +138,9 @@ KNOWN_MODELS = {
         "res": ["1K", "2K"],
     },
     "chroma": {"mode": "pixels", "max_w": 1280, "max_h": 1280, "steps_max": 10},
-    # lustify renders natively at 1440x1920 and hard-rejects anything taller.
-    "lustify-v8": {"mode": "pixels", "max_w": 1440, "max_h": 1920, "steps_max": 50},
+    # lustify renders natively at 960x1280 and tops out at 1280 a side.
+    # Anything above that is stretched by the server, which is the mush mode.
+    "lustify-v8": {"mode": "pixels", "max_w": 1280, "max_h": 1280, "steps_max": 50},
     "z-image-turbo": {"mode": "pixels", "max_w": 1280, "max_h": 1280, "steps_max": 8},
 }
 
@@ -138,13 +150,11 @@ SHARP_TAIL = "sharp focus, natural skin texture, directional studio light, 85mm"
 NEGATIVE_PROMPT = "blurry, soft focus, bokeh, plastic skin, extra fingers, fused fingers"
 NEGATIVE_PROMPT_SEXY = "stiff catalogue pose, stock photo, mannequin, plastic skin, extra fingers, fused fingers"
 NEGATIVE_PROMPT_NUDE = (
-    "blurry, out of focus, soft focus, bokeh, shallow depth of field, "
-    "hazy, low contrast, washed out, plastic skin, airbrushed, "
     "briefs, boxers, panties, knickers, trousers, jeans, skirt, towel, sheet, "
     "sarong, loincloth, drapery, fabric over the groin, clothing over the groin, "
-    "censored, mosaic, partially covered, cropped at the hips"
+    "censored, mosaic, partially covered"
 )
-NEGATIVE_HARD = ", any clothing, underwear, bra, panties, fabric, boots, stockings, blurry, soft focus, bokeh"
+NEGATIVE_HARD = ", any clothing, underwear, bra, panties, fabric, boots, stockings"
 STUDIO = "against a seamless charcoal studio backdrop, subtle rim light from behind"
 NUDE = "fully nude except for"
 SOFT_WORDS = re.compile(
@@ -417,7 +427,7 @@ def finalize_png(raw):
         logger.warning(f"UNDERSIZED RENDER: {img.size}")
     img.thumbnail((int(IMAGE_MAX_SIDE), int(IMAGE_MAX_SIDE)), Image.LANCZOS)
     if IMAGE_SHARPEN == "1":
-        img = img.filter(ImageFilter.UnsharpMask(radius=1.0, percent=80, threshold=3))
+        img = img.filter(ImageFilter.UnsharpMask(radius=1.0, percent=50, threshold=3))
     out = BytesIO()
     img.save(out, format="PNG", compress_level=1)
     return out.getvalue()
@@ -1031,7 +1041,9 @@ def _payload(prompt, model, negative=None):
     known = KNOWN_MODELS.get(model, {})
     ratio_mode = bool(c.get('aspectRatios')) or (not c and known.get('mode') == "ratio")
     data = {"model": model, "prompt": prompt, "format": IMAGE_FORMAT}
-    if negative:
+    # The API defaults safe_mode on, which sanitises every render.
+    data["safe_mode"] = False
+    if negative and not MINIMAL_PAYLOAD:
         data["negative_prompt"] = negative
     if ratio_mode:
         ratios = c.get('aspectRatios') or known.get("ratios") or ["3:4"]
@@ -1042,8 +1054,8 @@ def _payload(prompt, model, negative=None):
         div = max(1, int(c.get('widthHeightDivisor') or 8))
         max_w = int(c.get('maxWidth') or known.get("max_w") or 1280)
         max_h = int(c.get('maxHeight') or known.get("max_h") or 1280)
-        # Default to the model's own ceiling rather than a shared 960 box; an
-        # under-sized request is what the model then upscales into mush.
+        # Default to the model's own ceiling rather than a shared box; asking
+        # above it is what the server answers by stretching a smaller render.
         w = min(int(os.getenv("IMAGE_WIDTH", str(max_w))), max_w)
         h = min(int(os.getenv("IMAGE_HEIGHT", str(max_h))), max_h)
         data["width"] = max(div, (w // div) * div)
@@ -1053,8 +1065,9 @@ def _payload(prompt, model, negative=None):
             data["resolution"] = IMAGE_RESOLUTION if IMAGE_RESOLUTION in res else res[-1]
         step_spec = c.get('steps') or {}
         max_steps = int(step_spec.get('max') or known.get("steps_max") or 30)
-        data["steps"] = min(int(IMAGE_STEPS), max_steps)
-        data["cfg_scale"] = float(IMAGE_CFG)
+        if not MINIMAL_PAYLOAD:
+            data["steps"] = min(int(IMAGE_STEPS), max_steps)
+            data["cfg_scale"] = float(IMAGE_CFG)
     return data
 
 
@@ -1146,36 +1159,41 @@ def _score_bytes(raw):
 
 
 async def _request_image(prompt, negative=None, chain=None, min_sharp=None):
-    """Per-model, up to three attempts, regenerate on a bad or soft render."""
+    """One request. Deliver what comes back. A single silent re-roll only if the
+    render arrived upscaled. No floor, no score gate."""
     prompt = build_prompt(prompt)
     if not chain:
         chain = [IMAGE_MODEL] + [m for m in IMAGE_FALLBACKS if m != IMAGE_MODEL]
-    best = None
-    for model in chain:
-        floor = MODEL_MIN_SHARPNESS.get(model, DEFAULT_MIN_SHARPNESS) if min_sharp is None else min_sharp
+    model = chain[0]
+    data = _payload(prompt, model, negative)
+    last = None
+    for attempt in range(2):
+        raw = await asyncio.to_thread(_post_image, dict(data), model)
+        if not raw:
+            continue
+        try:
+            img = Image.open(BytesIO(raw))
+            img.load()
+            img = img.convert("RGB")
+        except Exception:
+            continue
+        density = len(raw) / max(1, img.size[0] * img.size[1])
+        score = sharpness_score(img)
+        last = (raw, score)
+        logger.info(
+            f"[{model}] {img.size} sharp {score:.1f} {len(raw)}b {density:.2f}b/px"
+        )
+        if MUSH_BYTES_PER_PX and density < MUSH_BYTES_PER_PX and attempt == 0:
+            logger.warning(f"[{model}] upscaled render, one re-roll")
+            continue
+        return raw, score
+    if last:
+        return last
+    for model in chain[1:]:
         data = _payload(prompt, model, negative)
-        for attempt in range(3):
-            raw = await asyncio.to_thread(_post_image, dict(data), model)
-            if not raw:
-                break
-            try:
-                img = Image.open(BytesIO(raw))
-                img.load()
-                img = img.convert("RGB")
-            except Exception:
-                break
-            score = sharpness_score(img)
-            ok = check_render(img.size)
-            logger.info(f"[{model}] attempt {attempt + 1} {img.size} sharp {score:.1f} ok={ok}")
-            if best is None or score > best[0]:
-                best = (score, raw)
-            if ok and score >= floor:
-                return raw, score
-            if attempt < 2:
-                logger.warning(f"[{model}] bad render ({score:.1f}), regenerating")
-        logger.warning(f"[{model}] exhausted attempts")
-    if best:
-        return best[1], best[0]
+        raw = await asyncio.to_thread(_post_image, dict(data), model)
+        if raw:
+            return raw, await asyncio.to_thread(_score_bytes, raw)
     return None, 0.0
 
 
@@ -1372,8 +1390,7 @@ async def send_avatar_photo(context, chat_id, image_bytes, caption):
 
 async def _debug_send(context, user_id, label, prompt, negative, chain=None,
                       upscale=False, gate=True):
-    """Batch harness. Every draw is delivered with its score; `gate` only annotates the
-    floor so a gated and an ungated run are comparable."""
+    """Batch harness. Every draw is delivered with its score."""
     floor_note = "gated" if gate else "floor off"
     batch = await _render_batch(prompt, negative, chain)
     safe_label = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_") or "draw"
@@ -1526,8 +1543,8 @@ async def payload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"TASK {IMAGE_MODEL}\n{task_payload}\n\n"
         f"REWARD {reward_model}\n{reward_payload}\n\n"
-        f"3 attempts/model, conc {IMAGE_CONCURRENCY} | floors {MODEL_MIN_SHARPNESS}\n"
-        f"vision chain {VISION_CHAIN}"
+        f"minimal={MINIMAL_PAYLOAD} | mush<{MUSH_BYTES_PER_PX} b/px | conc {IMAGE_CONCURRENCY}\n"
+        f"floors {MODEL_MIN_SHARPNESS}\nvision chain {VISION_CHAIN}"
     )
 
 
@@ -1537,7 +1554,7 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user = session.query(UserState).filter_by(user_id=user_id).first()
         if user:
-            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_CHAIN}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE} | sharpen: {IMAGE_SHARPEN} | max_side: {IMAGE_MAX_SIDE} | steps: {IMAGE_STEPS} | cfg: {IMAGE_CFG}\n\n/payload for the exact JSON")
+            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_CHAIN}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE} | sharpen: {IMAGE_SHARPEN} | max_side: {IMAGE_MAX_SIDE} | steps: {IMAGE_STEPS} | cfg: {IMAGE_CFG} | minimal: {MINIMAL_PAYLOAD}\n\n/payload for the exact JSON")
         else:
             await update.message.reply_text("No user record found")
     finally:
@@ -2411,7 +2428,8 @@ async def debugavatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session.close()
     await update.message.reply_text(
         f"Debug batch - task then reward. {RENDER_ATTEMPTS} draws each, floor 0, scores shown. "
-        f"Task {IMAGE_MODEL}, reward {IMAGE_MODEL_REWARD or 'same'}, variant {variant['label']}, cfg {IMAGE_CFG}, steps {IMAGE_STEPS}."
+        f"Task {IMAGE_MODEL}, reward {IMAGE_MODEL_REWARD or 'same'}, variant {variant['label']}, "
+        f"cfg {IMAGE_CFG}, steps {IMAGE_STEPS}, minimal {MINIMAL_PAYLOAD}."
     )
     dom = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
            f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
@@ -2423,7 +2441,7 @@ async def debugavatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def testreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Force a reward through the real path: floor, BARE gate, nudity retry, fallback."""
+    """Force a reward through the real path: nudity gate, retry pass, fallback."""
     user_id = update.effective_user.id
     session = get_session()
     try:
@@ -2433,8 +2451,7 @@ async def testreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session.close()
     wish = " ".join(context.args).strip()[:120] if context.args else None
     model = IMAGE_MODEL_REWARD or IMAGE_MODEL
-    floor = MODEL_MIN_SHARPNESS.get(model, DEFAULT_MIN_SHARPNESS)
-    await update.message.reply_text(f"Reward test on {model}, floor {floor:.0f}...")
+    await update.message.reply_text(f"Reward test on {model}, minimal {MINIMAL_PAYLOAD}...")
     try:
         raw, score, verdict = await _render_best(
             reward_prompt(variant, wish), reward_negative(variant),
@@ -2685,7 +2702,8 @@ def main():
     logger.info(f"Text: {TEXT_MODEL} | Vision: {VISION_CHAIN} | Probes: {PROBE_MODELS}")
     logger.info(f"Task model: {IMAGE_MODEL} | Reward model: {IMAGE_MODEL_REWARD or 'same'} | fallbacks: {IMAGE_FALLBACKS}")
     logger.info(f"Format: {IMAGE_FORMAT} | Upscale: {IMAGE_UPSCALE} | Aspect: {IMAGE_ASPECT} | Res: {IMAGE_RESOLUTION} | Sharpen: {IMAGE_SHARPEN} | MaxSide: {IMAGE_MAX_SIDE} | Steps: {IMAGE_STEPS} | CFG: {IMAGE_CFG}")
-    logger.info(f"3 attempts per model, concurrency {IMAGE_CONCURRENCY} | Floors: {MODEL_MIN_SHARPNESS}")
+    logger.info(f"Minimal payload: {MINIMAL_PAYLOAD} | mush < {MUSH_BYTES_PER_PX} b/px | concurrency {IMAGE_CONCURRENCY}")
+    logger.info(f"Floors (reference only): {MODEL_MIN_SHARPNESS}")
     logger.info(f"Venue presets: {len(VENUE_BASELINE)}")
     logger.info(f"Cloudinary configured: {bool(os.getenv('CLOUDINARY_CLOUD_NAME'))} / {bool(os.getenv('CLOUDINARY_API_KEY'))} / {bool(os.getenv('CLOUDINARY_API_SECRET'))}")
     logger.info("=" * 60)
