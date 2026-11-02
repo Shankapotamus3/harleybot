@@ -4,6 +4,32 @@ Harley Quinn Bot - Domme, chaotic, dangerously fun.
 Harley's voice comes from a local system prompt. No character_slug dependency.
 Fixed avatar with a penis/vagina toggle, real vision verification.
 Venue features: static presets by default, AI extension when the API cooperates.
+
+CHANGES IN THIS REVISION
+  1. Kids Present removed from CONTEXT_OPTIONS, generate_task_text, present_callback
+     and the location keyboard. Existing "kids" rows migrate to "alone" at boot.
+  2. Sharpness gate rewritten to variance-of-Laplacian. The old FIND_EDGES stddev
+     scored the backdrop gradient and passed blurred frames. MIN_SHARPNESS recalibrated.
+  3. check_render now FAILS an attempt (upscaled / undersized) instead of only warning.
+  4. reward_prompt: framing contradictions removed. One framing, cropped at mid-thigh.
+  5. SHARP_TAIL no longer duplicated - build_prompt is the single injection point.
+  6. STUDIO: hard key light instead of "subtle rim light" on a featureless backdrop.
+  7. NEGATIVE_PROMPT_NUDE trimmed, "cropped at the hips" dropped (it fought the prompt).
+  8. normalize_for_telegram: unsharp 140%->80%, threshold 5, JPEG q94.
+  9. steps/cfg now sent in ratio mode when the live spec declares them.
+ 10. Timeout jobs are cancelled before re-arming; auto_clear_task guards on expires_at.
+ 11. handle_blocker_input no longer leaves the user trapped after 3 reworks.
+ 12. Scheduler skips users who never finished setup; per-user rollback on error.
+ 13. get_spec only caches on success; specs prefetched off the event loop.
+ 14. naive/aware datetime helpers so SQLite does not raise.
+ 15. handle_photo commits before the user lookup.
+ 16. trans/nonbinary get a real outfit list instead of silently falling back to male.
+ 17. Global error handler.
+
+IMAGE_RESOLUTION is still 2K by default. With check_render now failing undersized
+renders, a model that answers a 2K request with ~1K gets caught and retried instead
+of being sharpened into mush. Watch the log for UNDERSIZED 2K RENDER; if it is
+constant, set IMAGE_RESOLUTION=1K and let the local downscale do the work.
 """
 
 import os
@@ -58,10 +84,10 @@ IMAGE_SHARPEN = os.getenv("IMAGE_SHARPEN", "1").strip()
 IMAGE_STEPS = os.getenv("IMAGE_STEPS", "30").strip()
 IMAGE_CFG = os.getenv("IMAGE_CFG", "5").strip()
 IMAGE_MAX_SIDE = os.getenv("IMAGE_MAX_SIDE", "1280").strip()
-# Edge energy below this counts as a bad render and gets regenerated. Low because a clean
-# studio portrait on a seamless backdrop has very few edges - 12 was rejecting good frames.
-MIN_SHARPNESS = 4.0
-MODEL_SPEC = {}
+# Variance-of-Laplacian. Collapses hard on blur; the old FIND_EDGES stddev did not.
+# Sharp frames score in the hundreds to thousands, mush under ~100. Recalibrate if
+# the model mix changes: log ten good renders and set this at ~40% of the lowest.
+MIN_SHARPNESS = 150.0
 MODEL_SPECS = {}
 
 # Used when the live spec is empty, so a failed /models fetch cannot cripple the payload.
@@ -92,8 +118,11 @@ NATIVE_CAPS = {"chroma": (960, 1280)}
 SHARP_TAIL = "sharp focus, natural skin texture, directional studio light, 85mm"
 NEGATIVE_PROMPT = "blurry, soft focus, bokeh, plastic skin, extra fingers, fused fingers"
 NEGATIVE_PROMPT_SEXY = "stiff catalogue pose, stock photo, mannequin, plastic skin, extra fingers, fused fingers"
-NEGATIVE_PROMPT_NUDE = "briefs, boxers, panties, knickers, trousers, jeans, skirt, towel, sheet, sarong, loincloth, drapery, fabric over the groin, clothing over the groin, censored, mosaic, partially covered, cropped at the hips"
-STUDIO = "against a seamless charcoal studio backdrop, subtle rim light from behind"
+# No "cropped at the hips" - it used to fight the framing instruction and the model hedged.
+NEGATIVE_PROMPT_NUDE = "briefs, boxers, panties, knickers, trousers, jeans, skirt, towel, sheet, sarong, loincloth, drapery, fabric over the groin, clothing over the groin, censored, mosaic"
+# "subtle rim light" was a softness cue and a seamless backdrop gives the edge detector
+# nothing to work with. Hard key, crisp shadow edges.
+STUDIO = "against a seamless charcoal studio backdrop, hard key light from camera left, crisp shadow edges"
 # Bare "nude" rather than "fully nude except for" - nano-banana's policy trips on the longer claims.
 NUDE = "nude"
 SOFT_WORDS = re.compile(
@@ -280,12 +309,23 @@ class LocationConstraint(Base):
     expires_at = Column(DateTime(timezone=True), nullable=False)
     times_hit = Column(Integer, default=1)
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+_connect_args = {"check_same_thread": False} if (DATABASE_URL or "").startswith("sqlite") else {}
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args=_connect_args)
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
 
 def get_session():
     return Session()
+
+# ============ TIME HELPERS ============
+def utcnow():
+    return datetime.now(timezone.utc)
+
+def aware(dt):
+    """SQLite hands back naive datetimes even with timezone=True. Normalise before maths."""
+    if dt is None:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 # ============ IMAGE HANDLING ============
 def sniff_ext(b):
@@ -305,25 +345,39 @@ def image_size(image_bytes):
         return (0, 0)
 
 def sharpness_score(image_bytes):
-    """Mean edge energy on a downscaled greyscale copy. Low means mush or a black frame."""
+    """Variance of Laplacian on a downscaled greyscale copy.
+
+    The previous metric was stddev of FIND_EDGES, which the backdrop gradient alone
+    satisfied - a ghosted subject scored well above the floor and passed. Laplacian
+    variance collapses on blur, which is the actual signal.
+    """
     try:
         img = Image.open(BytesIO(image_bytes)).convert("L")
         img.thumbnail((512, 512))
-        return ImageStat.Stat(img.filter(ImageFilter.FIND_EDGES)).stddev[0]
+        lap = img.filter(ImageFilter.Kernel((3, 3), (0, 1, 0, 1, -4, 1, 0, 1, 0), scale=1))
+        return ImageStat.Stat(lap).var[0]
     except Exception:
         return 0.0
 
 def check_render(size, data):
-    """Compare the returned render against what was asked for. Catches silent upscaling."""
+    """Compare the returned render against what was asked for. True if usable.
+
+    Now returns a verdict rather than only logging, so a silently upscaled or
+    undersized frame costs an attempt instead of being sharpened into mush.
+    """
     w, h = size
     req_w, req_h = data.get("width"), data.get("height")
     if req_w and req_h:
         if w > req_w * 1.2 or h > req_h * 1.2:
             logger.warning(f"UPSCALED RENDER: asked {req_w}x{req_h}, got {w}x{h}")
-        elif w < req_w * 0.8 or h < req_h * 0.8:
+            return False
+        if w < req_w * 0.8 or h < req_h * 0.8:
             logger.warning(f"UNDERSIZED RENDER: asked {req_w}x{req_h}, got {w}x{h}")
+            return False
     elif data.get("resolution") == "2K" and max(w, h) < 1500:
-        logger.warning(f"UNDERSIZED 2K RENDER: {w}x{h}")
+        logger.warning(f"UNDERSIZED 2K RENDER: {w}x{h} - model is not honouring 2K")
+        return False
+    return True
 
 def normalize_for_telegram(image_bytes, max_side=1280, sharpen=True):
     """Decode any image format, cap the long edge, sharpen, re-encode as baseline JPEG."""
@@ -340,11 +394,12 @@ def normalize_for_telegram(image_bytes, max_side=1280, sharpen=True):
         img = img.convert("RGB")
         img.thumbnail((max_side, max_side), Image.LANCZOS)
         if sharpen:
-            img = img.filter(ImageFilter.UnsharpMask(radius=1.0, percent=140, threshold=3))
+            # 140% on an already-soft downscale produced halos that read as smear.
+            img = img.filter(ImageFilter.UnsharpMask(radius=1.0, percent=80, threshold=5))
             img = ImageEnhance.Contrast(img).enhance(1.04)
             img = ImageEnhance.Sharpness(img).enhance(1.10)
         out = BytesIO()
-        img.save(out, format="JPEG", quality=90, progressive=False, optimize=True)
+        img.save(out, format="JPEG", quality=94, progressive=False, optimize=True)
         return out.getvalue()
     except Exception as e:
         logger.error(f"Image normalize error: {e}")
@@ -363,14 +418,14 @@ async def upload_to_cloudinary(image_bytes, user_id, image_type='user_upload', f
         if isinstance(image_bytes, (bytes, bytearray)):
             image_bytes = BytesIO(image_bytes)
         image_bytes.seek(0)
-        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+        timestamp = utcnow().strftime('%Y%m%d_%H%M%S')
         public_id = f"{folder}/user_{user_id}/{image_type}_{timestamp}_{random.randint(1000, 9999)}"
         result = await asyncio.to_thread(
             cloudinary.uploader.upload,
             image_bytes,
             public_id=public_id,
             resource_type="image",
-            context={'user_id': str(user_id), 'image_type': image_type, 'uploaded_at': str(datetime.now(timezone.utc))},
+            context={'user_id': str(user_id), 'image_type': image_type, 'uploaded_at': str(utcnow())},
             tags=[f"user_{user_id}", image_type, "telegram_bot"]
         )
         logger.info(f"Cloudinary upload success: {result.get('public_id')}")
@@ -455,7 +510,7 @@ VENUE_BASELINE = {
 def get_probe_key(location):
     low = (location or "").lower()
     for alias, key in _ALIAS_ORDER:
-        if alias in low:
+        if re.search(rf"\b{re.escape(alias)}\b", low):
             return key
     return "Generic"
 
@@ -499,6 +554,9 @@ OUTFIT_OPTIONS = {
     "custom": {"emoji": "✏️", "name": "Custom", "male_items": [], "female_items": []}
 }
 
+# trans/nonbinary used to fall through to male_items silently. Map them explicitly.
+GENDER_OUTFIT_KEY = {"male": "male", "female": "female", "trans": "female", "nonbinary": "male"}
+
 GENDER_GUIDELINES = {
     "male": {"body_parts": ["chest", "abs", "cock", "balls", "ass"], "cannot": ["cleavage", "bra", "panties"]},
     "female": {"body_parts": ["cleavage", "breasts", "nipples", "pussy", "ass"], "cannot": ["cock", "balls"]},
@@ -506,12 +564,12 @@ GENDER_GUIDELINES = {
     "nonbinary": {"body_parts": ["chest", "breasts", "genitals", "ass"], "cannot": []}
 }
 
+# Kids Present removed. Existing "kids" rows are migrated to "alone" at boot.
 CONTEXT_OPTIONS = {
     "alone": {"emoji": "🧍", "name": "Alone", "bonus": 0},
     "partner": {"emoji": "💑", "name": "Partner Home", "bonus": 1},
     "roommates": {"emoji": "🏠", "name": "Roommates", "bonus": 1},
     "parents": {"emoji": "👨‍👩‍👧", "name": "Family", "bonus": 2},
-    "kids": {"emoji": "👶", "name": "Kids Present", "bonus": 3},
     "friends": {"emoji": "🎉", "name": "Friends Over", "bonus": 1},
     "public": {"emoji": "👥", "name": "Public/Strangers", "bonus": 0}
 }
@@ -583,7 +641,10 @@ def variant_phrase(variant):
     return f", {variant['clothed']}" if variant.get("clothed") else ""
 
 def probes_for(user):
-    return json.loads(user.location_probes or '[]')
+    try:
+        return json.loads(user.location_probes or '[]')
+    except (ValueError, TypeError):
+        return []
 
 def venue_baseline(user, location):
     stored = probes_for(user)
@@ -597,11 +658,13 @@ def reward_chain():
     return None
 
 def reward_prompt(variant, wish=None):
+    """One framing only. 'face filling the upper third' used to fight 'hips up' and the
+    model hedged, which is what a soft subject looks like. SHARP_TAIL is added by
+    build_prompt, not here."""
     wish_text = f", {wish[:120]}" if wish else ""
     clause = variant.get("clause") or "genitals clearly visible"
     return (f"Raw editorial photograph of {HARLEY_BASE}, {variant.get('body', '')}, {NUDE} {random.choice(REWARD_GEAR)}, "
-            f"{clause}, {random.choice(REWARD_POSES)}{wish_text}, framed from the hips up, "
-            f"face filling the upper third, {STUDIO}, {SHARP_TAIL}")
+            f"{clause}, {random.choice(REWARD_POSES)}{wish_text}, cropped at mid-thigh, {STUDIO}")
 
 def reward_negative(variant):
     return NEGATIVE_PROMPT_NUDE + (variant.get("nude_negative") or "")
@@ -613,6 +676,18 @@ def task_keyboard(task_id, title):
         [InlineKeyboardButton("❌ I can't...", callback_data=f"giveup_{task_id}")],
         [InlineKeyboardButton("🙏 Mercy", callback_data=f"mercy_{task_id}")],
     ])
+
+def arm_timeout(context, user_id, task_id, when):
+    """Cancel any existing timeout for this task before arming a new one.
+
+    PTB allows duplicate job names, so re-arming after a rework used to leave the
+    original timer live. It fired at the old expiry and killed the fresh task.
+    """
+    name = f"timeout_{task_id}"
+    for job in context.job_queue.get_jobs_by_name(name):
+        job.schedule_removal()
+    context.job_queue.run_once(auto_clear_task, when=when,
+                               data={'user_id': user_id, 'task_id': task_id}, name=name)
 
 async def generate_ai_response(prompt, temperature=0.9):
     try:
@@ -756,9 +831,6 @@ async def generate_task_text(user, session=None, depth=0):
     others = user.context_others or "alone"
     privacy = user.context_privacy or "private"
     actual_risk = weighted_risk(max_risk)
-    if others == "kids":
-        actual_risk = min(2, actual_risk)
-        max_risk = min(2, max_risk)
     outfit_text = user.outfit_detail or ", ".join(outfit_items) or "clothing"
     detail = user.location_detail or ""
     guide = GENDER_GUIDELINES.get(gender, GENDER_GUIDELINES["nonbinary"])
@@ -795,7 +867,7 @@ async def generate_task_text(user, session=None, depth=0):
         blockers = session.query(LocationConstraint).filter(
             LocationConstraint.user_id == user.user_id,
             LocationConstraint.location == location,
-            LocationConstraint.expires_at > datetime.now(timezone.utc)
+            LocationConstraint.expires_at > utcnow()
         ).all()
     blockers_text = "\n".join(f"- {b.constraint}" for b in blockers) if blockers else "none"
 
@@ -871,29 +943,33 @@ SETTING: <the setting, 2-5 words>"""
 
 # ============ AVATAR ============
 def get_spec(model):
-    """Per-model constraints, fetched once and cached."""
+    """Per-model constraints, fetched once and cached.
+
+    Only caches on a successful fetch. The old version cached {} on any failure,
+    so one boot-time blip poisoned that model for the life of the process.
+    """
     if model in MODEL_SPECS:
         return MODEL_SPECS[model]
     spec = {}
+    ok = False
     try:
         r = requests.get(
             f"{VENICE_API_URL}/models?type=image",
             headers={"Authorization": f"Bearer {VENICE_API_KEY}"}, timeout=30
         )
         if r.status_code == 200:
+            ok = True
             payload = r.json()
             for m in (payload.get('data') or payload):
                 if m.get('id') == model:
                     spec = m.get('model_spec') or {}
                     break
         else:
-            logger.warning(f"Model spec fetch failed: HTTP {r.status_code}")
+            logger.warning(f"Model spec fetch failed for {model}: HTTP {r.status_code}")
     except Exception as e:
         logger.warning(f"Model spec error for {model}: {e}")
-    MODEL_SPECS[model] = spec
-    if model == IMAGE_MODEL:
-        MODEL_SPEC.clear()
-        MODEL_SPEC.update(spec)
+    if ok:
+        MODEL_SPECS[model] = spec
     return spec
 
 def load_model_spec():
@@ -905,7 +981,10 @@ def load_model_spec():
         logger.info(f"BOOT SPEC {m}: {json.dumps(spec) if spec else 'EMPTY (using KNOWN_MODELS)'}")
 
 def build_prompt(raw_prompt):
-    """Strip soft-vocabulary, then append the sharpness tail. Single entry point."""
+    """Strip soft-vocabulary, then append the sharpness tail. Single entry point.
+
+    Prompt builders must NOT include SHARP_TAIL themselves - it used to land twice.
+    """
     cleaned = SOFT_WORDS.sub("", raw_prompt)
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip().strip(",").strip()
     return f"{cleaned}, {SHARP_TAIL}"
@@ -932,6 +1011,12 @@ def _payload(prompt, model, negative=None):
         data["aspect_ratio"] = IMAGE_ASPECT if IMAGE_ASPECT in ratios else ratios[0]
         res = c.get('resolutions') or known.get("res") or ["1K", "2K"]
         data["resolution"] = IMAGE_RESOLUTION if IMAGE_RESOLUTION in res else res[-1]
+        # Only when the live spec actually declares them, so nothing is sent blind.
+        step_spec = c.get('steps') or {}
+        if step_spec.get('max'):
+            data["steps"] = min(int(IMAGE_STEPS), int(step_spec['max']))
+        if c.get('cfgScale'):
+            data["cfg_scale"] = float(IMAGE_CFG)
     else:
         div = max(1, int(c.get('widthHeightDivisor') or 8))
         max_w = int(c.get('maxWidth') or known.get("max_w") or 1280)
@@ -1012,6 +1097,9 @@ async def _request_image(prompt, negative=None, chain=None, min_sharp=None):
     floor = MIN_SHARPNESS if min_sharp is None else min_sharp
     if not chain:
         chain = [IMAGE_MODEL] + [m for m in IMAGE_FALLBACKS if m != IMAGE_MODEL]
+    # get_spec blocks. Do it off the loop, once per model, before the attempt loop.
+    for model in chain:
+        await asyncio.to_thread(get_spec, model)
     for model in chain:
         data = _payload(prompt, model, negative)
         for attempt in range(3):
@@ -1027,14 +1115,20 @@ async def _request_image(prompt, negative=None, chain=None, min_sharp=None):
                     logger.error(f"No image data from {model}: {str(result)[:300]}")
                     break
                 logger.info(f"Raw image from {model}: {len(raw)} bytes, header {raw[:12]!r}")
-                await asyncio.to_thread(check_render, image_size(raw), data)
+                render_ok = await asyncio.to_thread(check_render, image_size(raw), data)
                 score = await asyncio.to_thread(sharpness_score, raw)
-                logger.info(f"Sharpness score [{model}]: {score:.1f}")
+                logger.info(f"Sharpness score [{model}]: {score:.1f} (floor {floor:.1f})")
+                bad = []
+                if not render_ok:
+                    bad.append("render geometry")
                 if floor and score < floor:
+                    bad.append(f"sharpness {score:.1f}")
+                if bad:
+                    why = ", ".join(bad)
                     if attempt < 2:
-                        logger.warning(f"[{model}] bad render (score {score:.1f}), regenerating")
+                        logger.warning(f"[{model}] rejected ({why}), regenerating")
                         continue
-                    logger.warning(f"[{model}] still bad after 3 attempts, trying next model")
+                    logger.warning(f"[{model}] still bad after 3 attempts ({why}), trying next model")
                     break
                 if model != chain[0]:
                     logger.warning(f"FALLBACK SERVED: {model} (primary {chain[0]} failed)")
@@ -1096,7 +1190,7 @@ async def generate_avatar_pose(user, pose_type="dominant"):
             return await _build_and_send(user, reward_prompt(variant), user.user_id, reward_negative(variant), reward_chain(), upscale=True)
         prompt = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
                   f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
-                  f"framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}")
+                  f"framed from mid-thigh up, {STUDIO}")
         return await _build_and_send(user, prompt, user.user_id, NEGATIVE_PROMPT_SEXY + (variant.get("clothed_negative") or ""), upscale=False)
     except Exception as e:
         logger.error(f"Avatar error: {e}")
@@ -1269,7 +1363,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user = UserState(
                 user_id=user_id,
                 username=username,
-                next_task_time=datetime.now(timezone.utc) + timedelta(minutes=random.randint(30, 180)),
+                next_task_time=utcnow() + timedelta(minutes=random.randint(30, 180)),
             )
             session.add(user)
             session.commit()
@@ -1303,7 +1397,7 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user = session.query(UserState).filter_by(user_id=user_id).first()
         if user:
-            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_MODEL}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY} | aspect: {IMAGE_ASPECT} | res: {IMAGE_RESOLUTION} | sharpen: {IMAGE_SHARPEN} | max_side: {IMAGE_MAX_SIDE} | steps: {IMAGE_STEPS} | cfg: {IMAGE_CFG} | min_sharp: {MIN_SHARPNESS}\n\n/payload for the exact JSON")
+            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_MODEL}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY} | aspect: {IMAGE_ASPECT} | res: {IMAGE_RESOLUTION} | sharpen: {IMAGE_SHARPEN} | max_side: {IMAGE_MAX_SIDE}\nsteps: {IMAGE_STEPS} | cfg: {IMAGE_CFG} (both pixel-mode models only) | min_sharp: {MIN_SHARPNESS} (variance-of-Laplacian)\n\n/payload for the exact JSON")
         else:
             await update.message.reply_text("No user record found")
     finally:
@@ -1319,7 +1413,9 @@ async def skip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user.awaiting_outfit_detail = False
             user.awaiting_custom_outfit = False
             user.awaiting_custom_location = False
+            user.awaiting_reward_wish = False
             session.commit()
+        context.user_data.pop('blocked_task_id', None)
         await update.message.reply_text("Fine - I'll work with what I have. Use /task.")
     finally:
         session.close()
@@ -1395,7 +1491,8 @@ async def outfit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Describe your outfit:")
             return
         outfit = OUTFIT_OPTIONS[outfit_key]
-        items = outfit.get(f"{user.gender}_items", outfit["male_items"])
+        gkey = GENDER_OUTFIT_KEY.get(user.gender or "", "male")
+        items = outfit.get(f"{gkey}_items") or outfit["male_items"]
         user.current_outfit = outfit["name"]
         user.outfit_items = json.dumps(items)
         user.outfit_detail = None
@@ -1471,7 +1568,7 @@ async def context_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session.commit()
     finally:
         session.close()
-    keyboard = [[InlineKeyboardButton("🧍 Alone", callback_data="present_alone")], [InlineKeyboardButton("💑 Partner", callback_data="present_partner")], [InlineKeyboardButton("🏠 Roommates", callback_data="present_roommates")], [InlineKeyboardButton("👨‍👩‍👧 Family", callback_data="present_parents")], [InlineKeyboardButton("👶 Kids", callback_data="present_kids")], [InlineKeyboardButton("👥 Public", callback_data="present_public")]]
+    keyboard = [[InlineKeyboardButton("🧍 Alone", callback_data="present_alone")], [InlineKeyboardButton("💑 Partner", callback_data="present_partner")], [InlineKeyboardButton("🏠 Roommates", callback_data="present_roommates")], [InlineKeyboardButton("👨‍👩‍👧 Family", callback_data="present_parents")], [InlineKeyboardButton("👥 Public", callback_data="present_public")]]
     await query.edit_message_text(f"📍 {location}\n\nWho is present?", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def handle_custom_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1503,8 +1600,6 @@ async def present_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user:
             user.context_others = present_type
             user.context_alone = (present_type == "alone")
-            if present_type == "kids" and user.risk_level > 2:
-                user.risk_level = 2
             session.commit()
     finally:
         session.close()
@@ -1767,6 +1862,7 @@ async def task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         user.awaiting_location_detail = False
         user.awaiting_outfit_detail = False
+        user.awaiting_reward_wish = False
         session.commit()
         if not user.gender:
             await gender_cmd(update, context)
@@ -1779,7 +1875,7 @@ async def task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         active = session.query(Task).filter_by(user_id=user_id, status="pending").first()
         if active:
-            time_left = (active.expires_at - datetime.now(timezone.utc)).total_seconds() / 60
+            time_left = (aware(active.expires_at) - utcnow()).total_seconds() / 60
             await update.message.reply_text(f"You have a task pending! {max(0, time_left):.0f} minutes left.")
             return
         await update.message.reply_text("Generating your task...")
@@ -1789,12 +1885,12 @@ async def task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await send_avatar_photo(context, user_id, avatar_bytes, "Your task awaits...")
                 await asyncio.sleep(1)
         task_text, actual_risk = await generate_task_text(user, session)
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         expires = now + timedelta(minutes=30)
         task = Task(user_id=user_id, task_text=task_text, risk_level=actual_risk, created_at=now, expires_at=expires)
         session.add(task)
         session.commit()
-        context.job_queue.run_once(auto_clear_task, when=expires, data={'user_id': user_id, 'task_id': task.id}, name=f"timeout_{task.id}")
+        arm_timeout(context, user_id, task.id, expires)
         await update.message.reply_text(f"🎯 TASK\n\n{task_text}\n\n30 minutes.", reply_markup=task_keyboard(task.id, get_title()))
     finally:
         session.close()
@@ -1817,10 +1913,13 @@ async def handle_blocker_input(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text("That task's gone. Use /task.")
             return
         if task.blocked_count >= 3:
+            # The key must be popped here or the dispatcher re-enters forever.
+            context.user_data.pop('blocked_task_id', None)
             await update.message.reply_text("Three reworks already, puddin'. Use Mercy if it still won't work.")
             return
         user = session.query(UserState).filter_by(user_id=user_id).first()
         if not user:
+            context.user_data.pop('blocked_task_id', None)
             return
         context.user_data.pop('blocked_task_id', None)
         constraint_text = update.message.text.strip()[:200]
@@ -1831,7 +1930,7 @@ async def handle_blocker_input(update: Update, context: ContextTypes.DEFAULT_TYP
             if c.constraint.lower().strip().rstrip('.') == norm:
                 existing = c
                 break
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         if existing:
             existing.times_hit += 1
             existing.expires_at = now + timedelta(days=30 if existing.times_hit >= 2 else 3)
@@ -1848,7 +1947,7 @@ async def handle_blocker_input(update: Update, context: ContextTypes.DEFAULT_TYP
         task.expires_at = now + timedelta(minutes=30)
         session.commit()
         try:
-            context.job_queue.run_once(auto_clear_task, when=timedelta(minutes=30), data={'user_id': user_id, 'task_id': task.id}, name=f"timeout_{task.id}")
+            arm_timeout(context, user_id, task.id, aware(task.expires_at))
         except Exception as e:
             logger.warning(f"Could not re-arm blocked timer: {e}")
         await context.bot.send_message(chat_id=user_id, text=f"🎯 REWORKED\n\n{new_text}\n\n30 minutes.", reply_markup=task_keyboard(task.id, get_title()))
@@ -1873,7 +1972,7 @@ async def mercy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await query.edit_message_text("Mercy granted, puddin'. Let me find somethin' else...")
         new_task_text, actual_risk = await generate_task_text(user, session)
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         task.task_text = new_task_text
         task.risk_level = actual_risk
         task.verification_attempts = 0
@@ -1881,7 +1980,7 @@ async def mercy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task.expires_at = now + timedelta(minutes=30)
         session.commit()
         try:
-            context.job_queue.run_once(auto_clear_task, when=timedelta(minutes=30), data={'user_id': user_id, 'task_id': task.id}, name=f"timeout_{task.id}")
+            arm_timeout(context, user_id, task.id, aware(task.expires_at))
         except Exception as e:
             logger.warning(f"Could not re-arm mercy timer: {e}")
         await context.bot.send_message(chat_id=user_id, text=f"🔄 NEW TASK (Mercy)\n\n{new_task_text}\n\n30 minutes.", reply_markup=task_keyboard(task.id, get_title()))
@@ -1896,9 +1995,11 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not user:
             await update.message.reply_text("Use /start first")
             return
+        user.awaiting_reward_wish = False
+        session.commit()
         active = session.query(Task).filter_by(user_id=user_id, status="pending").first()
         if active:
-            time_left = (active.expires_at - datetime.now(timezone.utc)).total_seconds() / 60
+            time_left = (aware(active.expires_at) - utcnow()).total_seconds() / 60
             await update.message.reply_text(f"⏰ {max(0, time_left):.0f} min left\n\n{active.task_text[:200]}...", reply_markup=task_keyboard(active.id, get_title()))
         else:
             loc = user.custom_location or user.location or "Not set"
@@ -1942,8 +2043,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg += "\n☁️ Backed up to cloud."
             await update.message.reply_text(msg)
             return
-        now = datetime.now(timezone.utc)
-        if now > task.expires_at:
+        now = utcnow()
+        if now > aware(task.expires_at):
             task.status = "expired"
             session.commit()
             await update.message.reply_text("Task expired. Use /task.")
@@ -1964,15 +2065,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             task.followup_target = None
             context.user_data.pop('blocked_task_id', None)
             user = session.query(UserState).filter_by(user_id=user_id).first()
+            if user:
+                user.points += 10 * task.risk_level
+                user.streak += 1
+                user.completed_tasks += 1
+                user.consecutive_failures = 0
+                user.challenges_since_reward += 1
+            # Commit before the lookup-dependent branch so a missing profile cannot lose the win.
+            session.commit()
             if not user:
                 await update.message.reply_text("Your profile is missing. Use /start.")
                 return
-            user.points += 10 * task.risk_level
-            user.streak += 1
-            user.completed_tasks += 1
-            user.consecutive_failures = 0
-            user.challenges_since_reward += 1
-            session.commit()
             if user.challenges_since_reward >= random.randint(5, 10):
                 user.challenges_since_reward = 0
                 user.awaiting_reward_wish = True
@@ -2079,6 +2182,10 @@ async def auto_clear_task(context: ContextTypes.DEFAULT_TYPE):
         task = session.query(Task).filter_by(id=task_id).first()
         if not task or task.status != "pending":
             return
+        # If the task was reworked the stored expiry moved on; this timer is superseded.
+        if task.expires_at and utcnow() < aware(task.expires_at) - timedelta(seconds=10):
+            logger.info(f"Timeout job {task_id} superseded, skipping")
+            return
         task.status = "expired"
         user = session.query(UserState).filter_by(user_id=user_id).first()
         if user:
@@ -2112,7 +2219,7 @@ async def avatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         cloudinary_result = await upload_to_cloudinary(image_bytes, user_id, image_type='avatar')
         session.add(AvatarImage(user_id=user_id, image_url="generated", cloudinary_url=cloudinary_result['url'] if cloudinary_result else None, cloudinary_public_id=cloudinary_result['public_id'] if cloudinary_result else None))
-        user.last_avatar_sent_at = datetime.now(timezone.utc)
+        user.last_avatar_sent_at = utcnow()
         session.commit()
         await send_avatar_photo(context, user_id, image_bytes, f"🎨 Harley - {HARLEY_VARIANTS[user.harley_variant]['label']}")
     finally:
@@ -2130,11 +2237,11 @@ async def debugavatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Debug pair - task then reward. Task model {IMAGE_MODEL}, reward model {IMAGE_MODEL_REWARD or 'same'}, "
         f"variant {variant['label']}, cap {min(int(IMAGE_MAX_SIDE), 1280)}px, cfg {IMAGE_CFG}, steps {IMAGE_STEPS}, "
-        f"upscale {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY}, min sharpness {MIN_SHARPNESS}."
+        f"upscale {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY}, min sharpness {MIN_SHARPNESS} (Laplacian variance)."
     )
     dom = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
            f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
-           f"framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}")
+           f"framed from mid-thigh up, {STUDIO}")
     await _debug_send(context, user_id, "TASK", dom, NEGATIVE_PROMPT_SEXY + (variant.get("clothed_negative") or ""), upscale=False)
     await asyncio.sleep(2)
     await _debug_send(context, user_id, "REWARD", reward_prompt(variant), reward_negative(variant), reward_chain(), upscale=True)
@@ -2249,7 +2356,7 @@ async def schedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if query.data == "sched_enable":
             user.scheduling_enabled = True
-            user.next_task_time = datetime.now(timezone.utc) + timedelta(minutes=random.randint(user.min_interval, user.max_interval))
+            user.next_task_time = utcnow() + timedelta(minutes=random.randint(user.min_interval, user.max_interval))
             session.commit()
             await query.edit_message_text("✅ Auto-tasks enabled!")
         elif query.data == "sched_disable":
@@ -2263,33 +2370,41 @@ async def schedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def scheduled_task_check(context: ContextTypes.DEFAULT_TYPE):
     session = get_session()
     try:
-        now = datetime.now(timezone.utc)
-        session.query(LocationConstraint).filter(LocationConstraint.expires_at < now).delete()
+        session.query(LocationConstraint).filter(LocationConstraint.expires_at < utcnow()).delete()
         session.commit()
         users = session.query(UserState).filter(
             UserState.scheduling_enabled == True,
-            or_(UserState.next_task_time.is_(None), UserState.next_task_time <= now)
+            or_(UserState.next_task_time.is_(None), UserState.next_task_time <= utcnow())
         ).all()
         for user in users:
-            active = session.query(Task).filter_by(user_id=user.user_id, status="pending").first()
-            if not active:
-                try:
-                    if random.random() < 0.3:
-                        avatar_bytes = await generate_avatar_pose(user, "dominant")
-                        if avatar_bytes:
-                            await send_avatar_photo(context, user.user_id, avatar_bytes, "Your task awaits...")
-                            await asyncio.sleep(1)
-                    task_text, actual_risk = await generate_task_text(user, session)
-                    expires = now + timedelta(minutes=30)
-                    task = Task(user_id=user.user_id, task_text=task_text, risk_level=actual_risk, created_at=now, expires_at=expires)
-                    session.add(task)
+            try:
+                # A user who never finished setup would get a task against "Unknown".
+                if not (user.gender and user.current_outfit and user.custom_location):
+                    user.next_task_time = utcnow() + timedelta(minutes=user.min_interval)
                     session.commit()
-                    context.job_queue.run_once(auto_clear_task, when=expires, data={'user_id': user.user_id, 'task_id': task.id}, name=f"timeout_{task.id}")
-                    await context.bot.send_message(chat_id=user.user_id, text=f"🎯 AUTO TASK\n\n{task_text}\n\n30 minutes.", reply_markup=task_keyboard(task.id, get_title()))
-                    user.next_task_time = now + timedelta(minutes=random.randint(user.min_interval, user.max_interval))
-                    session.commit()
-                except Exception as e:
-                    logger.error(f"Auto-task error: {e}")
+                    continue
+                active = session.query(Task).filter_by(user_id=user.user_id, status="pending").first()
+                if active:
+                    continue
+                if random.random() < 0.3:
+                    avatar_bytes = await generate_avatar_pose(user, "dominant")
+                    if avatar_bytes:
+                        await send_avatar_photo(context, user.user_id, avatar_bytes, "Your task awaits...")
+                        await asyncio.sleep(1)
+                task_text, actual_risk = await generate_task_text(user, session)
+                now = utcnow()
+                expires = now + timedelta(minutes=30)
+                task = Task(user_id=user.user_id, task_text=task_text, risk_level=actual_risk, created_at=now, expires_at=expires)
+                session.add(task)
+                session.commit()
+                arm_timeout(context, user.user_id, task.id, expires)
+                await context.bot.send_message(chat_id=user.user_id, text=f"🎯 AUTO TASK\n\n{task_text}\n\n30 minutes.", reply_markup=task_keyboard(task.id, get_title()))
+                user.next_task_time = utcnow() + timedelta(minutes=random.randint(user.min_interval, user.max_interval))
+                session.commit()
+            except Exception as e:
+                # Without a rollback the dirty transaction kills every remaining user this pass.
+                logger.error(f"Auto-task error for {user.user_id}: {e}")
+                session.rollback()
     except Exception as e:
         logger.error(f"Scheduled check error: {e}")
     finally:
@@ -2323,6 +2438,29 @@ async def reset_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         session.close()
 
+# ============ MIGRATIONS ============
+def migrate_kids_context():
+    """Kids Present is gone. Move anyone sitting on it to 'alone' so the prompt is sane."""
+    session = get_session()
+    try:
+        n = session.query(UserState).filter(UserState.context_others == "kids").update({"context_others": "alone"})
+        session.commit()
+        if n:
+            logger.info(f"Migrated {n} user(s) from kids to alone")
+    except Exception as e:
+        logger.warning(f"Kids migration failed: {e}")
+    finally:
+        session.close()
+
+# ============ ERROR HANDLER ============
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Unhandled exception: {context.error}", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text="Somethin' shorted out, puddin'. Try again.")
+        except Exception:
+            pass
+
 # ============ MAIN ============
 def main():
     logger.info("=" * 60)
@@ -2335,7 +2473,9 @@ def main():
     logger.info(f"Cloudinary configured: {bool(os.getenv('CLOUDINARY_CLOUD_NAME'))} / {bool(os.getenv('CLOUDINARY_API_KEY'))} / {bool(os.getenv('CLOUDINARY_API_SECRET'))}")
     logger.info("=" * 60)
     load_model_spec()
+    migrate_kids_context()
     application = Application.builder().token(TELEGRAM_TOKEN).build()
+    application.add_error_handler(error_handler)
     application.job_queue.run_repeating(
         scheduled_task_check, interval=60, first=10, name="scheduled_check",
         job_kwargs={"misfire_grace_time": 180, "coalesce": True, "max_instances": 1}
