@@ -8,11 +8,12 @@ Venue features: static presets by default, AI extension when the API cooperates.
 IMAGING CHANGED ONLY. Everything else is the original file.
 
 Changelog:
-- reward prompt loosened: mid-thigh crop, no face-filling clause, lighter gear
+- reward prompt reverted to the wording that produced 315
+- per-model regeneration restored (_request_image + check_render), batching gone
 - nudity retry pass with a stripped prompt when nothing reads BARE
+- blur vocabulary added to the nude negative
 - fallback reports the real verdict; UNSURE preferred over COVERED
-- user wish is passed into the reward prompt
-- image concurrency capped with 429 backoff
+- user wish passed into the reward prompt
 """
 
 import os
@@ -91,8 +92,6 @@ MEASURE_EDGE = 1024
 VISION_EDGE = 768
 TARGET_LONG_EDGE = 1920
 RENDER_ATTEMPTS = int(os.getenv("RENDER_ATTEMPTS", "8"))
-RENDER_ROUNDS = int(os.getenv("RENDER_ROUNDS", "2"))
-RENDER_MAX_CANDS = int(os.getenv("RENDER_MAX_CANDS", "4"))
 TASK_IMAGE_CHANCE = float(os.getenv("TASK_IMAGE_CHANCE", "0.3"))
 IMAGE_CONCURRENCY = int(os.getenv("IMAGE_CONCURRENCY", "4"))
 
@@ -144,10 +143,16 @@ MODEL_EXPLICIT = {"lustify-v8", "chroma", "wai-illu"}
 SHARP_TAIL = "sharp focus, natural skin texture, directional studio light, 85mm"
 NEGATIVE_PROMPT = "blurry, soft focus, bokeh, plastic skin, extra fingers, fused fingers"
 NEGATIVE_PROMPT_SEXY = "stiff catalogue pose, stock photo, mannequin, plastic skin, extra fingers, fused fingers"
-NEGATIVE_PROMPT_NUDE = "briefs, boxers, panties, knickers, trousers, jeans, skirt, towel, sheet, sarong, loincloth, drapery, fabric over the groin, clothing over the groin, censored, mosaic, partially covered, cropped at the hips"
+NEGATIVE_PROMPT_NUDE = (
+    "blurry, out of focus, soft focus, bokeh, shallow depth of field, "
+    "hazy, low contrast, washed out, plastic skin, airbrushed, "
+    "briefs, boxers, panties, knickers, trousers, jeans, skirt, towel, sheet, "
+    "sarong, loincloth, drapery, fabric over the groin, clothing over the groin, "
+    "censored, mosaic, partially covered, cropped at the hips"
+)
 NEGATIVE_HARD = ", any clothing, underwear, bra, panties, fabric, boots, stockings, blurry, soft focus, bokeh"
 STUDIO = "against a seamless charcoal studio backdrop, subtle rim light from behind"
-NUDE = "completely nude, wearing nothing but"
+NUDE = "fully nude except for"
 SOFT_WORDS = re.compile(
     r"\b(soft focus|shallow depth of field|bokeh|dreamy|hazy|misty|film grain|"
     r"cinematic glow|soft lighting|glowing|ethereal)\b", re.IGNORECASE)
@@ -397,6 +402,15 @@ def sharpness_score(img):
     return float(ImageStat.Stat(lap).var[0])
 
 
+def check_render(size):
+    w, h = size
+    if min(w, h) < 400:
+        return False
+    if max(w, h) / max(1, min(w, h)) > 2.0:
+        return False
+    return True
+
+
 def finalize_png(raw):
     try:
         img = Image.open(BytesIO(raw))
@@ -628,7 +642,6 @@ REWARD_POSES = [
     "kneeling, hand in hair, throat exposed",
     "reclining on one elbow, top leg open, face turned to the lens",
     "lying back on both elbows, knees up, chin tucked to the chest",
-    "standing, weight on one hip, legs apart",
 ]
 REWARD_GEAR = [
     "nothing but a leather collar",
@@ -687,15 +700,15 @@ def reward_chain():
 def reward_prompt(variant, wish=None):
     wish_text = f", {wish[:120]}" if wish else ""
     return (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}, {NUDE} {random.choice(REWARD_GEAR)}, "
-            f"{variant['clause']}{wish_text}, {random.choice(REWARD_POSES)}, cropped at mid-thigh, "
-            f"full pubic area visible, {STUDIO}, {SHARP_TAIL}")
+            f"{variant['clause']}, {random.choice(REWARD_POSES)}{wish_text}, framed from the hips up, "
+            f"face filling the upper third, {STUDIO}, {SHARP_TAIL}")
 
 
 def reward_prompt_hard(variant, wish=None):
     """Stripped prompt for the nudity retry: no gear, no studio clutter."""
     wish_text = f", {wish[:120]}" if wish else ""
     return (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}, fully nude, naked, "
-            f"no clothing at all, {variant['clause']}{wish_text}, standing, cropped at mid-thigh, "
+            f"no clothing at all, {variant['clause']}{wish_text}, standing, framed from the hips up, "
             f"{STUDIO}, {SHARP_TAIL}")
 
 
@@ -1122,26 +1135,38 @@ def _score_bytes(raw):
         return 0.0
 
 
-async def _render_batch(prompt, negative, chain=None):
+async def _request_image(prompt, negative=None, chain=None, min_sharp=None):
+    """Per-model, up to three attempts, regenerate on a bad or soft render."""
     prompt = build_prompt(prompt)
     if not chain:
         chain = [IMAGE_MODEL] + [m for m in IMAGE_FALLBACKS if m != IMAGE_MODEL]
-    out = []
+    best = None
     for model in chain:
+        floor = MODEL_MIN_SHARPNESS.get(model, DEFAULT_MIN_SHARPNESS) if min_sharp is None else min_sharp
         data = _payload(prompt, model, negative)
-        logger.info(f"Batch payload [{model}]: {json.dumps({k: v for k, v in data.items() if k not in ('prompt', 'negative_prompt')})}")
-        results = await asyncio.gather(
-            *[asyncio.to_thread(_post_image, dict(data), model) for _ in range(RENDER_ATTEMPTS)],
-            return_exceptions=True
-        )
-        for r in results:
-            if isinstance(r, Exception) or not r:
-                out.append((0.0, b"", str(r) if r else "no image"))
-                continue
-            out.append((_score_bytes(r), r, ""))
-        if any(not e for _, _, e in out):
-            break
-    return out
+        for attempt in range(3):
+            raw = await asyncio.to_thread(_post_image, dict(data), model)
+            if not raw:
+                break
+            try:
+                img = Image.open(BytesIO(raw))
+                img.load()
+                img = img.convert("RGB")
+            except Exception:
+                break
+            score = sharpness_score(img)
+            ok = check_render(img.size)
+            logger.info(f"[{model}] attempt {attempt + 1} {img.size} sharp {score:.1f} ok={ok}")
+            if best is None or score > best[0]:
+                best = (score, raw)
+            if ok and score >= floor:
+                return raw, score
+            if attempt < 2:
+                logger.warning(f"[{model}] bad render ({score:.1f}), regenerating")
+        logger.warning(f"[{model}] exhausted attempts")
+    if best:
+        return best[1], best[0]
+    return None, 0.0
 
 
 async def nude_check(raw):
@@ -1177,67 +1202,70 @@ async def nude_check(raw):
 async def _render_best(prompt, negative, chain=None, require_bare=False, retry_prompt=None):
     if not chain:
         chain = [IMAGE_MODEL] + [m for m in IMAGE_FALLBACKS if m != IMAGE_MODEL]
-    fallback = None
     unsure = None
-    received = 0
+    best_any = None
 
-    async def one_pass(model, prompt_text, negative_text):
-        nonlocal fallback, unsure, received
-        floor = MODEL_MIN_SHARPNESS.get(model, DEFAULT_MIN_SHARPNESS)
-        data = _payload(build_prompt(prompt_text), model, negative_text)
-        logger.info(f"pass [{model}] floor {floor:.0f} bare={require_bare}")
-        results = await asyncio.gather(
-            *[asyncio.to_thread(_post_image, dict(data), model) for _ in range(RENDER_ATTEMPTS)],
-            return_exceptions=True
-        )
-        cands = []
-        for r in results:
-            if isinstance(r, Exception) or not r:
-                continue
-            received += 1
-            score = _score_bytes(r)
-            logger.info(f"{model} sharp {score:.1f} bytes {len(r)}")
-            if fallback is None or score > fallback[0]:
-                fallback = (score, r)
-            if score >= floor:
-                cands.append((score, r))
-                if len(cands) >= RENDER_MAX_CANDS:
-                    break
-        if not cands:
-            return None
-        cands.sort(key=lambda c: c[0], reverse=True)
+    for model in chain:
+        raw, score = await _request_image(prompt, negative, [model])
+        if not raw:
+            continue
+        if best_any is None or score > best_any[0]:
+            best_any = (score, raw)
         if not require_bare:
-            return cands[0][1], cands[0][0], "SKIPPED"
-        for score, raw in cands[:3]:
-            verdict = await nude_check(raw)
-            logger.info(f"{model} cand {score:.0f} {verdict}")
-            if verdict == "BARE":
-                return raw, score, "BARE"
-            if verdict == "UNSURE" and unsure is None:
-                unsure = (score, raw)
-        return None
-
-    for rnd in range(RENDER_ROUNDS):
-        for model in chain:
-            got = await one_pass(model, prompt, negative)
-            if got:
-                return got
+            return raw, score, "SKIPPED"
+        verdict = await nude_check(raw)
+        logger.info(f"[{model}] {score:.0f} {verdict}")
+        if verdict == "BARE":
+            return raw, score, "BARE"
+        if verdict == "UNSURE" and unsure is None:
+            unsure = (score, raw)
 
     if require_bare and retry_prompt:
         logger.info("nudity retry pass")
         for model in chain:
-            got = await one_pass(model, retry_prompt, negative + NEGATIVE_HARD)
-            if got:
-                return got
+            raw, score = await _request_image(retry_prompt, negative + NEGATIVE_HARD, [model])
+            if not raw:
+                continue
+            if best_any is None or score > best_any[0]:
+                best_any = (score, raw)
+            verdict = await nude_check(raw)
+            logger.info(f"[retry {model}] {score:.0f} {verdict}")
+            if verdict == "BARE":
+                return raw, score, "BARE"
+            if verdict == "UNSURE" and unsure is None:
+                unsure = (score, raw)
 
     if unsure:
         logger.info(f"fallback {unsure[0]:.0f}, UNSURE")
         return unsure[1], unsure[0], "UNSURE"
-    if fallback:
-        logger.info(f"fallback {fallback[0]:.0f}, COVERED")
-        return fallback[1], fallback[0], "COVERED"
-    logger.info(f"no images received at all ({received} draws)")
+    if best_any:
+        logger.info(f"fallback {best_any[0]:.0f}, COVERED")
+        return best_any[1], best_any[0], "COVERED"
+    logger.info("no images received")
     return None, 0.0, "FAILED"
+
+
+async def _render_batch(prompt, negative, chain=None):
+    """Harness: every draw with its score, no floor, no selection."""
+    prompt = build_prompt(prompt)
+    if not chain:
+        chain = [IMAGE_MODEL] + [m for m in IMAGE_FALLBACKS if m != IMAGE_MODEL]
+    out = []
+    for model in chain:
+        data = _payload(prompt, model, negative)
+        logger.info(f"Batch payload [{model}]: {json.dumps({k: v for k, v in data.items() if k not in ('prompt', 'negative_prompt')})}")
+        results = await asyncio.gather(
+            *[asyncio.to_thread(_post_image, dict(data), model) for _ in range(RENDER_ATTEMPTS)],
+            return_exceptions=True
+        )
+        for r in results:
+            if isinstance(r, Exception) or not r:
+                out.append((0.0, b"", str(r) if r else "no image"))
+                continue
+            out.append((_score_bytes(r), r, ""))
+        if any(not e for _, _, e in out):
+            break
+    return out
 
 
 async def _upscale(raw):
@@ -1483,7 +1511,7 @@ async def payload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"TASK {IMAGE_MODEL}\n{task_payload}\n\n"
         f"REWARD {reward_model}\n{reward_payload}\n\n"
-        f"attempts {RENDER_ATTEMPTS} x {RENDER_ROUNDS} max {RENDER_MAX_CANDS} conc {IMAGE_CONCURRENCY} | floors {MODEL_MIN_SHARPNESS}\n"
+        f"3 attempts/model, conc {IMAGE_CONCURRENCY} | floors {MODEL_MIN_SHARPNESS}\n"
         f"vision chain {VISION_CHAIN}"
     )
 
@@ -2536,7 +2564,7 @@ def main():
     logger.info(f"Text: {TEXT_MODEL} | Vision: {VISION_CHAIN} | Probes: {PROBE_MODELS}")
     logger.info(f"Task model: {IMAGE_MODEL} | Reward model: {IMAGE_MODEL_REWARD or 'same'} | fallbacks: {IMAGE_FALLBACKS}")
     logger.info(f"Format: {IMAGE_FORMAT} | Upscale: {IMAGE_UPSCALE} | Aspect: {IMAGE_ASPECT} | Res: {IMAGE_RESOLUTION} | Sharpen: {IMAGE_SHARPEN} | MaxSide: {IMAGE_MAX_SIDE} | Steps: {IMAGE_STEPS} | CFG: {IMAGE_CFG}")
-    logger.info(f"Attempts: {RENDER_ATTEMPTS}x{RENDER_ROUNDS} max {RENDER_MAX_CANDS} conc {IMAGE_CONCURRENCY} | Floors: {MODEL_MIN_SHARPNESS}")
+    logger.info(f"3 attempts per model, concurrency {IMAGE_CONCURRENCY} | Floors: {MODEL_MIN_SHARPNESS}")
     logger.info(f"Venue presets: {len(VENUE_BASELINE)}")
     logger.info(f"Cloudinary configured: {bool(os.getenv('CLOUDINARY_CLOUD_NAME'))} / {bool(os.getenv('CLOUDINARY_API_KEY'))} / {bool(os.getenv('CLOUDINARY_API_SECRET'))}")
     logger.info("=" * 60)
@@ -2583,20 +2611,4 @@ def main():
     application.add_handler(CallbackQueryHandler(complete_callback, pattern="^complete_"))
     application.add_handler(CallbackQueryHandler(blocked_callback, pattern="^blocked_"))
     application.add_handler(CallbackQueryHandler(giveup_callback, pattern="^giveup_"))
-    application.add_handler(CallbackQueryHandler(retry_callback, pattern="^retry_"))
-    application.add_handler(CallbackQueryHandler(schedule_callback, pattern="^sched_"))
-    application.add_handler(CallbackQueryHandler(reset_callback, pattern="^reset_"))
-    application.add_handler(CallbackQueryHandler(mercy_callback, pattern="^mercy_"))
-    application.add_handler(CallbackQueryHandler(reward_surprise_callback, pattern="^reward_surprise$"))
-    application.add_handler(CallbackQueryHandler(setmodel_callback, pattern="^setmodel_"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_input_dispatcher))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-        bootstrap_retries=5,
-    )
-
-
-if __name__ == "__main__":
-    main()
+    application.add_handler(CallbackQueryHandler(retry_callback, pattern="
