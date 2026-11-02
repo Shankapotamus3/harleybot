@@ -1,9 +1,13 @@
-# harley_bot.py
+# harleybot.py
 """
 Harley Quinn task bot.
 
 Changelog
 ---------
+- Env-driven tuning restored: IMAGE_CFG, IMAGE_STEPS, IMAGE_MAX_SIDE,
+  IMAGE_UPSCALE, IMAGE_UPSCALE_CREATIVITY, per-model floors.
+- Token resolution accepts BOT_TOKEN / TELEGRAM_BOT_TOKEN / TELEGRAM_TOKEN /
+  TOKEN; loud boot failure naming the vars that do exist.
 - Vision: default model in code, fallback chain, word-boundary verdict parse,
   max_tokens 64, directive prompt.
 - Imaging contract inlined: PNG only, native boxes, unclipped 1024-edge
@@ -52,11 +56,26 @@ logging.basicConfig(
 )
 log = logging.getLogger("harley")
 
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
 # --------------------------------------------------------------------------- #
 # config
 # --------------------------------------------------------------------------- #
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_TOKEN = (
+    os.getenv("BOT_TOKEN")
+    or os.getenv("TELEGRAM_BOT_TOKEN")
+    or os.getenv("TELEGRAM_TOKEN")
+    or os.getenv("TOKEN")
+    or ""
+).strip()
+
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///harley.db")
 
@@ -77,7 +96,10 @@ IMAGE_MODEL_REWARD = os.getenv("IMAGE_MODEL_REWARD", "lustify-v8")
 API_BASE = "https://api.venice.ai/api/v1"
 GENERATE_URL = f"{API_BASE}/image/generate"
 UPSCALE_URL = f"{API_BASE}/image/upscale"
-VENICE_KEY = os.getenv("VENICE_API_KEY", "")
+
+VENICE_KEY = (
+    os.getenv("VENICE_API_KEY") or os.getenv("VENICE_KEY") or ""
+).strip()
 
 VISION_CHAIN = [m for m in (
     os.getenv("VENICE_VISION_MODEL", "e2ee-qwen3-vl-30b-a3b-p"),
@@ -90,12 +112,33 @@ MEASURE_EDGE = 1024
 TARGET_LONG_EDGE = 1920
 DEFAULT_SAMPLER = "DPM++ 2M"
 
+IMAGE_CFG = _env_float("IMAGE_CFG", 5.0)
+IMAGE_STEPS = int(_env_float("IMAGE_STEPS", 32))
+IMAGE_MAX_SIDE = int(_env_float("IMAGE_MAX_SIDE", 1280))
+IMAGE_UPSCALE = _env_float("IMAGE_UPSCALE", 1.5)
+IMAGE_UPSCALE_CREATIVITY = _env_float("IMAGE_UPSCALE_CREATIVITY", 0.2)
+
 ASPECT_BOXES = {
     "portrait": (960, 1280),
     "square": (1280, 1280),
     "landscape": (1280, 960),
 }
-MODEL_RENDER_MULT = {"lustify-v8": 1.5}
+MODEL_RENDER_MULT = {"lustify-v8": IMAGE_UPSCALE}
+MODEL_STEPS: dict[str, int] = {}
+MODEL_CFG: dict[str, float] = {}
+
+
+def steps_for(model: str) -> int:
+    return MODEL_STEPS.get(model, IMAGE_STEPS)
+
+
+def cfg_for(model: str) -> float:
+    return MODEL_CFG.get(model, IMAGE_CFG)
+
+
+def mult_for(model: str) -> float:
+    return MODEL_RENDER_MULT.get(model, IMAGE_UPSCALE)
+
 
 MODEL_CHOICES = [
     "lustify-v8", "chroma", "wai-illu", "grok-imagine-image-2-0",
@@ -105,13 +148,14 @@ MODEL_EXPLICIT = {"lustify-v8", "chroma", "wai-illu"}
 MODEL_NO_NEGATIVE = {"gpt-image-2", "gpt-image-2-edit"}
 MODEL_NO_SAMPLER = {"gpt-image-2", "gpt-image-2-edit", "nano-banana-pro"}
 
-MODEL_STEPS = {"lustify-v8": 32, "chroma": 32}
-MODEL_CFG = {"lustify-v8": 5.0, "chroma": 5.0}
-DEFAULT_STEPS = 32
-DEFAULT_CFG = 5.0
-
-MODEL_MIN_SHARPNESS = {"lustify-v8": 100.0, "chroma": 60.0, "submit": 45.0}
-DEFAULT_MIN_SHARPNESS = 100.0
+MODEL_MIN_SHARPNESS = {
+    "lustify-v8": _env_float("LUSTIFY_MIN_SHARPNESS", 100.0),
+    "chroma": _env_float(
+        "CHROMA_MIN_SHARPNESS", _env_float('MODEL_MIN_SHARPNESS["chroma"]', 60.0)
+    ),
+    "submit": _env_float("SUBMIT_MIN_SHARPNESS", 45.0),
+}
+DEFAULT_MIN_SHARPNESS = _env_float("DEFAULT_MIN_SHARPNESS", 100.0)
 
 LAST_IMAGE_ERROR = ""
 
@@ -144,8 +188,12 @@ def sharpness_score(img: Image.Image) -> float:
 
 def _box(aspect: str, model: str) -> tuple[int, int]:
     b = ASPECT_BOXES.get(aspect, ASPECT_BOXES["portrait"])
-    m = MODEL_RENDER_MULT.get(model, 1.0)
-    return (int(b[0] * m), int(b[1] * m))
+    m = mult_for(model)
+    w, h = int(b[0] * m), int(b[1] * m)
+    over = max(w, h) / IMAGE_MAX_SIDE
+    if over > 1:
+        w, h = int(w / over), int(h / over)
+    return (w, h)
 
 
 def _target(size: tuple[int, int]) -> tuple[int, int]:
@@ -160,8 +208,8 @@ def _payload(model, prompt, negative, box, seed=None) -> dict:
         "prompt": prompt,
         "width": box[0],
         "height": box[1],
-        "steps": MODEL_STEPS.get(model, DEFAULT_STEPS),
-        "cfg_scale": MODEL_CFG.get(model, DEFAULT_CFG),
+        "steps": steps_for(model),
+        "cfg_scale": cfg_for(model),
         "output_format": "png",
         "hide_watermark": True,
         "safe_mode": False,
@@ -229,6 +277,7 @@ class Client:
         data = await self._post(UPSCALE_URL, {
             "image": base64.b64encode(png).decode(),
             "scale": round(factor, 2),
+            "creativity": IMAGE_UPSCALE_CREATIVITY,
         })
         raw = data.get("image") or (data.get("images") or [None])[0]
         if not raw:
@@ -1103,10 +1152,19 @@ async def post_init(app: Application):
     migrate_kids_context()
     app.job_queue.run_repeating(scheduler_tick, interval=SCHEDULER_INTERVAL,
                                 first=60, name="scheduler")
-    log.info("booted")
+    log.info(
+        "booted cfg=%.1f steps=%d max_side=%d upscale=%.2f",
+        IMAGE_CFG, IMAGE_STEPS, IMAGE_MAX_SIDE, IMAGE_UPSCALE,
+    )
 
 
 def main():
+    if not BOT_TOKEN:
+        present = sorted(k for k in os.environ if "TOKEN" in k.upper())
+        raise SystemExit(f"BOT_TOKEN empty. Token-ish vars present: {present}")
+    if not VENICE_KEY:
+        raise SystemExit("VENICE_API_KEY empty.")
+    log.info("token %s…%s", BOT_TOKEN[:4], BOT_TOKEN[-4:])
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("task", task_command))
