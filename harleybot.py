@@ -6,15 +6,15 @@ Fixed avatar with a penis/vagina toggle, real vision verification.
 Venue features: static presets by default, AI extension when the API cooperates.
 
 Changelog:
-- penis variant uses futanari plus explicit anatomy; vagina clause excludes penis
-- NUDE_GATE toggle, default off; the vision chain was returning UNSURE on every draw
-- reward prompt carries nudity on its own now (no knickers, no bra, bare skin)
-- nude_check: 200 tokens, 25s timeout, temp 0.1, empty replies logged
-- safe_mode forced false (the API defaults it on and sanitises every render)
-- IMAGE_MINIMAL strips steps/cfg/negative so the payload matches the website
-- _request_image is single-attempt: no floor, one silent re-roll only on an upscaled render
+- bulge phrase moved after the outfit and pose so it reads as part of the clothing
+- negative prompt always sent; IMAGE_MINIMAL now gates steps/cfg only
+- reward framing back to mid-thigh so genitals are not cropped
+- penis variant: erect penis over the pussy, balls hanging, female-genitals negative
+- NUDE_GATE toggle, default off
+- safe_mode forced false
+- _request_image is single-attempt, one silent re-roll only on an upscaled render
 - byte-density check catches the server-side upscale mode
-- unsharp mask 80 -> 50 so soft renders stop getting crunchy
+- unsharp mask 80 -> 50
 - setreward_callback defined; reward_negative restored
 - lustify capped at 1280 so the request never exceeds the model's ceiling
 """
@@ -91,8 +91,8 @@ IMAGE_STEPS = os.getenv("IMAGE_STEPS", "45").strip()
 IMAGE_CFG = os.getenv("IMAGE_CFG", "7.5").strip()
 IMAGE_MAX_SIDE = os.getenv("IMAGE_MAX_SIDE", "1920").strip()
 
-# Strip the payload back to what the website sends: model, prompt, format,
-# safe_mode, box. Server defaults for steps and cfg, no negative.
+# Strip steps and cfg back to server defaults, matching the website. The
+# negative prompt is still sent - it carries the garment and anatomy levers.
 MINIMAL_PAYLOAD = os.getenv("IMAGE_MINIMAL", "1") == "1"
 
 # Off by default. The vision chain returned UNSURE on every draw, so the gate
@@ -183,17 +183,17 @@ HARLEY_VARIANTS = {
         "label": "Vagina",
         "body": "curvy athletic figure, medium breasts",
         "clothed": "",
-        "clause": "pussy clearly visible, breasts bare, no penis",
+        "clause": "pussy clearly visible, breasts bare",
         "clothed_negative": "",
         "nude_negative": "",
     },
     "penis": {
         "label": "Penis",
         "body": "curvy athletic figure, medium breasts, futanari",
-        "clothed": "clear bulge in the front of the garment",
-        "clause": "penis and balls clearly visible, no vulva",
+        "clothed": "clear bulge in the front of the garment, visible cock outline",
+        "clause": "large erect penis clearly visible over the pussy, balls hanging, breasts bare",
         "clothed_negative": ", flat smooth crotch",
-        "nude_negative": ", pussy, vulva, female genitalia",
+        "nude_negative": ", female genitals only, flat crotch, no penis",
     },
 }
 
@@ -716,14 +716,14 @@ def reward_prompt(variant, wish=None):
     wish_text = f", {wish[:120]}" if wish else ""
     return (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}, {NUDE} {random.choice(REWARD_GEAR)}, "
             f"no knickers, no bra, bare skin, {variant['clause']}, {random.choice(REWARD_POSES)}{wish_text}, "
-            f"framed from the hips up, face filling the upper third, {STUDIO}, {SHARP_TAIL}")
+            f"framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}")
 
 
 def reward_prompt_hard(variant, wish=None):
     """Stripped prompt for the nudity retry: no gear, no studio clutter."""
     wish_text = f", {wish[:120]}" if wish else ""
     return (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}, fully nude, naked, "
-            f"no clothing at all, {variant['clause']}{wish_text}, standing, framed from the hips up, "
+            f"no clothing at all, {variant['clause']}{wish_text}, standing, framed from mid-thigh up, "
             f"{STUDIO}, {SHARP_TAIL}")
 
 
@@ -1050,7 +1050,7 @@ def _payload(prompt, model, negative=None):
     data = {"model": model, "prompt": prompt, "format": IMAGE_FORMAT}
     # The API defaults safe_mode on, which sanitises every render.
     data["safe_mode"] = False
-    if negative and not MINIMAL_PAYLOAD:
+    if negative:
         data["negative_prompt"] = negative
     if ratio_mode:
         ratios = c.get('aspectRatios') or known.get("ratios") or ["3:4"]
@@ -1351,9 +1351,9 @@ async def generate_avatar_pose(user, pose_type="dominant"):
             return await _build_and_send(
                 user, reward_prompt(variant), user.user_id, reward_negative(variant), reward_chain(),
                 require_bare=True, retry_prompt=reward_prompt_hard(variant))
-        prompt = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
-                  f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
-                  f"framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}")
+        prompt = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}, "
+                  f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}"
+                  f"{variant_phrase(variant)}, framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}")
         return await _build_and_send(user, prompt, user.user_id,
                                      NEGATIVE_PROMPT_SEXY + variant["clothed_negative"])
     except Exception as e:
@@ -1519,8 +1519,6 @@ He said: "{message_text}"
         await update.message.reply_text("Mmm? Somethin' broke, puddin'. Try again.")
     finally:
         session.close()
-
-
 # ============ COMMANDS ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1836,6 +1834,8 @@ async def handle_location_detail(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("Good. That's enough to work with.\n\nUse /task.")
     finally:
         session.close()
+
+
 # ============ VENUE CHIPS ============
 def probe_keyboard(probes, selected):
     keyboard = []
@@ -2440,9 +2440,9 @@ async def debugavatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Task {IMAGE_MODEL}, reward {IMAGE_MODEL_REWARD or 'same'}, variant {variant['label']}, "
         f"minimal {MINIMAL_PAYLOAD}, cfg {IMAGE_CFG}, steps {IMAGE_STEPS}."
     )
-    dom = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
-           f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
-           f"framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}")
+    dom = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}, "
+           f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}"
+           f"{variant_phrase(variant)}, framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}")
     await _debug_send(context, user_id, "TASK", dom, NEGATIVE_PROMPT_SEXY + variant["clothed_negative"], gate=False)
     await asyncio.sleep(2)
     await _debug_send(context, user_id, "REWARD", reward_prompt(variant),
@@ -2529,15 +2529,13 @@ async def tryn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session.close()
     await update.message.reply_text(f"{n} task draws, floor off...")
     for i in range(n):
-        dom = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
-               f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
-               f"framed from mid-thigh up, {STUDIO}")
+        dom = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}, "
+               f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}"
+               f"{variant_phrase(variant)}, framed from mid-thigh up, {STUDIO}")
         await _debug_send(context, user_id, f"TASK {i + 1}/{n}", dom,
                           NEGATIVE_PROMPT_SEXY + (variant.get("clothed_negative") or ""),
                           None, upscale=False, gate=False)
         await asyncio.sleep(2)
-
-
 MODEL_CHOICES = ["grok-imagine-image", "chroma", "lustify-v8", "z-image-turbo", "nano-banana-pro"]
 
 
