@@ -9,6 +9,15 @@ IMAGING CHANGED ONLY. Everything else is the original file.
 Imaging: PNG out, no JPEG re-encode, variance-of-Laplacian gate, best-of-N
 selection, BARE gate with vision fallback chain, upscale after select,
 document delivery instead of photo.
+
+Changelog since last send:
+- testreward runs the real path (floor + BARE gate), not a raw batch
+- reward model defaults to lustify-v8, fallbacks to chroma
+- MODEL_EXPLICIT filter on the reward chain (nano-banana 422s on explicit)
+- scheduler gated on gender/outfit/location, pushes next_task_time on skip
+- MODEL_ID_RE / _models_from_env rejects pasted code in env vars
+- boot logs the resolved model set
+- candidate loop short-circuits at 4 so a good early draw stops the batch
 """
 
 import os
@@ -53,25 +62,42 @@ VISION_FALLBACKS = [m.strip() for m in os.getenv(
     "VISION_FALLBACKS", "qwen-3-8-flash,google-gemma-4-26b-a4b-it").split(",") if m.strip()]
 VISION_CHAIN = [m for m in [VISION_MODEL] + VISION_FALLBACKS if m]
 PROBE_MODELS = [m.strip() for m in os.getenv("PROBE_MODELS", "openai-gpt-oss-120b,gemma-4-31b-it,mistral-small-3-2-24b-instruct").split(",") if m.strip()]
-# Tasks: sharp, R-rated. Rewards: explicit.
-IMAGE_MODEL = os.getenv("IMAGE_MODEL", "grok-imagine-image").strip()
-IMAGE_MODEL_REWARD = os.getenv("IMAGE_MODEL_REWARD", "chroma").strip()
-IMAGE_FALLBACKS = [m.strip() for m in os.getenv("IMAGE_FALLBACKS", "nano-banana-pro").split(",") if m.strip()]
+
+MODEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._\-]*$")
+
+
+def _models_from_env(name, default):
+    """Env values get pasted as code often enough to validate them."""
+    raw = os.getenv(name, default) or default
+    out = []
+    for part in raw.split(","):
+        m = part.strip().strip('"').strip("'").strip()
+        if MODEL_ID_RE.match(m):
+            out.append(m)
+        elif m:
+            logger.warning(f"{name}: rejected {m!r}")
+    return out or [default]
+
+
+IMAGE_MODEL = _models_from_env("IMAGE_MODEL", "lustify-v8")[0]
+IMAGE_MODEL_REWARD = _models_from_env("IMAGE_MODEL_REWARD", "lustify-v8")[0]
+IMAGE_FALLBACKS = _models_from_env("IMAGE_FALLBACKS", "chroma")
 IMAGE_FORMAT = os.getenv("IMAGE_FORMAT", "png").strip()
 IMAGE_UPSCALE = os.getenv("IMAGE_UPSCALE", "off").strip()
 IMAGE_ASPECT = os.getenv("IMAGE_ASPECT", "3:4").strip()
 IMAGE_RESOLUTION = os.getenv("IMAGE_RESOLUTION", "2K").strip()
 IMAGE_SHARPEN = os.getenv("IMAGE_SHARPEN", "1").strip()
-IMAGE_STEPS = os.getenv("IMAGE_STEPS", "30").strip()
-IMAGE_CFG = os.getenv("IMAGE_CFG", "5").strip()
+IMAGE_STEPS = os.getenv("IMAGE_STEPS", "45").strip()
+IMAGE_CFG = os.getenv("IMAGE_CFG", "7.5").strip()
 IMAGE_MAX_SIDE = os.getenv("IMAGE_MAX_SIDE", "1280").strip()
 
 # ---- imaging gate knobs ----
 MEASURE_EDGE = 1024
 VISION_EDGE = 768
 TARGET_LONG_EDGE = 1920
-RENDER_ATTEMPTS = int(os.getenv("RENDER_ATTEMPTS", "8"))
+RENDER_ATTEMPTS = int(os.getenv("RENDER_ATTEMPTS", "12"))
 RENDER_ROUNDS = int(os.getenv("RENDER_ROUNDS", "2"))
+RENDER_MAX_CANDS = int(os.getenv("RENDER_MAX_CANDS", "4"))
 TASK_IMAGE_CHANCE = float(os.getenv("TASK_IMAGE_CHANCE", "0.3"))
 
 
@@ -115,6 +141,8 @@ KNOWN_MODELS = {
     "lustify-v8": {"mode": "pixels", "max_w": 1280, "max_h": 1280},
     "z-image-turbo": {"mode": "pixels", "max_w": 1280, "max_h": 1280},
 }
+
+MODEL_EXPLICIT = {"lustify-v8", "chroma", "wai-illu"}
 
 SHARP_TAIL = "sharp focus, natural skin texture, directional studio light, 85mm"
 NEGATIVE_PROMPT = "blurry, soft focus, bokeh, plastic skin, extra fingers, fused fingers"
@@ -362,6 +390,7 @@ def sniff_ext(b):
 
 def sharpness_score(img):
     """Scale-normalised, unclipped variance of Laplacian."""
+    from PIL import ImageStat
     g = img.convert("L")
     w, h = g.size
     scale = MEASURE_EDGE / max(w, h)
@@ -369,7 +398,6 @@ def sharpness_score(img):
         g = g.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
     lap = g.filter(ImageFilter.Kernel(
         (3, 3), [0, 1, 0, 1, -4, 1, 0, 1, 0], scale=1, offset=128))
-    from PIL import ImageStat
     return float(ImageStat.Stat(lap).var[0])
 
 
@@ -403,12 +431,6 @@ def _vision_thumb(raw):
     buf = BytesIO()
     img.save(buf, format="JPEG", quality=88)
     return buf.getvalue()
-
-
-def _target(size):
-    w, h = size
-    s = TARGET_LONG_EDGE / max(w, h)
-    return (max(1, round(w * s)), max(1, round(h * s)))
 
 
 def dump_debug(image_bytes, user_id, kind="raw"):
@@ -665,9 +687,8 @@ def venue_baseline(user, location):
 
 
 def reward_chain():
-    if IMAGE_MODEL_REWARD:
-        return [IMAGE_MODEL_REWARD] + [m for m in IMAGE_FALLBACKS if m != IMAGE_MODEL_REWARD]
-    return None
+    chain = [IMAGE_MODEL_REWARD] + [m for m in IMAGE_FALLBACKS if m != IMAGE_MODEL_REWARD]
+    return [m for m in chain if m in MODEL_EXPLICIT]
 
 
 def reward_prompt(variant, wish=None):
@@ -1142,6 +1163,9 @@ async def _render_best(prompt, negative, chain=None, require_bare=False):
                 logger.info(f"{model} r{rnd} sharp {score:.1f} bytes {len(r)}")
                 if score >= floor:
                     cands.append((score, r))
+                    if len(cands) >= RENDER_MAX_CANDS:
+                        logger.info(f"{model} r{rnd}: {RENDER_MAX_CANDS} candidates, stopping early")
+                        break
             if not cands:
                 continue
             cands.sort(key=lambda c: c[0], reverse=True)
@@ -1441,7 +1465,7 @@ async def payload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"TASK {IMAGE_MODEL}\n{task_payload}\n\n"
         f"REWARD {reward_model}\n{reward_payload}\n\n"
-        f"attempts {RENDER_ATTEMPTS} x {RENDER_ROUNDS} | floors {MODEL_MIN_SHARPNESS}\n"
+        f"attempts {RENDER_ATTEMPTS} x {RENDER_ROUNDS} max {RENDER_MAX_CANDS} | floors {MODEL_MIN_SHARPNESS}\n"
         f"task spec: {json.dumps(MODEL_SPECS.get(IMAGE_MODEL, {})) or 'EMPTY'}\n"
         f"reward spec: {json.dumps(MODEL_SPECS.get(reward_model, {})) or 'EMPTY'}"
     )
@@ -1453,7 +1477,7 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user = session.query(UserState).filter_by(user_id=user_id).first()
         if user:
-            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_CHAIN}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE} | sharpen: {IMAGE_SHARPEN} | max_side: {IMAGE_MAX_SIDE}\nattempts: {RENDER_ATTEMPTS}x{RENDER_ROUNDS} | floors: {MODEL_MIN_SHARPNESS}\n\n/payload for the exact JSON")
+            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_CHAIN}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE} | sharpen: {IMAGE_SHARPEN} | max_side: {IMAGE_MAX_SIDE}\nattempts: {RENDER_ATTEMPTS}x{RENDER_ROUNDS} max {RENDER_MAX_CANDS} | floors: {MODEL_MIN_SHARPNESS}\n\n/payload for the exact JSON")
         else:
             await update.message.reply_text("No user record found")
     finally:
@@ -2339,7 +2363,7 @@ async def debugavatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def testreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Force a reward shot without completing anything. Optional wish text after the command."""
+    """Force a reward through the real path: floor, BARE gate, fallback."""
     user_id = update.effective_user.id
     session = get_session()
     try:
@@ -2348,13 +2372,18 @@ async def testreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         session.close()
     wish = " ".join(context.args).strip()[:120] if context.args else None
-    await update.message.reply_text(
-        f"Reward test - {wish or 'surprise'} | {RENDER_ATTEMPTS}x{RENDER_ROUNDS} "
-        f"floor {MODEL_MIN_SHARPNESS.get(IMAGE_MODEL_REWARD, DEFAULT_MIN_SHARPNESS):.0f}..."
-    )
+    model = IMAGE_MODEL_REWARD
+    floor = MODEL_MIN_SHARPNESS.get(model, DEFAULT_MIN_SHARPNESS)
+    await update.message.reply_text(f"Reward test on {model}, floor {floor:.0f}...")
     try:
-        await _debug_send(context, user_id, "REWARD", reward_prompt(variant, wish),
-                          NEGATIVE_PROMPT_NUDE + variant["nude_negative"], reward_chain())
+        raw, score, verdict = await _render_best(
+            reward_prompt(variant, wish), NEGATIVE_PROMPT_NUDE + variant["nude_negative"],
+            reward_chain(), require_bare=True)
+        if not raw:
+            await update.message.reply_text("All draws under floor.")
+            return
+        final = await asyncio.to_thread(finalize_png, raw)
+        await send_render(context, user_id, final, f"REWARD {score:.0f} | {verdict}")
     except Exception as e:
         logger.exception("testreward failed")
         await update.message.reply_text(f"testreward crashed: {type(e).__name__}: {e}")
@@ -2420,26 +2449,33 @@ async def scheduled_task_check(context: ContextTypes.DEFAULT_TYPE):
             UserState.scheduling_enabled == True,
             or_(UserState.next_task_time.is_(None), UserState.next_task_time <= now)
         ).all()
+        logger.info(f"Scheduled tick: {len(users)} due")
         for user in users:
             active = session.query(Task).filter_by(user_id=user.user_id, status="pending").first()
-            if not active:
-                try:
-                    if random.random() < TASK_IMAGE_CHANCE:
-                        avatar_bytes, _, _ = await generate_avatar_pose(user, "dominant")
-                        if avatar_bytes:
-                            await send_avatar_photo(context, user.user_id, avatar_bytes, "Your task awaits...")
-                            await asyncio.sleep(1)
-                    task_text, actual_risk = await generate_task_text(user, session)
-                    expires = now + timedelta(minutes=30)
-                    task = Task(user_id=user.user_id, task_text=task_text, risk_level=actual_risk, created_at=now, expires_at=expires)
-                    session.add(task)
-                    session.commit()
-                    context.job_queue.run_once(auto_clear_task, when=expires, data={'user_id': user.user_id, 'task_id': task.id}, name=f"timeout_{task.id}")
-                    await context.bot.send_message(chat_id=user.user_id, text=f"🎯 AUTO TASK\n\n{task_text}\n\n30 minutes.", reply_markup=task_keyboard(task.id, get_title()))
-                    user.next_task_time = now + timedelta(minutes=random.randint(user.min_interval, user.max_interval))
-                    session.commit()
-                except Exception as e:
-                    logger.error(f"Auto-task error: {e}")
+            if active:
+                continue
+            if not (user.gender and user.current_outfit and user.custom_location):
+                user.next_task_time = now + timedelta(
+                    minutes=random.randint(user.min_interval, user.max_interval))
+                session.commit()
+                continue
+            try:
+                if random.random() < TASK_IMAGE_CHANCE:
+                    avatar_bytes, _, _ = await generate_avatar_pose(user, "dominant")
+                    if avatar_bytes:
+                        await send_avatar_photo(context, user.user_id, avatar_bytes, "Your task awaits...")
+                        await asyncio.sleep(1)
+                task_text, actual_risk = await generate_task_text(user, session)
+                expires = now + timedelta(minutes=30)
+                task = Task(user_id=user.user_id, task_text=task_text, risk_level=actual_risk, created_at=now, expires_at=expires)
+                session.add(task)
+                session.commit()
+                context.job_queue.run_once(auto_clear_task, when=expires, data={'user_id': user.user_id, 'task_id': task.id}, name=f"timeout_{task.id}")
+                await context.bot.send_message(chat_id=user.user_id, text=f"🎯 AUTO TASK\n\n{task_text}\n\n30 minutes.", reply_markup=task_keyboard(task.id, get_title()))
+                user.next_task_time = now + timedelta(minutes=random.randint(user.min_interval, user.max_interval))
+                session.commit()
+            except Exception as e:
+                logger.error(f"Auto-task error: {e}")
     except Exception as e:
         logger.error(f"Scheduled check error: {e}")
     finally:
@@ -2483,7 +2519,7 @@ def main():
     logger.info(f"Text: {TEXT_MODEL} | Vision: {VISION_CHAIN} | Probes: {PROBE_MODELS}")
     logger.info(f"Task model: {IMAGE_MODEL} | Reward model: {IMAGE_MODEL_REWARD or 'same'} | fallbacks: {IMAGE_FALLBACKS}")
     logger.info(f"Format: {IMAGE_FORMAT} | Upscale: {IMAGE_UPSCALE} | Aspect: {IMAGE_ASPECT} | Res: {IMAGE_RESOLUTION} | Sharpen: {IMAGE_SHARPEN} | MaxSide: {IMAGE_MAX_SIDE}")
-    logger.info(f"Attempts: {RENDER_ATTEMPTS}x{RENDER_ROUNDS} | Floors: {MODEL_MIN_SHARPNESS} | Task image chance: {TASK_IMAGE_CHANCE}")
+    logger.info(f"Attempts: {RENDER_ATTEMPTS}x{RENDER_ROUNDS} max {RENDER_MAX_CANDS} | Floors: {MODEL_MIN_SHARPNESS} | Task image chance: {TASK_IMAGE_CHANCE}")
     logger.info(f"Venue presets: {len(VENUE_BASELINE)}")
     logger.info(f"Cloudinary configured: {bool(os.getenv('CLOUDINARY_CLOUD_NAME'))} / {bool(os.getenv('CLOUDINARY_API_KEY'))} / {bool(os.getenv('CLOUDINARY_API_SECRET'))}")
     logger.info("=" * 60)
