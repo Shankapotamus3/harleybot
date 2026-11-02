@@ -1028,9 +1028,12 @@ async def _request_image(prompt, negative=None, chain=None):
                 await asyncio.to_thread(check_render, image_size(raw), data)
                 score = await asyncio.to_thread(sharpness_score, raw)
                 logger.info(f"Sharpness score [{model}]: {score:.1f}")
-                if score < MIN_SHARPNESS and attempt < 2:
-                    logger.warning(f"[{model}] bad render (score {score:.1f}), regenerating")
-                    continue
+                if score < MIN_SHARPNESS:
+                    if attempt < 2:
+                        logger.warning(f"[{model}] bad render (score {score:.1f}), regenerating")
+                        continue
+                    logger.warning(f"[{model}] still bad after 3 attempts, trying next model")
+                    break
                 if model != chain[0]:
                     logger.warning(f"FALLBACK SERVED: {model} (primary {chain[0]} failed)")
                 return raw
@@ -2147,6 +2150,51 @@ async def testreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Reward test - {wish or 'surprise'}...")
     await _debug_send(context, user_id, "REWARD", reward_prompt(variant, wish), reward_negative(variant), reward_chain(), upscale=True)
 
+async def imgmodels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Dump the live image catalogue with each model's caps, so a swap is a lookup."""
+    try:
+        r = await asyncio.to_thread(
+            requests.get, f"{VENICE_API_URL}/models?type=image",
+            headers={"Authorization": f"Bearer {VENICE_API_KEY}"}, timeout=30)
+    except Exception as e:
+        await update.message.reply_text(f"Fetch failed: {e}")
+        return
+    if r.status_code != 200:
+        await update.message.reply_text(f"HTTP {r.status_code}: {r.text[:200]}")
+        return
+    payload = r.json()
+    rows = payload.get("data") or payload
+    lines = []
+    for m in rows:
+        c = (m.get("model_spec") or {}).get("constraints") or {}
+        res = c.get("resolutions") or ([c.get("defaultResolution")] if c.get("defaultResolution") else [])
+        steps = (c.get("steps") or {}).get("max")
+        lines.append(f"{m.get('id')} | res {res or '-'} | max {c.get('maxWidth')}x{c.get('maxHeight')} | steps {steps}")
+    if not lines:
+        await update.message.reply_text("Empty list.")
+        return
+    for i in range(0, len(lines), 25):
+        await update.message.reply_text("\n".join(lines[i:i + 25]))
+
+async def tryreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fire one reward at a named model without touching the defaults."""
+    if not context.args:
+        await update.message.reply_text("usage: /tryreward <model-id> [wish]")
+        return
+    model = context.args[0]
+    wish = " ".join(context.args[1:]).strip()[:120] or None
+    session = get_session()
+    try:
+        user = session.query(UserState).filter_by(user_id=update.effective_user.id).first()
+        variant = harley_variant(user) if user else HARLEY_VARIANTS["vagina"]
+    finally:
+        session.close()
+    await update.message.reply_text(f"Trying {model}...")
+    await _debug_send(
+        context, update.effective_user.id, "TRY", reward_prompt(variant, wish),
+        reward_negative(variant), [model], upscale=False,
+    )
+
 MODEL_CHOICES = ["grok-imagine-image-quality", "grok-imagine-image-2-0", "nano-banana-pro", "chroma", "z-image-turbo"]
 
 async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2296,6 +2344,8 @@ def main():
     application.add_handler(CommandHandler("skip", skip_cmd))
     application.add_handler(CommandHandler("debugavatar", debugavatar_cmd))
     application.add_handler(CommandHandler("testreward", testreward_cmd))
+    application.add_handler(CommandHandler("imgmodels", imgmodels_cmd))
+    application.add_handler(CommandHandler("tryreward", tryreward_cmd))
     application.add_handler(CommandHandler("model", model_cmd))
     application.add_handler(CommandHandler("rewardmodel", rewardmodel_cmd))
     application.add_handler(CommandHandler("gender", gender_cmd))
