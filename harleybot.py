@@ -79,9 +79,9 @@ def _models_from_env(name, default):
     return out or [default]
 
 
-IMAGE_MODEL = _models_from_env("IMAGE_MODEL", "lustify-v8")[0]
-IMAGE_MODEL_REWARD = _models_from_env("IMAGE_MODEL_REWARD", "lustify-v8")[0]
-IMAGE_FALLBACKS = _models_from_env("IMAGE_FALLBACKS", "chroma")
+IMAGE_MODEL = _models_from_env("IMAGE_MODEL", "chroma")[0]
+IMAGE_FALLBACKS = _models_from_env("IMAGE_FALLBACKS", "lustify-v8")
+IMAGE_MODEL_REWARD = _models_from_env("IMAGE_MODEL_REWARD", "chroma")[0]
 IMAGE_FORMAT = os.getenv("IMAGE_FORMAT", "png").strip()
 IMAGE_UPSCALE = os.getenv("IMAGE_UPSCALE", "off").strip()
 IMAGE_ASPECT = os.getenv("IMAGE_ASPECT", "3:4").strip()
