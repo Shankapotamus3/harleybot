@@ -41,25 +41,34 @@ CHANGES IN THIS REVISION
      foreshortening, which a soft SDXL model renders as mush on a mid-thigh crop.
  25. /tryn added - N renders from ONE prompt at one model, so model comparisons are not
      confounded by random pose and gear.
- 26. lustify floor raised to 100. The distribution is bimodal with a 15x empty gap
-     between 23.6 and 344.5, so there is no calibration ambiguity.
+ 26. lustify floor raised to 100. The distribution is bimodal with a wide empty gap
+     between the two populations, so there is no calibration ambiguity.
  27. NEGATIVE_PROMPT_NUDE was cut, then restored. Cutting it raised the floor and
      destroyed the ceiling (best score fell 727 -> 55), so the garment list is
-     load-bearing for structure, not just for nudity. Confirmed again on the run after.
+     load-bearing for structure, not just for nudity. Confirmed twice.
  28. Nudity moved into the POSITIVE prompt as "nothing on but X".
  29. /tryn takes a task|reward mode, reports the delivered score as well as the raw one,
      and runs a one-word nude check so both axes are scored.
  30. nude_check max_tokens raised 10 -> 24 and logs the raw reply or HTTP status on a
      miss. At 10 the reply truncated before the keyword and every verdict was "?".
- 31. REWARD_GEAR stripped of all legwear. Four of seven items put boots or stockings on
-     the legs, and on a mid-thigh crop that is the whole visible leg region. Torso, wrist
-     and neck only now.
+ 31. REWARD_GEAR stripped of all legwear, then of body harnesses. Four of seven items
+     put boots or stockings on the legs and on a mid-thigh crop that is the whole
+     visible leg region. A body harness has a crotch strap, which also read as covered.
  32. "wearing only X over bare skin" -> "nothing on but X". "Wearing" is a dressing cue
      and it beat the "over bare skin" qualifier.
- 33. NEGATIVE_PROMPT_NUDE gains boots, thigh-high boots, stockings, tights, leggings,
-     consistent with nothing in the prompt asking for them.
+ 33. The clause now carries "bare thighs, defined collarbone and rib shadow" - structure
+     words that are not garments, to recover the sharpness that removing legwear cost
+     (ceiling fell 460 -> 217).
  34. nude_check gains an UNSURE verdict, so "?" means the request failed and UNSURE means
      the frame was too soft to judge. The two were being conflated.
+ 35. IMAGE_MODEL_REWARD changed from nano-banana-pro to chroma. nano-banana-pro is a
+     Gemini model and refuses the nude prompt outright with a 422, retryable:false, so it
+     was never a viable reward model. Chroma had been serving every reward via fallback.
+ 36. MODEL_EXPLICIT added. Reward paths filter the chain to models that will actually
+     render genitals, so no round trip is wasted on a guaranteed policy rejection.
+ 37. MODEL_NO_NEGATIVE / MODEL_NO_SAMPLER added. Gemini/GPT/Ideogram/Recraft/Luma family
+     models take neither negative prompts nor SDXL sampler params.
+ 38. LAST_IMAGE_ERROR added so /tryn reports why a render failed instead of "no image".
 
 IMAGE_RESOLUTION stays 2K. check_render fails undersized renders, so a model that
 answers 2K with ~1K gets retried instead of being sharpened into mush. If UNDERSIZED 2K
@@ -102,10 +111,11 @@ VENICE_UPSCALE_URL = "https://api.venice.ai/api/v1/image/upscale"
 TEXT_MODEL = os.getenv("TEXT_MODEL", "venice-uncensored-role-play").strip()
 VISION_MODEL = os.getenv("VISION_MODEL", "claude-opus-4-8-fast").strip()
 PROBE_MODELS = [m.strip() for m in os.getenv("PROBE_MODELS", "openai-gpt-oss-120b,gemma-4-31b-it,mistral-small-3-2-24b-instruct").split(",") if m.strip()]
-# Tasks: sharp, R-rated. Rewards: explicit. Sharp models first, chroma last.
+# Tasks: sharp, R-rated. Rewards: explicit.
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "grok-imagine-image").strip()
-IMAGE_MODEL_REWARD = "nano-banana-pro"
-IMAGE_FALLBACKS = ["nano-banana-pro", "chroma"]
+# Chroma, not nano-banana-pro. nano-banana refuses the nude prompt with a 422.
+IMAGE_MODEL_REWARD = "chroma"
+IMAGE_FALLBACKS = ["nano-banana-pro", "chroma", "lustify-v8"]
 IMAGE_FORMAT = os.getenv("IMAGE_FORMAT", "png").strip()
 # Literal, not env - the Railway variable layer has proved unreliable and the upscaler
 # only ever existed for chroma. Re-enable by changing these two lines.
@@ -124,13 +134,26 @@ MIN_SHARPNESS = 150.0
 # Per-model override. SD/SDXL finetunes are soft by nature and score an order of
 # magnitude below a sharp model; judging them against the global floor just means
 # they never survive an attempt.
-# lustify's distribution is bimodal (9.2/10.8 vs 374.4/460.1) with a wide empty gap,
-# so 100 sits in dead space between the two populations.
-# If you ever shorten NEGATIVE_PROMPT_NUDE again, the ceiling falls to ~55 and this
-# has to come down to about 30, at which point there is no sharp mode left.
+# lustify's distribution is bimodal (14.5/18.5/29.3 vs 167.7/217.0) with a wide empty
+# gap, so 100 sits in dead space. chroma at 60 is a placeholder - calibrate it.
 MODEL_MIN_SHARPNESS = {"lustify-v8": 100.0, "lustify-v7": 10.0, "lustify-sdxl": 10.0,
-                       "wai-Illustrious": 10.0, "venice-sd35": 10.0}
+                       "wai-Illustrious": 10.0, "venice-sd35": 10.0, "chroma": 60.0}
 MODEL_SPECS = {}
+
+# Models that will actually render genitals. Gemini/GPT family refuse the nude prompt
+# with a 422 and retryable:false, so trying them on a reward only burns a round trip.
+MODEL_EXPLICIT = {"chroma", "lustify-v8", "lustify-v7", "lustify-sdxl", "venice-sd35", "wai-Illustrious"}
+
+# Gemini/GPT/Ideogram/Recraft/Luma family models take neither negative prompts nor
+# SDXL sampler params. Sending them is what broke nano-banana-pro.
+MODEL_NO_NEGATIVE = {"nano-banana-pro", "nano-banana-2", "nano-banana-2-1", "nano-banana-2-lite",
+                     "gpt-image-2", "gpt-image-1-5", "gpt-image-2-5-flare", "gpt-image-2-5-sunburst",
+                     "ideogram-v4", "ideogram-v4-5", "recraft-v4", "recraft-v4-pro",
+                     "muse-image", "luma-uni-1", "luma-uni-1-max"}
+MODEL_NO_SAMPLER = MODEL_NO_NEGATIVE
+
+# Last failure reason, for /tryn to report instead of a bare "no image".
+LAST_IMAGE_ERROR = ""
 
 # Used when the live spec is empty, so a failed /models fetch cannot cripple the payload.
 # The live catalogue carries no maxWidth/maxHeight for anything, so these are load-bearing.
@@ -169,10 +192,9 @@ SHARP_TAIL = "sharp focus, natural skin texture, directional studio light, 85mm"
 NEGATIVE_PROMPT = "blurry, soft focus, bokeh, plastic skin, extra fingers, fused fingers"
 NEGATIVE_PROMPT_SEXY = "stiff catalogue pose, stock photo, mannequin, plastic skin, extra fingers, fused fingers"
 # The long garment list is load-bearing twice over: it enforces nudity AND it feeds the
-# model concrete vocabulary to build structure against. Cutting it to four terms raised
-# the floor from ~15 to ~22 but dropped the ceiling from 727 to 55. Do not shorten it
-# without moving MODEL_MIN_SHARPNESS["lustify-v8"] down with it.
-# Legwear is negated too, because nothing in REWARD_GEAR puts anything on the legs now.
+# model concrete vocabulary to build structure against. Cutting it raised the floor and
+# dropped the ceiling from 727 to 55. Do not shorten it without lowering the lustify
+# floor to ~30 with it.
 NEGATIVE_PROMPT_NUDE = ("briefs, boxers, panties, knickers, trousers, jeans, skirt, towel, sheet, sarong, "
                         "loincloth, drapery, fabric over the groin, clothing over the groin, censored, mosaic, "
                         "boots, thigh-high boots, stockings, tights, leggings, extra fingers, flat lighting")
@@ -188,12 +210,14 @@ SOFT_WORDS = re.compile(
 # Look only. Interpolated into every avatar prompt - keep it to physical description.
 HARLEY_BASE = "Harley Quinn, white skin, blonde hair in pigtails with red and blue dyed tips, athletic slim build, lean muscular arms, red and black jester makeup, blue and red eyeshadow"
 
+# The clause carries structure words that are not garments - "bare thighs, defined
+# collarbone and rib shadow" - because removing legwear cost the sharpness ceiling.
 HARLEY_VARIANTS = {
     "vagina": {
         "label": "Vagina",
         "body": "curvy athletic figure, medium breasts",
         "clothed": "",
-        "clause": "genitals clearly visible, breasts bare",
+        "clause": "genitals clearly visible, breasts bare, bare thighs, defined collarbone and rib shadow",
         "clothed_negative": "",
         "nude_negative": "",
     },
@@ -201,7 +225,7 @@ HARLEY_VARIANTS = {
         "label": "Penis",
         "body": "curvy athletic figure, medium breasts",
         "clothed": "clear bulge in the front of the garment",
-        "clause": "genitals clearly visible, breasts bare",
+        "clause": "genitals clearly visible, breasts bare, bare thighs, defined collarbone and rib shadow",
         "clothed_negative": ", flat smooth crotch",
         "nude_negative": ", featureless crotch",
     },
@@ -665,16 +689,14 @@ REWARD_POSES = [
     "half-turned away, looking back over her shoulder",
     "sitting back on her heels, torso tall, arms overhead",
 ]
-# Torso, wrist and neck only. Four of the previous seven items put boots or stockings on
-# the legs, and on a mid-thigh crop that is the entire visible leg region - which is what
-# the vision check kept reading as COVERED.
+# Above the waist only. Legwear occupied the whole visible leg region on a mid-thigh crop,
+# and a body harness has a crotch strap - both read as COVERED to the vision check.
 REWARD_GEAR = [
-    "a black leather chest harness",
-    "a strappy leather body harness",
-    "leather wrist cuffs and a collar",
     "a leather collar",
-    "a single leather chest strap",
-    "leather cuffs",
+    "leather wrist cuffs",
+    "a leather chest harness",
+    "leather cuffs and a collar",
+    "a single leather strap across the chest",
 ]
 
 GREETINGS = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening", "hiya", "howdy", "greetings", "sup", "yo"]
@@ -1117,19 +1139,22 @@ def _payload(prompt, model, negative=None):
     known = KNOWN_MODELS.get(model, {})
     ratio_mode = bool(c.get('aspectRatios')) or (not c and known.get('mode') == "ratio")
     data = {"model": model, "prompt": prompt, "format": IMAGE_FORMAT}
-    if negative:
+    # Gemini/GPT family have no negative field.
+    if negative and model not in MODEL_NO_NEGATIVE:
         data["negative_prompt"] = negative
     if ratio_mode:
         ratios = c.get('aspectRatios') or known.get("ratios") or ["3:4"]
         data["aspect_ratio"] = IMAGE_ASPECT if IMAGE_ASPECT in ratios else ratios[0]
         res = c.get('resolutions') or known.get("res") or ["1K", "2K"]
         data["resolution"] = IMAGE_RESOLUTION if IMAGE_RESOLUTION in res else res[-1]
-        # Only when the live spec actually declares them, so nothing is sent blind.
-        step_spec = c.get('steps') or {}
-        if step_spec.get('max'):
-            data["steps"] = min(int(IMAGE_STEPS), int(step_spec['max']))
-        if c.get('cfgScale'):
-            data["cfg_scale"] = float(IMAGE_CFG)
+        # Only when the live spec actually declares them, and only for models that take
+        # SDXL sampler params at all.
+        if model not in MODEL_NO_SAMPLER:
+            step_spec = c.get('steps') or {}
+            if step_spec.get('max'):
+                data["steps"] = min(int(IMAGE_STEPS), int(step_spec['max']))
+            if c.get('cfgScale'):
+                data["cfg_scale"] = float(IMAGE_CFG)
     else:
         div = max(1, int(c.get('widthHeightDivisor') or 8))
         # The catalogue gives no maxWidth/maxHeight, so this falls through to KNOWN_MODELS
@@ -1217,11 +1242,16 @@ def _extract_bytes(result):
     except Exception:
         return None
 
-async def _request_image(prompt, negative=None, chain=None, min_sharp=None):
+async def _request_image(prompt, negative=None, chain=None, min_sharp=None, require_explicit=False):
+    global LAST_IMAGE_ERROR
     headers = {"Authorization": f"Bearer {VENICE_API_KEY}", "Content-Type": "application/json"}
     prompt = build_prompt(prompt)
     if not chain:
         chain = [IMAGE_MODEL] + [m for m in IMAGE_FALLBACKS if m != IMAGE_MODEL]
+    if require_explicit:
+        allowed = [m for m in chain if m in MODEL_EXPLICIT]
+        if allowed:
+            chain = allowed
     # get_spec blocks. Do it off the loop, once per model, before the attempt loop.
     for model in chain:
         await asyncio.to_thread(get_spec, model)
@@ -1239,7 +1269,8 @@ async def _request_image(prompt, negative=None, chain=None, min_sharp=None):
                 result = response.json()
                 raw = await asyncio.to_thread(_extract_bytes, result)
                 if not raw:
-                    logger.error(f"No image data from {model}: {str(result)[:300]}")
+                    LAST_IMAGE_ERROR = f"{model}: 200 but no image data - {str(result)[:200]}"
+                    logger.error(LAST_IMAGE_ERROR)
                     break
                 logger.info(f"Raw image from {model}: {len(raw)} bytes, header {raw[:12]!r}")
                 render_ok = await asyncio.to_thread(check_render, image_size(raw), data)
@@ -1256,6 +1287,7 @@ async def _request_image(prompt, negative=None, chain=None, min_sharp=None):
                         logger.warning(f"[{model}] rejected ({why}), regenerating")
                         continue
                     logger.warning(f"[{model}] still bad after 3 attempts ({why}), trying next model")
+                    LAST_IMAGE_ERROR = f"{model}: rejected 3x ({why})"
                     break
                 if model != chain[0]:
                     logger.warning(f"FALLBACK SERVED: {model} (primary {chain[0]} failed)")
@@ -1263,6 +1295,7 @@ async def _request_image(prompt, negative=None, chain=None, min_sharp=None):
             if response.status_code == 400 and attempt < 2 and _prune_payload(data, response.text):
                 logger.warning(f"[{model}] rejected, pruned to {sorted(data.keys())}: {response.text[:200]}")
                 continue
+            LAST_IMAGE_ERROR = f"{model}: HTTP {response.status_code} - {response.text[:200]}"
             logger.error(f"Image API error [{model}]: {response.status_code} - {response.text[:300]}")
             break
     logger.error(f"All image models failed: {chain}")
@@ -1293,8 +1326,8 @@ async def _upscale(raw):
         logger.warning(f"Upscale error, keeping raw: {e}")
         return raw
 
-async def _build_and_send(user, prompt, user_id=None, negative=None, chain=None, upscale=True):
-    raw = await _request_image(prompt, negative, chain)
+async def _build_and_send(user, prompt, user_id=None, negative=None, chain=None, upscale=True, require_explicit=False):
+    raw = await _request_image(prompt, negative, chain, require_explicit=require_explicit)
     if not raw:
         return None
     if user_id:
@@ -1314,7 +1347,8 @@ async def generate_avatar_pose(user, pose_type="dominant"):
     try:
         variant = harley_variant(user)
         if pose_type == "reward":
-            return await _build_and_send(user, reward_prompt(variant), user.user_id, reward_negative(variant), reward_chain(), upscale=True)
+            return await _build_and_send(user, reward_prompt(variant), user.user_id, reward_negative(variant),
+                                         reward_chain(), upscale=True, require_explicit=True)
         return await _build_and_send(user, task_prompt(variant), user.user_id, task_negative(variant), upscale=False)
     except Exception as e:
         logger.error(f"Avatar error: {e}")
@@ -1325,7 +1359,8 @@ async def generate_avatar_pose(user, pose_type="dominant"):
 async def deliver_reward(context, user, wish=None, session=None):
     user_id = user.user_id
     variant = harley_variant(user)
-    image_bytes = await _build_and_send(user, reward_prompt(variant, wish), user_id, reward_negative(variant), reward_chain(), upscale=True)
+    image_bytes = await _build_and_send(user, reward_prompt(variant, wish), user_id, reward_negative(variant),
+                                        reward_chain(), upscale=True, require_explicit=True)
     if not image_bytes:
         await context.bot.send_message(chat_id=user_id, text="Couldn't get it out of the camera. Try /avatar.")
         return
@@ -1348,11 +1383,12 @@ async def send_avatar_photo(context, chat_id, image_bytes, caption):
         logger.error(f"Send photo error: {e}")
     return False
 
-async def _debug_send(context, user_id, label, prompt, negative, chain=None, upscale=False, gate=True):
+async def _debug_send(context, user_id, label, prompt, negative, chain=None, upscale=False, gate=True, require_explicit=False):
     """Raw and normalized as documents, then normalized again as a photo for like-for-like."""
-    raw = await _request_image(prompt, negative, chain, min_sharp=None if gate else 0)
+    raw = await _request_image(prompt, negative, chain, min_sharp=None if gate else 0,
+                               require_explicit=require_explicit)
     if not raw:
-        await context.bot.send_message(chat_id=user_id, text=f"{label}: no image returned - check the log.")
+        await context.bot.send_message(chat_id=user_id, text=f"{label}: no image returned - {LAST_IMAGE_ERROR or 'see log'}")
         return
     w, h = await asyncio.to_thread(image_size, raw)
     try:
@@ -1510,6 +1546,7 @@ async def payload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"TASK {IMAGE_MODEL}\n{task_payload}\n\n"
         f"REWARD {reward_model}\n{reward_payload}\n\n"
         f"chains: task {[IMAGE_MODEL] + IMAGE_FALLBACKS} | reward {reward_chain()}\n"
+        f"explicit only: {sorted(MODEL_EXPLICIT)}\n"
         f"floors: global {MIN_SHARPNESS} | overrides {MODEL_MIN_SHARPNESS}\n\n"
         f"task spec: {json.dumps(MODEL_SPECS.get(IMAGE_MODEL, {})) or 'EMPTY'}\n"
         f"reward spec: {json.dumps(MODEL_SPECS.get(reward_model, {})) or 'EMPTY'}"
@@ -1521,7 +1558,7 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user = session.query(UserState).filter_by(user_id=user_id).first()
         if user:
-            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_MODEL}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY} | aspect: {IMAGE_ASPECT} | res: {IMAGE_RESOLUTION} | sharpen: {IMAGE_SHARPEN} | max_side: {IMAGE_MAX_SIDE}\nsteps: {IMAGE_STEPS} | cfg: {IMAGE_CFG} (pixel-mode models only) | floors: global {MIN_SHARPNESS}, overrides {MODEL_MIN_SHARPNESS}\noutput scale: {OUTPUT_SCALE}\n\n/payload for the exact JSON")
+            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_MODEL}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY} | aspect: {IMAGE_ASPECT} | res: {IMAGE_RESOLUTION} | sharpen: {IMAGE_SHARPEN} | max_side: {IMAGE_MAX_SIDE}\nsteps: {IMAGE_STEPS} | cfg: {IMAGE_CFG} (pixel-mode models only) | floors: global {MIN_SHARPNESS}, overrides {MODEL_MIN_SHARPNESS}\noutput scale: {OUTPUT_SCALE}\nexplicit only: {sorted(MODEL_EXPLICIT)}\n\n/payload for the exact JSON")
         else:
             await update.message.reply_text("No user record found")
     finally:
@@ -2366,7 +2403,8 @@ async def debugavatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await _debug_send(context, user_id, "TASK", task_prompt(variant), task_negative(variant), upscale=False)
     await asyncio.sleep(2)
-    await _debug_send(context, user_id, "REWARD", reward_prompt(variant), reward_negative(variant), reward_chain(), upscale=True)
+    await _debug_send(context, user_id, "REWARD", reward_prompt(variant), reward_negative(variant), reward_chain(),
+                      upscale=True, require_explicit=True)
 
 async def testreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Force a reward shot without completing anything. Optional wish text after the command."""
@@ -2379,7 +2417,8 @@ async def testreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session.close()
     wish = " ".join(context.args).strip()[:120] if context.args else None
     await update.message.reply_text(f"Reward test - {wish or 'surprise'}...")
-    await _debug_send(context, user_id, "REWARD", reward_prompt(variant, wish), reward_negative(variant), reward_chain(), upscale=True)
+    await _debug_send(context, user_id, "REWARD", reward_prompt(variant, wish), reward_negative(variant),
+                      reward_chain(), upscale=True, require_explicit=True)
 
 async def imgmodels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Dump the live image catalogue with each model's caps, so a swap is a lookup."""
@@ -2423,7 +2462,7 @@ async def tryreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Trying {model}...")
     await _debug_send(
         context, update.effective_user.id, "TRY", reward_prompt(variant, wish),
-        reward_negative(variant), [model], upscale=False, gate=False,
+        reward_negative(variant), [model], upscale=False, gate=False, require_explicit=True,
     )
 
 async def tryn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2464,9 +2503,10 @@ async def tryn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"{n} renders of one {mode} prompt on {model}. cfg {IMAGE_CFG}, steps {IMAGE_STEPS}.")
     cap = min(int(IMAGE_MAX_SIDE), 1280)
     for i in range(n):
-        raw = await _request_image(prompt, negative, [model], min_sharp=0)
+        raw = await _request_image(prompt, negative, [model], min_sharp=0,
+                                   require_explicit=(mode == "reward"))
         if not raw:
-            await update.message.reply_text(f"{i + 1}/{n}: no image")
+            await update.message.reply_text(f"{i + 1}/{n}: {LAST_IMAGE_ERROR or 'no image, no reason recorded'}")
             continue
         w, h = await asyncio.to_thread(image_size, raw)
         score = await asyncio.to_thread(sharpness_score, raw)
@@ -2499,13 +2539,13 @@ async def setmodel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     IMAGE_MODEL = m
     await asyncio.to_thread(get_spec, m)
-    await query.edit_message_text(f"Task model: {m}. /debugavatar to test.\n\ngrok = sharpest, R-rated, hides genitals. nano-banana = sharp, rejects explicit. chroma = explicit but soft, last resort. lustify = explicit, soft. z-image = fast.")
+    await query.edit_message_text(f"Task model: {m}. /debugavatar to test.\n\ngrok = sharpest, R-rated, hides genitals. nano-banana = sharp, refuses explicit (422). chroma = explicit but soft. lustify = explicit, bimodal. z-image = fast.")
 
 async def rewardmodel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton(m, callback_data=f"setreward_{m}") for m in MODEL_CHOICES]]
     keyboard.append([InlineKeyboardButton("same as task", callback_data="setreward_same")])
     await update.message.reply_text(
-        f"Reward model: {IMAGE_MODEL_REWARD or 'same'}\n\nPick one, then /testreward.",
+        f"Reward model: {IMAGE_MODEL_REWARD or 'same'}\n\nOnly explicit-capable models will be tried on rewards: {sorted(MODEL_EXPLICIT)}",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -2517,7 +2557,8 @@ async def setreward_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     IMAGE_MODEL_REWARD = "" if m == "same" else m
     if IMAGE_MODEL_REWARD:
         await asyncio.to_thread(get_spec, IMAGE_MODEL_REWARD)
-    await query.edit_message_text(f"Reward model: {IMAGE_MODEL_REWARD or 'same'}. /testreward to check.")
+    note = "" if (not IMAGE_MODEL_REWARD or IMAGE_MODEL_REWARD in MODEL_EXPLICIT) else "\n\n⚠️ Not explicit-capable - it will be skipped on rewards."
+    await query.edit_message_text(f"Reward model: {IMAGE_MODEL_REWARD or 'same'}. /testreward to check.{note}")
 
 # ============ SCHEDULER ============
 async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2650,6 +2691,7 @@ def main():
     logger.info(f"Format: {IMAGE_FORMAT} | Upscale: {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY} | Aspect: {IMAGE_ASPECT} | Res: {IMAGE_RESOLUTION} | Sharpen: {IMAGE_SHARPEN} | MaxSide: {IMAGE_MAX_SIDE} | Steps: {IMAGE_STEPS} | CFG: {IMAGE_CFG}")
     logger.info(f"Floors: global {MIN_SHARPNESS} | overrides {MODEL_MIN_SHARPNESS}")
     logger.info(f"Native caps: {NATIVE_CAPS} | output scale: {OUTPUT_SCALE}")
+    logger.info(f"Explicit-capable: {sorted(MODEL_EXPLICIT)}")
     logger.info(f"Venue presets: {len(VENUE_BASELINE)}")
     logger.info(f"Cloudinary configured: {bool(os.getenv('CLOUDINARY_CLOUD_NAME'))} / {bool(os.getenv('CLOUDINARY_API_KEY'))} / {bool(os.getenv('CLOUDINARY_API_SECRET'))}")
     logger.info("=" * 60)
