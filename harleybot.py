@@ -2555,7 +2555,73 @@ async def reset_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Error.")
     finally:
         session.close()
+async def imgmodels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Dump the live image catalogue with each model's caps, so a swap is a lookup."""
+    try:
+        r = await asyncio.to_thread(
+            requests.get, f"{VENICE_API_URL}/models?type=image",
+            headers={"Authorization": f"Bearer {VENICE_API_KEY}"}, timeout=30,
+        )
+        payload = r.json()
+    except Exception as e:
+        await update.message.reply_text(f"catalogue fetch failed - {e}")
+        return
+    rows = []
+    for m in payload.get("data", []):
+        spec = m.get("model_spec") or {}
+        rows.append(f"{m.get('id', '?')} | res {','.join(spec.get('resolutions') or []) or '-'} | "
+                    f"steps<={spec.get('steps', {}).get('max', '-')} | {','.join(spec.get('traits') or [])}")
+    await update.message.reply_text("\n".join(rows)[:3900] or "empty catalogue")
 
+async def tryreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """N ungated reward draws: /tryreward [count] [wish]"""
+    user_id = update.effective_user.id
+    args = list(context.args)
+    n = 5
+    if args and args[0].isdigit():
+        n = max(1, min(int(args.pop(0)), 8))
+    session = get_session()
+    try:
+        user = session.query(UserState).filter_by(user_id=user_id).first()
+        variant = harley_variant(user) if user else HARLEY_VARIANTS["vagina"]
+    finally:
+        session.close()
+    wish = " ".join(args).strip()[:120] or None
+    await update.message.reply_text(f"{n} reward draws - {wish or 'surprise'}, gate off...")
+    for i in range(n):
+        await _debug_send(context, user_id, f"REWARD {i + 1}/{n}", reward_prompt(variant, wish),
+                          reward_negative(variant), reward_chain(), upscale=True, gate=False)
+        await asyncio.sleep(2)
+
+async def tryn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """N ungated task draws: /tryn [count]"""
+    user_id = update.effective_user.id
+    n = 5
+    if context.args and context.args[0].isdigit():
+        n = max(1, min(int(context.args[0]), 8))
+    session = get_session()
+    try:
+        user = session.query(UserState).filter_by(user_id=user_id).first()
+        variant = harley_variant(user) if user else HARLEY_VARIANTS["vagina"]
+    finally:
+        session.close()
+    await update.message.reply_text(f"{n} task draws, gate off...")
+    for i in range(n):
+        dom = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
+               f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
+               f"framed from mid-thigh up, {STUDIO}")
+        await _debug_send(context, user_id, f"TASK {i + 1}/{n}", dom,
+                          NEGATIVE_PROMPT_SEXY + (variant.get("clothed_negative") or ""),
+                          None, upscale=False, gate=False)
+        await asyncio.sleep(2)
+
+async def rewardmodel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [[InlineKeyboardButton(m, callback_data=f"setreward_{m}")] for m in MODEL_CHOICES]
+    keyboard.append([InlineKeyboardButton("same as task", callback_data="setreward_same")])
+    await update.message.reply_text(
+        f"Reward model: {IMAGE_MODEL_REWARD or 'same'}\n\nPick one, then /testreward.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
 # ============ MAIN ============
 def main():
