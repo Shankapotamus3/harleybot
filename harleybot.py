@@ -2,10 +2,11 @@
 """
 Harley Quinn Bot - Domme, chaotic, dangerously fun.
 Harley's voice comes from a local system prompt. No character_slug dependency.
-Fixed avatar with a penis/vagina toggle, real vision verification.
 Venue features: room picker per venue, static baseline plus scoped AI probes.
 
 Changelog:
+- single state architecture: DB row behind a write-through dict view
+- one render pipeline; spec resolved once, payload built from the spec
 - room picker per venue; probes scoped to the rooms chosen, capped at 10
 - AI probes scoped to the picked rooms and told what not to repeat
 - chroma is the default task and reward model; lustify is the fallback
@@ -13,25 +14,25 @@ Changelog:
 - penis variant: futanari lead, genitals-only clause, no anatomy in the negatives
 - no female anatomy terms in any positive prompt
 - NUDE_GATE default off; safe_mode forced false
-- single-attempt render, one re-roll only on an upscaled render
 """
 
+import io
 import os
 import re
 import json
 import time
-import logging
-import asyncio
 import base64
 import random
+import logging
+import asyncio
 import threading
 import requests
 import cloudinary
 import cloudinary.uploader
 from io import BytesIO
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time as dt_time
 
-from PIL import Image, ImageFilter, ImageEnhance, UnidentifiedImageError
+from PIL import Image, ImageFilter, ImageStat, UnidentifiedImageError
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -48,9 +49,17 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN') or os.getenv('BOT_TOKEN') or os.getenv('TELEGRAM_BOT_TOKEN')
-VENICE_API_KEY = os.getenv('VENICE_API_KEY')
+BOT_TOKEN = (
+    os.getenv('BOT_TOKEN')
+    or os.getenv('TELEGRAM_TOKEN')
+    or os.getenv('TELEGRAM_BOT_TOKEN')
+    or ''
+).strip()
+
+VENICE_API_KEY = (os.getenv('VENICE_API_KEY') or '').strip()
 DATABASE_URL = os.getenv('DATABASE_URL')
+DEBUG_CHAT_ID = int(os.getenv('DEBUG_CHAT_ID', '0') or 0)
+
 VENICE_API_URL = "https://api.venice.ai/api/v1"
 VENICE_IMAGE_URL = "https://api.venice.ai/api/v1/image/generate"
 VENICE_UPSCALE_URL = "https://api.venice.ai/api/v1/image/upscale"
@@ -59,7 +68,8 @@ VISION_MODEL = os.getenv("VISION_MODEL", "qwen-3-8-flash").strip()
 VISION_FALLBACKS = [m.strip() for m in os.getenv(
     "VISION_FALLBACKS", "google-gemma-4-26b-a4b-it,e2ee-qwen3-vl-30b-a3b-p").split(",") if m.strip()]
 VISION_CHAIN = [m for m in [VISION_MODEL] + VISION_FALLBACKS if m]
-PROBE_MODELS = [m.strip() for m in os.getenv("PROBE_MODELS", "openai-gpt-oss-120b,gemma-4-31b-it,mistral-small-3-2-24b-instruct").split(",") if m.strip()]
+PROBE_MODELS = [m.strip() for m in os.getenv(
+    "PROBE_MODELS", "openai-gpt-oss-120b,gemma-4-31b-it,mistral-small-3-2-24b-instruct").split(",") if m.strip()]
 
 MODEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._\-]*$")
 
@@ -82,15 +92,16 @@ IMAGE_MODEL = _models_from_env("IMAGE_MODEL", "chroma")[0]
 IMAGE_MODEL_REWARD = _models_from_env("IMAGE_MODEL_REWARD", "chroma")[0]
 IMAGE_FALLBACKS = _models_from_env("IMAGE_FALLBACKS", "lustify-v8")
 IMAGE_FORMAT = os.getenv("IMAGE_FORMAT", "png").strip()
-IMAGE_UPSCALE = os.getenv("IMAGE_UPSCALE", "off").strip()
 IMAGE_ASPECT = os.getenv("IMAGE_ASPECT", "3:4").strip()
 IMAGE_RESOLUTION = os.getenv("IMAGE_RESOLUTION", "2K").strip()
 IMAGE_SHARPEN = os.getenv("IMAGE_SHARPEN", "1").strip()
 IMAGE_STEPS = os.getenv("IMAGE_STEPS", "45").strip()
 IMAGE_CFG = os.getenv("IMAGE_CFG", "7.5").strip()
 IMAGE_MAX_SIDE = os.getenv("IMAGE_MAX_SIDE", "1920").strip()
-IMAGE_WIDTH = os.getenv("IMAGE_WIDTH", "960").strip()
-IMAGE_HEIGHT = os.getenv("IMAGE_HEIGHT", "1280").strip()
+
+# Pinned, not read from env. A cleared variable used to square the box.
+IMAGE_WIDTH = 960
+IMAGE_HEIGHT = 1280
 
 # Strip steps and cfg back to server defaults, matching the website. The
 # negative prompt is still sent - it carries the garment and anatomy levers.
@@ -112,6 +123,12 @@ MAX_PROBES = 10
 # photographic PNG runs about 2.4 bytes/px, an upscale about 0.2. 1.0 sits
 # between them. Set 0 to disable the re-roll entirely.
 MUSH_BYTES_PER_PX = float(os.getenv("MUSH_BYTES_PER_PX", "1.0"))
+
+SHARPNESS_FLOOR = float(os.getenv("SHARPNESS_FLOOR", "90"))
+REWARD_HOUR = int(os.getenv("REWARD_HOUR", "9"))
+REWARD_MODEL_DEFAULT = IMAGE_MODEL_REWARD
+DEFAULT_VARIANT = "vagina"
+DEFAULT_PRIVACY = "private"
 
 _image_sem = threading.Semaphore(IMAGE_CONCURRENCY)
 
@@ -152,6 +169,7 @@ KNOWN_MODELS = {
 }
 
 MODEL_EXPLICIT = {"lustify-v8", "chroma", "wai-illu"}
+TASK_MODELS = ["chroma", "lustify-v8", "wai-illu"]
 
 SHARP_TAIL = "sharp focus, natural skin texture, directional studio light, 85mm"
 NEGATIVE_PROMPT = "blurry, soft focus, bokeh, plastic skin, extra fingers, fused fingers"
@@ -168,13 +186,19 @@ SOFT_WORDS = re.compile(
     r"\b(soft focus|shallow depth of field|bokeh|dreamy|hazy|misty|film grain|"
     r"cinematic glow|soft lighting|glowing|ethereal)\b", re.IGNORECASE)
 
-NUDE_PROMPT = (
-    "Look at the lower half of this image. Answer with one word only. "
-    "BARE = genitals or pubic area visible. "
-    "COVERED = clothing, underwear or fabric hides them. "
-    "UNSURE = cannot tell. Answer:"
+NUDE_SYSTEM = (
+    "You are a strict image classifier. Look at the picture and reply with "
+    "exactly one word. NUDE if the visible torso is bare from chest to hips and "
+    "nothing covers the crotch. COVERED if clothing, underwear, a hand, a prop "
+    "or a leg hides the crotch. UNSURE if the framing makes it impossible to "
+    "tell."
 )
-_VERDICT_RE = re.compile(r"\b(BARE|COVERED|UNSURE)\b")
+
+NUDE_MODELS = [
+    "e2ee-qwen3-vl-30b-a3b-instruct",
+    "qwen3-vl-235b-a22b-instruct",
+    "google-gemma-4-26b-a4b-it",
+]
 
 HARLEY_BASE = "Harley Quinn, white skin, blonde hair in pigtails with red and blue dyed tips, athletic slim build, lean muscular arms, red and black jester makeup, blue and red eyeshadow"
 
@@ -185,7 +209,6 @@ HARLEY_VARIANTS = {
         "clothed": "",
         "lead": "",
         "clause": "genitals clearly visible, breasts bare",
-        "clothed_negative": "",
         "nude_negative": "",
     },
     "penis": {
@@ -194,7 +217,6 @@ HARLEY_VARIANTS = {
         "clothed": "obvious bulge in the front of her clothes, visibly packing, cock outline through the fabric",
         "lead": "futanari, penis, balls",
         "clause": "penis and balls clearly visible",
-        "clothed_negative": "",
         "nude_negative": "",
     },
 }
@@ -240,7 +262,7 @@ class UserState(Base):
     user_id = Column(BigInteger, unique=True, nullable=False)
     username = Column(String(100))
     gender = Column(String(20), default=None)
-    harley_variant = Column(String(20), default='vagina')
+    harley_variant = Column(String(20), default=DEFAULT_VARIANT)
     current_outfit = Column(String(100), default=None)
     outfit_items = Column(Text, default=None)
     outfit_detail = Column(Text, default=None)
@@ -249,9 +271,11 @@ class UserState(Base):
     location_detail = Column(Text, default=None)
     location_probes = Column(Text, default=None)
     rooms = Column(Text, default=None)
+    reward_model = Column(String(50), default=None)
+    task_model = Column(String(50), default=None)
     context_alone = Column(Boolean, default=True)
     context_others = Column(String(100), default=None)
-    context_privacy = Column(String(20), default='private')
+    context_privacy = Column(String(20), default=DEFAULT_PRIVACY)
     risk_level = Column(Integer, default=5)
     points = Column(Integer, default=0)
     streak = Column(Integer, default=0)
@@ -380,7 +404,12 @@ def ensure_schema():
     tables = set(insp.get_table_names())
     additions = {
         "tasks": {"sharpness": "INTEGER"},
-        "user_states": {"reward_target": "INTEGER", "rooms": "TEXT"},
+        "user_states": {
+            "reward_target": "INTEGER",
+            "rooms": "TEXT",
+            "reward_model": "VARCHAR(50)",
+            "task_model": "VARCHAR(50)",
+        },
     }
     with engine.begin() as conn:
         for table, cols in additions.items():
@@ -391,6 +420,117 @@ def ensure_schema():
                 if col not in have:
                     logger.warning(f"migrating: adding {table}.{col}")
                     conn.execute(sqltext(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
+
+
+# ============ STATE ============
+_STATES = {}
+
+_PERSIST = {
+    "variant": ("harley_variant", None),
+    "privacy": ("context_privacy", None),
+    "location": ("location", None),
+    "location_notes": ("location_detail", None),
+    "reward_model": ("reward_model", None),
+    "task_model": ("task_model", None),
+    "rooms": ("rooms", json.dumps),
+    "probes": ("location_probes", json.dumps),
+}
+
+
+class StateView(dict):
+    """Dict front end over a UserState row. Persistent keys write straight through."""
+
+    def __init__(self, row, session):
+        super().__init__()
+        self._row = row
+        self._session = session
+        for key, (col, decode) in _PERSIST.items():
+            raw = getattr(row, col, None)
+            if decode and raw:
+                try:
+                    super().__setitem__(key, json.loads(raw))
+                except (ValueError, TypeError):
+                    super().__setitem__(key, [])
+            else:
+                super().__setitem__(key, raw)
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        target = _PERSIST.get(key)
+        if not target:
+            return
+        col, encode = target
+        try:
+            setattr(self._row, col, encode(value) if encode else value)
+            self._session.commit()
+        except Exception as exc:
+            logger.warning(f"state write failed for {key}: {exc}")
+
+    def setdefault(self, key, default=None):
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+
+def get_state(user_id):
+    view = _STATES.get(user_id)
+    if view is not None:
+        return view
+    session = get_session()
+    row = session.query(UserState).filter_by(user_id=user_id).first()
+    if not row:
+        row = UserState(user_id=user_id, username="")
+        session.add(row)
+        session.commit()
+    view = StateView(row, session)
+    _STATES[user_id] = view
+    return view
+
+
+def reset_state(user_id):
+    _STATES.pop(user_id, None)
+    session = get_session()
+    try:
+        row = session.query(UserState).filter_by(user_id=user_id).first()
+        if row:
+            row.harley_variant = DEFAULT_VARIANT
+            row.context_privacy = DEFAULT_PRIVACY
+            row.reward_model = REWARD_MODEL_DEFAULT
+            row.task_model = IMAGE_MODEL
+            row.location = None
+            row.location_detail = None
+            row.rooms = None
+            row.location_probes = None
+            session.commit()
+    finally:
+        session.close()
+
+
+def set_location(user_id, notes):
+    state = get_state(user_id)
+    state["location_notes"] = notes
+
+
+def all_user_ids():
+    session = get_session()
+    try:
+        return [r.user_id for r in session.query(UserState.user_id).all()]
+    finally:
+        session.close()
+
+
+def recent_settings(user_id):
+    try:
+        return json.loads(get_state(user_id).get("_recent") or "[]")
+    except (ValueError, TypeError):
+        return []
+
+
+def remember_setting(user_id, item):
+    pool = recent_settings(user_id)
+    pool.append(item)
+    state = get_state(user_id)
+    super(StateView, state).__setitem__("_recent", json.dumps(pool[-8:]))
 
 
 # ============ IMAGE HANDLING ============
@@ -404,9 +544,13 @@ def sniff_ext(b):
     return "bin"
 
 
-def sharpness_score(img):
-    from PIL import ImageStat
-    g = img.convert("L")
+def sharpness_score(source):
+    if isinstance(source, (bytes, bytearray)):
+        try:
+            source = Image.open(BytesIO(source)).convert("RGB")
+        except Exception:
+            return 0.0
+    g = source.convert("L")
     w, h = g.size
     scale = MEASURE_EDGE / max(w, h)
     if scale < 1:
@@ -416,13 +560,21 @@ def sharpness_score(img):
     return float(ImageStat.Stat(lap).var[0])
 
 
-def check_render(size):
-    w, h = size
+def check_render(source):
+    """Return (ok, reason). Accepts bytes or a (w, h) tuple."""
+    if isinstance(source, (bytes, bytearray)):
+        try:
+            with Image.open(BytesIO(source)) as im:
+                w, h = im.size
+        except Exception:
+            return False, "undecodable"
+    else:
+        w, h = source
     if min(w, h) < 400:
-        return False
+        return False, f"undersize {w}x{h}"
     if max(w, h) / max(1, min(w, h)) > 2.0:
-        return False
-    return True
+        return False, f"aspect {w}x{h}"
+    return True, None
 
 
 def finalize_png(raw):
@@ -476,14 +628,21 @@ async def upload_to_cloudinary(image_bytes, user_id, image_type='user_upload', f
             image_bytes,
             public_id=public_id,
             resource_type="image",
-            context={'user_id': str(user_id), 'image_type': image_type, 'uploaded_at': str(datetime.now(timezone.utc))},
+            context={'user_id': str(user_id), 'image_type': image_type,
+                     'uploaded_at': str(datetime.now(timezone.utc))},
             tags=[f"user_{user_id}", image_type, "telegram_bot"]
         )
         logger.info(f"Cloudinary upload success: {result.get('public_id')}")
-        return {'url': result.get('secure_url'), 'public_id': result.get('public_id'), 'width': result.get('width'), 'height': result.get('height')}
+        return {'url': result.get('secure_url'), 'public_id': result.get('public_id'),
+                'width': result.get('width'), 'height': result.get('height')}
     except Exception as e:
         logger.error(f"Cloudinary upload error: {type(e).__name__}: {e}")
         return None
+
+
+async def upload_png(png_bytes, user_id, prefix="harley"):
+    result = await upload_to_cloudinary(png_bytes, user_id, image_type=prefix)
+    return result.get("url") if result else None
 
 
 # ============ CONSTANTS ============
@@ -588,19 +747,6 @@ ROOM_OPTIONS = {
     },
 }
 
-# ---------------------------------------------------------------------------
-# Tunables read by the render pipeline and the scheduler
-# ---------------------------------------------------------------------------
-
-RENDER_TRIES = 8
-SHARPNESS_FLOOR = 90.0
-MUSH_BYTES_PER_PX = 0.35
-NUDE_GATE = os.getenv("NUDE_GATE", "0") == "1"
-MAX_PROBES = 10
-REWARD_HOUR = int(os.getenv("REWARD_HOUR", "9"))
-REWARD_MODEL_DEFAULT = "chroma"
-DEFAULT_VARIANT = "penis"
-DEFAULT_PRIVACY = "clothed"
 
 def get_probe_key(location):
     low = (location or "").lower()
@@ -616,39 +762,43 @@ def baseline_chips(location):
 
 
 KINK_CATEGORIES = {
-    "kink_exposure": ("📸 Exposure", "Being seen/photographed"),
-    "kink_humiliation": ("😳 Humiliation", "Verbal degradation"),
-    "kink_degradation": ("🗑️ Degradation", "Being treated as inferior"),
-    "kink_bondage": ("⛓️ Bondage", "Restraint"),
-    "kink_pain": ("🔥 Pain", "Impact play"),
-    "kink_service": ("🙇 Service", "Serving, chores"),
-    "kink_edging": ("⏱️ Edging", "Orgasm denial"),
-    "kink_watersports": ("💧 Watersports", "Pee play"),
-    "kink_exhibitionism": ("🎭 Exhibitionism", "Public exposure"),
-    "kink_roleplay": ("🎪 Roleplay", "Scenarios"),
-    "kink_petplay": ("🐾 Pet Play", "Animal roleplay"),
-    "kink_feminization": ("💄 Feminization", "Forced fem"),
-    "kink_cbt": ("🔩 CBT", "Cock/ball torture"),
-    "kink_breathplay": ("😮‍💨 Breath Play", "Choking"),
-    "kink_sensory": ("🙈 Sensory", "Blindfolds"),
-    "kink_temperature": ("🌡️ Temperature", "Ice/heat/wax"),
-    "kink_marking": ("✏️ Marking", "Body writing"),
-    "kink_spanking": ("👋 Spanking", "Slapping"),
-    "kink_nipple": ("👀 Nipple", "Nipple play"),
-    "kink_anal": ("🍑 Anal", "Ass play"),
-    "kink_gags": ("🔇 Gags", "Mouth restriction"),
-    "kink_social_media": ("📱 Social Media", "Online exposure")
+    "kink_exposure": ("Exposure", "Being seen/photographed"),
+    "kink_humiliation": ("Humiliation", "Verbal degradation"),
+    "kink_degradation": ("Degradation", "Being treated as inferior"),
+    "kink_bondage": ("Bondage", "Restraint"),
+    "kink_pain": ("Pain", "Impact play"),
+    "kink_service": ("Service", "Serving, chores"),
+    "kink_edging": ("Edging", "Orgasm denial"),
+    "kink_watersports": ("Watersports", "Pee play"),
+    "kink_exhibitionism": ("Exhibitionism", "Public exposure"),
+    "kink_roleplay": ("Roleplay", "Scenarios"),
+    "kink_petplay": ("Pet Play", "Animal roleplay"),
+    "kink_feminization": ("Feminization", "Forced fem"),
+    "kink_cbt": ("CBT", "Cock/ball torture"),
+    "kink_breathplay": ("Breath Play", "Choking"),
+    "kink_sensory": ("Sensory", "Blindfolds"),
+    "kink_temperature": ("Temperature", "Ice/heat/wax"),
+    "kink_marking": ("Marking", "Body writing"),
+    "kink_spanking": ("Spanking", "Slapping"),
+    "kink_nipple": ("Nipple", "Nipple play"),
+    "kink_anal": ("Anal", "Ass play"),
+    "kink_gags": ("Gags", "Mouth restriction"),
+    "kink_social_media": ("Social Media", "Online exposure")
 }
 
-KINK_LEVELS = {"no": {"emoji": "❌", "name": "No", "desc": "Hard limit"}, "okay": {"emoji": "⭕", "name": "Okay", "desc": "Allowed"}, "yes": {"emoji": "✅", "name": "Yes", "desc": "Desired"}}
+KINK_LEVELS = {
+    "no": {"emoji": "X", "name": "No", "desc": "Hard limit"},
+    "okay": {"emoji": "O", "name": "Okay", "desc": "Allowed"},
+    "yes": {"emoji": "Y", "name": "Yes", "desc": "Desired"},
+}
 
 OUTFIT_OPTIONS = {
-    "casual": {"emoji": "👕", "name": "Casual", "male_items": ["t-shirt", "jeans", "boxers"], "female_items": ["t-shirt", "leggings", "panties"]},
-    "formal": {"emoji": "👔", "name": "Formal", "male_items": ["button-up", "dress pants", "tie"], "female_items": ["blouse", "skirt", "bra"]},
-    "athletic": {"emoji": "🎽", "name": "Athletic", "male_items": ["tank", "shorts", "compression"], "female_items": ["sports bra", "shorts", "panties"]},
-    "lounge": {"emoji": "🛋️", "name": "Lounge", "male_items": ["hoodie", "sweatpants", "boxers"], "female_items": ["hoodie", "leggings", "panties"]},
-    "minimal": {"emoji": "🩳", "name": "Underwear Only", "male_items": ["boxers"], "female_items": ["bra", "panties"]},
-    "custom": {"emoji": "✏️", "name": "Custom", "male_items": [], "female_items": []}
+    "casual": {"emoji": "", "name": "Casual", "male_items": ["t-shirt", "jeans", "boxers"], "female_items": ["t-shirt", "leggings", "panties"]},
+    "formal": {"emoji": "", "name": "Formal", "male_items": ["button-up", "dress pants", "tie"], "female_items": ["blouse", "skirt", "bra"]},
+    "athletic": {"emoji": "", "name": "Athletic", "male_items": ["tank", "shorts", "compression"], "female_items": ["sports bra", "shorts", "panties"]},
+    "lounge": {"emoji": "", "name": "Lounge", "male_items": ["hoodie", "sweatpants", "boxers"], "female_items": ["hoodie", "leggings", "panties"]},
+    "minimal": {"emoji": "", "name": "Underwear Only", "male_items": ["boxers"], "female_items": ["bra", "panties"]},
+    "custom": {"emoji": "", "name": "Custom", "male_items": [], "female_items": []}
 }
 
 GENDER_GUIDELINES = {
@@ -659,12 +809,12 @@ GENDER_GUIDELINES = {
 }
 
 CONTEXT_OPTIONS = {
-    "alone": {"emoji": "🧍", "name": "Alone", "bonus": 0},
-    "partner": {"emoji": "💑", "name": "Partner Home", "bonus": 1},
-    "roommates": {"emoji": "🏠", "name": "Roommates", "bonus": 1},
-    "parents": {"emoji": "👨‍👩‍👧", "name": "Family", "bonus": 2},
-    "friends": {"emoji": "🎉", "name": "Friends Over", "bonus": 1},
-    "public": {"emoji": "👥", "name": "Public/Strangers", "bonus": 0}
+    "alone": {"emoji": "", "name": "Alone", "bonus": 0},
+    "partner": {"emoji": "", "name": "Partner Home", "bonus": 1},
+    "roommates": {"emoji": "", "name": "Roommates", "bonus": 1},
+    "parents": {"emoji": "", "name": "Family", "bonus": 2},
+    "friends": {"emoji": "", "name": "Friends Over", "bonus": 1},
+    "public": {"emoji": "", "name": "Public/Strangers", "bonus": 0}
 }
 
 HARLEY_POSES = [
@@ -710,6 +860,8 @@ GREETINGS = ["hi", "hello", "hey", "good morning", "good afternoon", "good eveni
 TASK_INQUIRIES = ["task", "my task", "current task", "what task", "do i have a task", "any task", "status", "check task", "pending task"]
 COMPLIMENTS = ["beautiful", "sexy", "hot", "gorgeous", "pretty", "cute", "amazing", "perfect", "wonderful", "great", "good", "love", "like you", "miss you"]
 DISRESPECTFUL = ["fuck", "shit", "bitch", "stupid", "dumb", "hate", "suck", "ass", "idiot", "moron"]
+
+
 # ============ HELPERS ============
 def get_user_kinks(user, level=None):
     kinks = []
@@ -726,46 +878,69 @@ def get_title(avatar_gender=None):
     return "Mistress"
 
 
-def harley_variant(user):
-    return HARLEY_VARIANTS.get(getattr(user, "harley_variant", None) or "vagina", HARLEY_VARIANTS["vagina"])
+def variant_of(state):
+    key = state.get("variant") or DEFAULT_VARIANT
+    return HARLEY_VARIANTS.get(key, HARLEY_VARIANTS[DEFAULT_VARIANT])
 
 
-def variant_phrase(variant):
-    return f", {variant['clothed']}" if variant.get("clothed") else ""
+def _row_of(target):
+    if isinstance(target, int):
+        return get_state(target)._row
+    if isinstance(target, dict):
+        return target._row
+    return target
 
 
-def probes_for(user):
+def probes_for(target):
+    row = _row_of(target)
     try:
-        data = json.loads(user.location_probes or '[]')
+        data = json.loads(getattr(row, "location_probes", None) or '[]')
         return data if isinstance(data, list) else []
     except (ValueError, TypeError):
         return []
 
 
-def rooms_for(user):
+def rooms_for(target):
+    row = _row_of(target)
     try:
-        data = json.loads(user.rooms or '[]')
+        data = json.loads(getattr(row, "rooms", None) or '[]')
         return data if isinstance(data, list) else []
     except (ValueError, TypeError):
         return []
 
 
-def rooms_for_venue(location):
-    return ROOM_OPTIONS.get(get_probe_key(location)) or ROOM_OPTIONS.get(location or "") or {}
+def rooms_for_venue(venue):
+    table = ROOM_OPTIONS.get(get_probe_key(venue)) or {}
+    return list(table.keys())
 
 
-def room_chips(user, location):
+def present_features(venue, room):
+    table = ROOM_OPTIONS.get(get_probe_key(venue)) or {}
+    return [f.strip() for f in (table.get(room) or "").split(",") if f.strip()]
+
+
+def probe_options(venue, rooms):
+    out = []
+    for room in rooms:
+        for feature in present_features(venue, room):
+            if feature not in out:
+                out.append(feature)
+    return (out or baseline_chips(venue))[:MAX_PROBES]
+
+
+def room_chips(target, location):
     """Baseline features for the rooms the sub actually has access to."""
-    table = rooms_for_venue(location)
-    picked = [p.strip() for r in rooms_for(user) if r in table for p in table[r].split(",")]
+    picked = []
+    for room in rooms_for(target):
+        picked.extend(present_features(location, room))
     return [p for p in picked if p]
 
 
-def venue_baseline(user, location):
-    picked = room_chips(user, location)
+def venue_baseline(target, location):
+    picked = room_chips(target, location)
     if picked:
         return ", ".join(picked)
-    stored = probes_for(user)
+    stored = probes_for(target)
     if stored:
         return ", ".join(stored)
     return VENUE_BASELINE.get(get_probe_key(location), VENUE_BASELINE["Generic"])
@@ -776,84 +951,104 @@ def reward_chain():
     return [m for m in chain if m in MODEL_EXPLICIT]
 
 
-def reward_prompt(variant, wish=None):
-    wish_text = f", {wish[:120]}" if wish else ""
-    lead = f", {variant['lead']}" if variant.get("lead") else ""
-    return (f"Raw editorial photograph of {HARLEY_BASE}{lead}, {variant['body']}, "
-            f"{NUDE} {random.choice(REWARD_GEAR)}, no knickers, no bra, {variant['clause']}"
-            f"{wish_text}, {random.choice(REWARD_POSES)}, framed from mid-thigh up, {STUDIO}")
-
-
-def reward_prompt_hard(variant, wish=None):
-    """Stripped prompt for the nudity retry: no gear, no studio clutter."""
-    wish_text = f", {wish[:120]}" if wish else ""
-    lead = f", {variant['lead']}" if variant.get("lead") else ""
-    return (f"Raw editorial photograph of {HARLEY_BASE}{lead}, {variant['body']}, "
-            f"fully nude, naked, no clothing at all, {variant['clause']}{wish_text}, "
-            f"standing, framed from mid-thigh up, {STUDIO}")
-
-
 def reward_negative(variant):
-    return NEGATIVE_PROMPT_NUDE + (variant.get("nude_negative") or "")
+    v = HARLEY_VARIANTS.get(variant, {}) if isinstance(variant, str) else (variant or {})
+    return NEGATIVE_PROMPT_NUDE + (v.get("nude_negative") or "")
 
 
 def task_keyboard(task_id, title):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"📸 Done, {title}", callback_data=f"complete_{task_id}")],
-        [InlineKeyboardButton("🚧 Not possible", callback_data=f"blocked_{task_id}")],
-        [InlineKeyboardButton("❌ I can't...", callback_data=f"giveup_{task_id}")],
-        [InlineKeyboardButton("🙏 Mercy", callback_data=f"mercy_{task_id}")],
+        [InlineKeyboardButton(f"Done, {title}", callback_data=f"complete_{task_id}")],
+        [InlineKeyboardButton("Not possible", callback_data=f"blocked_{task_id}")],
+        [InlineKeyboardButton("I can't...", callback_data=f"giveup_{task_id}")],
+        [InlineKeyboardButton("Mercy", callback_data=f"mercy_{task_id}")],
     ])
 
 
-def present_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧍 Alone", callback_data="present_alone")],
-        [InlineKeyboardButton("💑 Partner", callback_data="present_partner")],
-        [InlineKeyboardButton("🏠 Roommates", callback_data="present_roommates")],
-        [InlineKeyboardButton("👨‍👩‍👧 Family", callback_data="present_parents")],
-        [InlineKeyboardButton("👥 Public", callback_data="present_public")],
+def present_keyboard(venue, rooms, selected):
+    rows, row = [], []
+    for room_index, room in enumerate(rooms):
+        for feat_index, feature in enumerate(present_features(venue, room)):
+            mark = "Y " if feature in selected else ""
+            row.append(InlineKeyboardButton(
+                f"{mark}{feature[:18]}", callback_data=f"present_{room_index}_{feat_index}"))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton("Add my own", callback_data="present_custom"),
+        InlineKeyboardButton("Done", callback_data="present_done"),
     ])
+    return InlineKeyboardMarkup(rows)
 
 
-def privacy_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔒 Private", callback_data="privacy_private")],
-        [InlineKeyboardButton("🚪 Semi-private", callback_data="privacy_semi")],
-        [InlineKeyboardButton("👁️ Exposed", callback_data="privacy_exposed")],
-        [InlineKeyboardButton("🌍 Public", callback_data="privacy_public")],
+def probe_keyboard(pool, selected):
+    rows, row = [], []
+    for index, item in enumerate(pool):
+        mark = "Y " if item in selected else ""
+        row.append(InlineKeyboardButton(f"{mark}{item[:18]}", callback_data=f"probe_{index}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton("Add my own", callback_data="probe_custom"),
+        InlineKeyboardButton("Done", callback_data="probe_done"),
     ])
+    return InlineKeyboardMarkup(rows)
 
 
-def room_keyboard(venue, selected):
-    keyboard = []
-    for key in rooms_for_venue(venue):
-        mark = "✅ " if key in selected else ""
-        keyboard.append([InlineKeyboardButton(f"{mark}{key.title()}", callback_data=f"room_{key}")])
-    keyboard.append([InlineKeyboardButton("✔️ That's the lot", callback_data="room_done")])
-    return InlineKeyboardMarkup(keyboard)
+def variant_keyboard(selected):
+    rows = []
+    for key, value in HARLEY_VARIANTS.items():
+        mark = "Y " if key == selected else ""
+        rows.append([InlineKeyboardButton(f"{mark}{value['label']}", callback_data=f"variant_{key}")])
+    return InlineKeyboardMarkup(rows)
 
 
-async def generate_ai_response(prompt, temperature=0.9):
+def model_keyboard(selected):
+    rows = []
+    for model in TASK_MODELS:
+        mark = "Y " if model == selected else ""
+        rows.append([InlineKeyboardButton(f"{mark}{model}", callback_data=f"model_{model}")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ============ VENICE TRANSPORT ============
+def _headers():
+    return {"Authorization": f"Bearer {VENICE_API_KEY}", "Content-Type": "application/json"}
+
+
+async def _venice_post(path, payload, timeout=60):
+    response = await asyncio.to_thread(
+        requests.post, f"{VENICE_API_URL}{path}", headers=_headers(), json=payload, timeout=timeout)
+    if response.status_code != 200:
+        raise RuntimeError(f"{path} HTTP {response.status_code}: {response.text[:160]}")
+    return response.json()
+
+
+async def _venice_get(path, timeout=30):
+    response = await asyncio.to_thread(
+        requests.get, f"{VENICE_API_URL}{path}", headers=_headers(), timeout=timeout)
+    if response.status_code != 200:
+        raise RuntimeError(f"{path} HTTP {response.status_code}: {response.text[:160]}")
+    return response.json()
+
+
+async def generate_ai_response(messages, temperature=0.9):
+    if isinstance(messages, str):
+        messages = [{"role": "user", "content": messages}]
     try:
-        headers = {"Authorization": f"Bearer {VENICE_API_KEY}", "Content-Type": "application/json"}
-        data = {
+        data = await _venice_post("/chat/completions", {
             "model": TEXT_MODEL,
-            "messages": [
-                {"role": "system", "content": HARLEY_VOICE},
-                {"role": "user", "content": prompt},
-            ],
+            "messages": [{"role": "system", "content": HARLEY_VOICE}] + list(messages),
             "temperature": temperature,
             "max_tokens": 500,
-        }
-        response = await asyncio.to_thread(
-            requests.post, f"{VENICE_API_URL}/chat/completions",
-            headers=headers, json=data, timeout=30
-        )
-        if response.status_code == 200:
-            return response.json()['choices'][0]['message']['content']
-        logger.error(f"AI error: {response.status_code} - {response.text[:200]}")
-        return None
+        }, timeout=30)
+        return data['choices'][0]['message']['content']
     except Exception as e:
         logger.error(f"AI error: {e}")
         return None
@@ -888,7 +1083,7 @@ async def generate_probes(location, rooms=None, known=None):
             try:
                 raw = await asyncio.to_thread(
                     requests.post, f"{VENICE_API_URL}/chat/completions",
-                    headers={"Authorization": f"Bearer {VENICE_API_KEY}", "Content-Type": "application/json"},
+                    headers=_headers(),
                     json={"model": model, "messages": [{"role": "user", "content": prompt}],
                           "temperature": 0.8, "max_tokens": 220},
                     timeout=25
@@ -912,7 +1107,6 @@ async def generate_probes(location, rooms=None, known=None):
 
 async def analyze_image(image_bytes, task_desc, followup_target=None):
     try:
-        headers = {"Authorization": f"Bearer {VENICE_API_KEY}", "Content-Type": "application/json"}
         image_b64 = base64.b64encode(image_bytes).decode('utf-8')
         if followup_target:
             prompt = f"""The sub was asked for ONE specific thing after an earlier photo: {followup_target}
@@ -938,14 +1132,19 @@ Reply in exactly this format:
 VERIFIED: yes/no
 MISSING: <the single most important element not visible, or "none">
 REASON: brief"""
-        data = {"model": VISION_MODEL, "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}]}], "max_tokens": 200}
-        response = await asyncio.to_thread(
-            requests.post, f"{VENICE_API_URL}/chat/completions",
-            headers=headers, json=data, timeout=30
-        )
-        if response.status_code == 200:
-            return response.json()['choices'][0]['message']['content']
-        logger.error(f"Vision error: HTTP {response.status_code} - {response.text[:200]}")
+        for model in VISION_CHAIN:
+            try:
+                data = await _venice_post("/chat/completions", {
+                    "model": model,
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                    ]}],
+                    "max_tokens": 200,
+                }, timeout=30)
+                return data['choices'][0]['message']['content']
+            except Exception as e:
+                logger.warning(f"Vision {model} failed: {e}")
         return None
     except Exception as e:
         logger.error(f"Vision error: {e}")
@@ -1017,10 +1216,10 @@ async def generate_task_text(user, session=None, depth=0):
         session.commit()
 
     try:
-        recent_settings = json.loads(user.recent_settings or '[]')
+        recent = json.loads(user.recent_settings or '[]')
     except (ValueError, TypeError):
-        recent_settings = []
-    recent_text = "\n".join(f"- {r}" for r in recent_settings[-8:]) if recent_settings else "none yet"
+        recent = []
+    recent_text = "\n".join(f"- {r}" for r in recent[-8:]) if recent else "none yet"
     blockers = []
     if session:
         blockers = session.query(LocationConstraint).filter(
@@ -1075,7 +1274,12 @@ SETTING: <the setting, 2-5 words>"""
     response = await generate_ai_response(prompt, temperature=0.95)
     if response:
         response = response.strip()
-        forbidden_keywords = {"marking": ["write", "marker", "sharpie", "draw on", "body writing", "written", "label"], "watersports": ["pee", "piss", "urine", "wet yourself"], "breathplay": ["choke", "strangle", "suffocate"], "social_media": ["post", "upload", "instagram", "twitter", "facebook", "share online"]}
+        forbidden_keywords = {
+            "marking": ["write", "marker", "sharpie", "draw on", "body writing", "written", "label"],
+            "watersports": ["pee", "piss", "urine", "wet yourself"],
+            "breathplay": ["choke", "strangle", "suffocate"],
+            "social_media": ["post", "upload", "instagram", "twitter", "facebook", "share online"],
+        }
         for forbidden_kink, keywords in forbidden_keywords.items():
             if depth < 3 and forbidden_kink in forbidden_kinks:
                 if any(kw in response.lower() for kw in keywords):
@@ -1093,26 +1297,30 @@ SETTING: <the setting, 2-5 words>"""
             kept.append(m.group(1).strip() if m else line)
         response = "\n".join(l for l in kept if l.strip()).strip()
         if setting:
-            recent_settings.append(setting)
-            user.recent_settings = json.dumps(recent_settings[-8:])
+            recent.append(setting)
+            user.recent_settings = json.dumps(recent[-8:])
             if session:
                 session.commit()
         if response:
             return response, actual_risk
-    fallbacks = {1: f"Strip completely at {location} and photograph your reflection", 2: f"Strip at {location} near the unlocked door and take a photo", 3: f"Expose yourself at {location} near a window and photograph the view", 4: f"Step just outside {location} doorway, expose yourself, and take a photo", 5: f"Walk to the end of the {location} hallway, expose yourself briefly, photograph the empty hall behind you"}
+    fallbacks = {
+        1: f"Strip completely at {location} and photograph your reflection",
+        2: f"Strip at {location} near the unlocked door and take a photo",
+        3: f"Expose yourself at {location} near a window and photograph the view",
+        4: f"Step just outside {location} doorway, expose yourself, and take a photo",
+        5: f"Walk to the end of the {location} hallway, expose yourself briefly, photograph the empty hall behind you",
+    }
     return fallbacks.get(actual_risk, fallbacks[1]), actual_risk
 
 
-# ============ PAYLOAD + SPEC ============
-def get_spec(model):
+# ============ SPEC + PAYLOAD ============
+def _fetch_spec(model):
     if model in MODEL_SPECS:
         return MODEL_SPECS[model]
     spec = {}
     try:
         r = requests.get(
-            f"{VENICE_API_URL}/models?type=image",
-            headers={"Authorization": f"Bearer {VENICE_API_KEY}"}, timeout=30
-        )
+            f"{VENICE_API_URL}/models?type=image", headers=_headers(), timeout=30)
         if r.status_code == 200:
             payload = r.json()
             for m in (payload.get('data') or payload):
@@ -1124,57 +1332,79 @@ def get_spec(model):
     except Exception as e:
         logger.warning(f"Model spec error for {model}: {e}")
     MODEL_SPECS[model] = spec
-    if model == IMAGE_MODEL:
-        MODEL_SPEC.clear()
-        MODEL_SPEC.update(spec)
+    return spec
+
+
+def get_spec(target=None, nude=False, model=None):
+    """Resolve a full render spec. `target` is a variant key and is only used for logging."""
+    m = model or (IMAGE_MODEL_REWARD if nude else IMAGE_MODEL)
+    raw = _fetch_spec(m)
+    constraints = (raw.get("constraints") or {})
+    known = KNOWN_MODELS.get(m, {})
+    spec = {
+        "model": m,
+        "output_format": IMAGE_FORMAT,
+        "mode": "pixels",
+        "width": 0,
+        "height": 0,
+        "aspect_ratio": None,
+        "resolution": None,
+        "steps": None,
+        "cfg": None,
+    }
+    ratio_mode = bool(constraints.get("aspectRatios")) or (not constraints and known.get("mode") == "ratio")
+    if ratio_mode:
+        ratios = constraints.get("aspectRatios") or known.get("ratios") or ["3:4"]
+        spec["mode"] = "ratio"
+        spec["aspect_ratio"] = IMAGE_ASPECT if IMAGE_ASPECT in ratios else ratios[0]
+        res = constraints.get("resolutions") or known.get("res") or ["1K", "2K"]
+        spec["resolution"] = IMAGE_RESOLUTION if IMAGE_RESOLUTION in res else res[-1]
+    else:
+        div = max(1, int(constraints.get("widthHeightDivisor") or 8))
+        max_w = int(constraints.get("maxWidth") or known.get("max_w") or 1280)
+        max_h = int(constraints.get("maxHeight") or known.get("max_h") or 1280)
+        spec["width"] = max(div, (min(IMAGE_WIDTH, max_w) // div) * div)
+        spec["height"] = max(div, (min(IMAGE_HEIGHT, max_h) // div) * div)
+        res = constraints.get("resolutions")
+        if res or constraints.get("defaultResolution"):
+            res = res or ["1K", "2K"]
+            spec["resolution"] = IMAGE_RESOLUTION if IMAGE_RESOLUTION in res else res[-1]
+        step_spec = constraints.get("steps") or {}
+        max_steps = int(step_spec.get("max") or known.get("steps_max") or 30)
+        if not MINIMAL_PAYLOAD:
+            spec["steps"] = min(int(IMAGE_STEPS), max_steps)
+            spec["cfg"] = float(IMAGE_CFG)
     return spec
 
 
 def load_model_spec():
-    targets = [IMAGE_MODEL]
-    if IMAGE_MODEL_REWARD and IMAGE_MODEL_REWARD != IMAGE_MODEL:
-        targets.append(IMAGE_MODEL_REWARD)
-    for m in targets:
-        spec = get_spec(m)
+    for m in {IMAGE_MODEL, IMAGE_MODEL_REWARD}:
+        spec = _fetch_spec(m)
         logger.info(f"BOOT SPEC {m}: {json.dumps(spec) if spec else 'EMPTY (using KNOWN_MODELS)'}")
 
 
-def build_prompt(raw_prompt):
-    cleaned = SOFT_WORDS.sub("", raw_prompt)
-    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip().strip(",").strip()
-    return f"{cleaned}, {SHARP_TAIL}"
-
-
-def _payload(prompt, model, negative=None):
-    c = (get_spec(model).get('constraints') or {})
-    known = KNOWN_MODELS.get(model, {})
-    ratio_mode = bool(c.get('aspectRatios')) or (not c and known.get('mode') == "ratio")
-    data = {"model": model, "prompt": prompt, "format": IMAGE_FORMAT}
-    # The API defaults safe_mode on, which sanitises every render.
-    data["safe_mode"] = False
+def _payload(prompt, spec, negative=None):
+    data = {
+        "model": spec["model"],
+        "prompt": prompt,
+        "format": spec["output_format"],
+        # The API defaults safe_mode on, which sanitises every render.
+        "safe_mode": False,
+    }
     if negative:
         data["negative_prompt"] = negative
-    if ratio_mode:
-        ratios = c.get('aspectRatios') or known.get("ratios") or ["3:4"]
-        data["aspect_ratio"] = IMAGE_ASPECT if IMAGE_ASPECT in ratios else ratios[0]
-        res = c.get('resolutions') or known.get("res") or ["1K", "2K"]
-        data["resolution"] = IMAGE_RESOLUTION if IMAGE_RESOLUTION in res else res[-1]
+    if spec["mode"] == "ratio":
+        data["aspect_ratio"] = spec["aspect_ratio"]
+        if spec["resolution"]:
+            data["resolution"] = spec["resolution"]
     else:
-        div = max(1, int(c.get('widthHeightDivisor') or 8))
-        max_w = int(c.get('maxWidth') or known.get("max_w") or 1280)
-        max_h = int(c.get('maxHeight') or known.get("max_h") or 1280)
-        w = min(int(IMAGE_WIDTH), max_w)
-        h = min(int(IMAGE_HEIGHT), max_h)
-        data["width"] = max(div, (w // div) * div)
-        data["height"] = max(div, (h // div) * div)
-        if c.get('resolutions') or c.get('defaultResolution'):
-            res = c.get('resolutions') or ["1K", "2K"]
-            data["resolution"] = IMAGE_RESOLUTION if IMAGE_RESOLUTION in res else res[-1]
-        step_spec = c.get('steps') or {}
-        max_steps = int(step_spec.get('max') or known.get("steps_max") or 30)
-        if not MINIMAL_PAYLOAD:
-            data["steps"] = min(int(IMAGE_STEPS), max_steps)
-            data["cfg_scale"] = float(IMAGE_CFG)
+        data["width"] = spec["width"]
+        data["height"] = spec["height"]
+        if spec["resolution"]:
+            data["resolution"] = spec["resolution"]
+        if spec["steps"]:
+            data["steps"] = spec["steps"]
+            data["cfg_scale"] = spec["cfg"]
     return data
 
 
@@ -1232,11 +1462,10 @@ def _extract_bytes(result):
 
 
 def _post_image(data, model):
-    headers = {"Authorization": f"Bearer {VENICE_API_KEY}", "Content-Type": "application/json"}
     for attempt in range(3):
         try:
             with _image_sem:
-                response = requests.post(VENICE_IMAGE_URL, headers=headers, json=data, timeout=180)
+                response = requests.post(VENICE_IMAGE_URL, headers=_headers(), json=data, timeout=180)
         except Exception as e:
             logger.error(f"Image transport error [{model}]: {e}")
             return None
@@ -1255,73 +1484,54 @@ def _post_image(data, model):
     return None
 
 
-def _score_bytes(raw):
-    try:
-        img = Image.open(BytesIO(raw))
-        img.load()
-        return sharpness_score(img.convert("RGB"))
-    except Exception as e:
-        logger.warning(f"Score decode failed: {e}")
-        return 0.0
+# ============ PROMPTS ============
+def _clean(prompt):
+    cleaned = SOFT_WORDS.sub("", prompt)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip().strip(",").strip()
+    return f"{cleaned}, {SHARP_TAIL}"
 
 
-async def _request_image(prompt, negative=None, chain=None, min_sharp=None):
-    """One request. Deliver what comes back. A single silent re-roll only if the
-    render arrived upscaled. No floor, no score gate."""
-    prompt = build_prompt(prompt)
-    if not chain:
-        chain = [IMAGE_MODEL] + [m for m in IMAGE_FALLBACKS if m != IMAGE_MODEL]
-    model = chain[0]
-    data = _payload(prompt, model, negative)
-    last = None
-    for attempt in range(2):
-        raw = await asyncio.to_thread(_post_image, dict(data), model)
-        if not raw:
-            continue
-        try:
-            img = Image.open(BytesIO(raw))
-            img.load()
-            img = img.convert("RGB")
-        except Exception:
-            continue
-        density = len(raw) / max(1, img.size[0] * img.size[1])
-        score = sharpness_score(img)
-        last = (raw, score)
-        logger.info(
-            f"[{model}] {img.size} sharp {score:.1f} {len(raw)}b {density:.2f}b/px"
-        )
-        if MUSH_BYTES_PER_PX and density < MUSH_BYTES_PER_PX and attempt == 0:
-            logger.warning(f"[{model}] upscaled render, one re-roll")
-            continue
-        return raw, score
-    if last:
-        return last
-    for model in chain[1:]:
-        data = _payload(prompt, model, negative)
-        raw = await asyncio.to_thread(_post_image, dict(data), model)
-        if raw:
-            return raw, await asyncio.to_thread(_score_bytes, raw)
-    return None, 0.0
-# ---------------------------------------------------------------------------
-# Nudity gate
-# ---------------------------------------------------------------------------
+async def build_prompt(target, variant=None, *, nude=False, room_notes=""):
+    """Return (positive, negative). `target` is a user id or a state view."""
+    state = get_state(target) if isinstance(target, int) else target
+    v = HARLEY_VARIANTS.get(variant or state.get("variant") or DEFAULT_VARIANT,
+                            HARLEY_VARIANTS[DEFAULT_VARIANT])
+    location = state.get("location") or "a room"
 
-NUDE_SYSTEM = (
-    "You are a strict image classifier. Look at the picture and reply with "
-    "exactly one word. NUDE if the visible torso is bare from chest to hips and "
-    "nothing covers the crotch. COVERED if clothing, underwear, a hand, a prop "
-    "or a leg hides the crotch. UNSURE if the framing makes it impossible to "
-    "tell."
-)
+    bits = [HARLEY_BASE]
+    if v.get("lead"):
+        bits.append(v["lead"])
+    bits.append(v["body"])
 
-NUDE_MODELS = [
-    "e2ee-qwen3-vl-30b-a3b-instruct",
-    "qwen3-vl-235b-a22b-instruct",
-    "e2ee-qwen3-vl-30b-a3b-instruct",
-]
+    if nude:
+        bits.append(f"{NUDE} {random.choice(REWARD_GEAR)}")
+        bits.append(v["clause"])
+        bits.append(random.choice(REWARD_POSES))
+        negative = reward_negative(v)
+    else:
+        bits.append(state.get("outfit_detail") or state.get("current_outfit")
+                    or random.choice(HARLEY_OUTFITS))
+        if v.get("clothed"):
+            bits.append(v["clothed"])
+        bits.append(random.choice(HARLEY_POSES))
+        negative = NEGATIVE_PROMPT_SEXY + NEGATIVE_HARD
+
+    notes = (room_notes or state.get("location_notes") or "").replace("\n", ", ")
+    if notes:
+        bits.append(notes)
+    bits.append(f"at {location}")
+    bits.append(STUDIO)
+
+    return _clean(", ".join(b for b in bits if b)), negative
 
 
-async def nude_check(png_bytes: bytes) -> str:
+async def build_reward_prompt(target, variant=None):
+    prompt, _ = await build_prompt(target, variant, nude=True)
+    return prompt
+
+
+# ============ NUDITY GATE ============
+async def nude_check(png_bytes):
     """Return NUDE, COVERED or UNSURE. Never raises."""
     if not NUDE_GATE:
         return "UNSURE"
@@ -1333,16 +1543,10 @@ async def nude_check(png_bytes: bytes) -> str:
         "temperature": 0.0,
         "messages": [
             {"role": "system", "content": NUDE_SYSTEM},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Classify this image."},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{b64}"},
-                    },
-                ],
-            },
+            {"role": "user", "content": [
+                {"type": "text", "text": "Classify this image."},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+            ]},
         ],
     }
 
@@ -1351,39 +1555,32 @@ async def nude_check(png_bytes: bytes) -> str:
         try:
             data = await _venice_post("/chat/completions", payload, timeout=25)
         except Exception as exc:
-            logger.warning("nude_check transport failure on %s: %s", model, exc)
+            logger.warning(f"nude_check transport failure on {model}: {exc}")
             continue
-
         try:
             text = (data["choices"][0]["message"]["content"] or "").strip()
         except (KeyError, IndexError, TypeError):
-            logger.warning("nude_check malformed reply from %s: %r", model, data)
+            logger.warning(f"nude_check malformed reply from {model}")
             continue
-
         if not text:
-            logger.warning("nude_check empty reply from %s", model)
+            logger.warning(f"nude_check empty reply from {model}")
             continue
-
         upper = text.upper()
         if "NUD" in upper:
             return "NUDE"
         if "COVER" in upper:
             return "COVERED"
-        logger.info("nude_check unparsed reply from %s: %r", model, text[:80])
+        logger.info(f"nude_check unparsed reply from {model}: {text[:80]}")
         return "UNSURE"
 
     logger.warning("nude_check exhausted every model without a verdict")
     return "UNSURE"
 
 
-# ---------------------------------------------------------------------------
-# Render pipeline
-# ---------------------------------------------------------------------------
-
-def _mushy(png_bytes: bytes) -> bool:
-    """Byte density check. Low density means a flat, smeared render."""
+# ============ RENDER PIPELINE ============
+def _mushy(png_bytes):
     try:
-        with Image.open(io.BytesIO(png_bytes)) as im:
+        with Image.open(BytesIO(png_bytes)) as im:
             px = im.width * im.height
     except Exception:
         return False
@@ -1392,29 +1589,28 @@ def _mushy(png_bytes: bytes) -> bool:
     return (len(png_bytes) / px) < MUSH_BYTES_PER_PX
 
 
-async def _render_batch(
-    user_id: int,
-    variant: str,
-    *,
-    nude: bool,
-    room_notes: str,
-    count: int = RENDER_TRIES,
-) -> list[tuple[float, bytes, str | None]]:
-    """Fire `count` renders in parallel and score each one."""
-    spec = get_spec(variant, nude=nude)
-    prompt, negative = await build_prompt(
-        user_id,
-        variant,
-        nude=nude,
-        room_notes=room_notes,
-    )
+async def _request_image(prompt, negative=None, spec=None):
+    """One request across the fallback chain. Returns bytes or None."""
+    spec = spec or get_spec(nude=False)
+    chain = [spec["model"]] + [m for m in IMAGE_FALLBACKS if m != spec["model"]]
+    for index, model in enumerate(chain):
+        current = spec if index == 0 else get_spec(model=model)
+        data = _payload(prompt, current, negative)
+        raw = await asyncio.to_thread(_post_image, dict(data), model)
+        if raw:
+            return raw
+    return None
 
-    async def one() -> tuple[float, bytes, str | None]:
+
+async def _render_batch(user_id, variant, spec, *, nude, room_notes, count):
+    prompt, negative = await build_prompt(user_id, variant, nude=nude, room_notes=room_notes)
+
+    async def one():
         raw = await _request_image(prompt, negative, spec)
         if not raw:
             return (0.0, b"", "no image")
-        if _mushy(raw):
-            logger.info("user %s draw was mushy, re-rolling once", user_id)
+        if MUSH_BYTES_PER_PX and _mushy(raw):
+            logger.info(f"user {user_id} draw was mushy, re-rolling once")
             raw = await _request_image(prompt, negative, spec)
             if not raw:
                 return (0.0, b"", "no image after reroll")
@@ -1423,164 +1619,101 @@ async def _render_batch(
             return (0.0, raw, reason)
         return (sharpness_score(raw), raw, None)
 
-    gathered = await asyncio.gather(
-        *(one() for _ in range(count)),
-        return_exceptions=True,
-    )
+    gathered = await asyncio.gather(*(one() for _ in range(count)), return_exceptions=True)
 
-    scored: list[tuple[float, bytes, str | None]] = []
+    scored = []
     for item in gathered:
         if isinstance(item, Exception):
-            logger.warning("render raised: %s", item)
+            logger.warning(f"render raised: {item}")
             continue
         scored.append(item)
-
     scored.sort(key=lambda row: row[0], reverse=True)
     return scored
 
 
-async def _render_best(
-    user_id: int,
-    variant: str,
-    *,
-    nude: bool,
-    room_notes: str = "",
-) -> bytes:
+async def _render_best(user_id, variant, *, nude, room_notes="", model=None):
     """Best of a batch, with one extra batch if everything lands under the floor."""
+    state = get_state(user_id)
+    spec = get_spec(variant, nude=nude, model=model or state.get("reward_model" if nude else "task_model"))
+    floor = MODEL_MIN_SHARPNESS.get(spec["model"], SHARPNESS_FLOOR)
+
     for attempt in (1, 2):
         batch = await _render_batch(
-            user_id,
-            variant,
-            nude=nude,
-            room_notes=room_notes,
-        )
+            user_id, variant, spec, nude=nude, room_notes=room_notes, count=RENDER_ATTEMPTS)
         clean = [row for row in batch if row[2] is None and row[1]]
-        passing = [row for row in clean if row[0] >= SHARPNESS_FLOOR]
+        passing = [row for row in clean if row[0] >= floor]
 
         if passing:
             score, png, _ = passing[0]
-            logger.info(
-                "user %s attempt %s best %.1f of %s",
-                user_id,
-                attempt,
-                score,
-                len(batch),
-            )
+            logger.info(f"user {user_id} attempt {attempt} best {score:.1f} of {len(batch)}")
             return png
-
         if clean:
             score, png, _ = clean[0]
-            logger.info(
-                "user %s attempt %s nothing over floor, keeping %.1f",
-                user_id,
-                attempt,
-                score,
-            )
+            logger.info(f"user {user_id} attempt {attempt} nothing over floor, keeping {score:.1f}")
             return png
-
-        logger.warning("user %s attempt %s produced nothing usable", user_id, attempt)
+        logger.warning(f"user {user_id} attempt {attempt} produced nothing usable")
 
     raise RuntimeError("render failed")
 
 
-async def _upscale(png_bytes: bytes) -> bytes:
-    """Upscale, finalise and return the delivered file."""
+async def _upscale(png_bytes):
     try:
         data = await _venice_post(
             "/image/upscale",
             {"image": base64.b64encode(png_bytes).decode("ascii"), "scale": 2},
             timeout=120,
         )
-        encoded = data["image"]
+        encoded = data.get("image")
         if isinstance(encoded, dict):
             encoded = encoded.get("b64_json") or encoded.get("base64") or ""
         if encoded:
             png_bytes = base64.b64decode(encoded)
     except Exception as exc:
-        logger.warning("upscale failed, shipping the raw render: %s", exc)
-    return finalize_png(png_bytes)
+        logger.warning(f"upscale failed, shipping the raw render: {exc}")
+    return finalize_png(png_bytes) or png_bytes
 
 
-# ---------------------------------------------------------------------------
-# Delivery
-# ---------------------------------------------------------------------------
-
-async def _build_and_send(
-    bot,
-    chat_id: int,
-    png_bytes: bytes,
-    *,
-    caption: str,
-    reply_to: int | None = None,
-) -> None:
+# ============ DELIVERY ============
+async def _build_and_send(bot, chat_id, user_id, png_bytes, *, caption, reply_to=None):
     png_bytes = await _upscale(png_bytes)
-    url = await upload_png(png_bytes, prefix="harley")
-    await bot.send_document(
-        chat_id=chat_id,
-        document=url,
-        caption=caption[:1024],
-        reply_to_message_id=reply_to,
-        write_timeout=180,
-        read_timeout=180,
-    )
+    url = await upload_png(png_bytes, user_id)
+    if url:
+        await bot.send_document(
+            chat_id=chat_id, document=url, caption=caption[:1024],
+            reply_to_message_id=reply_to, write_timeout=180, read_timeout=180)
+    else:
+        await bot.send_document(
+            chat_id=chat_id, document=png_bytes, filename=f"harley_{int(time.time())}.png",
+            caption=caption[:1024], reply_to_message_id=reply_to,
+            write_timeout=180, read_timeout=180)
 
 
-async def send_render(
-    bot,
-    chat_id: int,
-    png_bytes: bytes,
-    *,
-    caption: str,
-    reply_to: int | None = None,
-) -> None:
+async def send_render(bot, chat_id, user_id, png_bytes, *, caption, reply_to=None):
     try:
-        await _build_and_send(
-            bot,
-            chat_id,
-            png_bytes,
-            caption=caption,
-            reply_to=reply_to,
-        )
+        await _build_and_send(bot, chat_id, user_id, png_bytes, caption=caption, reply_to=reply_to)
     except Exception:
-        logger.exception("send_render failed for chat %s", chat_id)
-        await bot.send_message(
-            chat_id=chat_id,
-            text="Could not deliver that one. Try again in a moment.",
-        )
+        logger.exception(f"send_render failed for chat {chat_id}")
+        await bot.send_message(chat_id=chat_id, text="Could not deliver that one. Try again in a moment.")
 
 
-async def send_avatar_photo(
-    bot,
-    chat_id: int,
-    png_bytes: bytes,
-    *,
-    caption: str = "",
-) -> None:
-    png_bytes = finalize_png(png_bytes)
-    url = await upload_png(png_bytes, prefix="avatar")
-    await bot.send_document(
-        chat_id=chat_id,
-        document=url,
-        caption=caption[:1024],
-        write_timeout=180,
-        read_timeout=180,
-    )
+async def send_avatar_photo(bot, chat_id, user_id, png_bytes, *, caption=""):
+    png_bytes = finalize_png(png_bytes) or png_bytes
+    url = await upload_png(png_bytes, user_id, prefix="avatar")
+    if url:
+        await bot.send_document(chat_id=chat_id, document=url, caption=caption[:1024],
+                                write_timeout=180, read_timeout=180)
+    else:
+        await bot.send_document(chat_id=chat_id, document=png_bytes,
+                                filename=f"avatar_{int(time.time())}.png", caption=caption[:1024],
+                                write_timeout=180, read_timeout=180)
 
 
-async def deliver_reward(
-    bot,
-    chat_id: int,
-    user_id: int,
-    variant: str,
-    *,
-    caption: str,
-) -> None:
-    """Nude reward with one retry pass if the gate says the crotch is hidden."""
+async def deliver_reward(bot, chat_id, user_id, variant, *, caption):
     png_bytes = await _render_best(user_id, variant, nude=True)
     verdict = await nude_check(png_bytes)
 
     if verdict == "COVERED" and NUDE_GATE:
-        logger.info("user %s reward came back COVERED, running retry pass", user_id)
+        logger.info(f"user {user_id} reward came back COVERED, running retry pass")
         try:
             retry = await _render_best(user_id, variant, nude=True)
             retry_verdict = await nude_check(retry)
@@ -1588,16 +1721,13 @@ async def deliver_reward(
                 png_bytes = retry
                 verdict = retry_verdict
         except Exception as exc:
-            logger.warning("retry pass failed for user %s: %s", user_id, exc)
+            logger.warning(f"retry pass failed for user {user_id}: {exc}")
 
-    logger.info("user %s reward delivered, gate verdict %s", user_id, verdict)
-    await send_render(bot, chat_id, png_bytes, caption=caption)
+    logger.info(f"user {user_id} reward delivered, gate verdict {verdict}")
+    await send_render(bot, chat_id, user_id, png_bytes, caption=caption)
 
 
-# ---------------------------------------------------------------------------
-# Avatar
-# ---------------------------------------------------------------------------
-
+# ============ AVATAR ============
 AVATAR_POSES = [
     "standing three quarter turn, weight on the back leg, chin lowered",
     "seated on the edge of a surface, forearms on the thighs, leaning in",
@@ -1609,7 +1739,7 @@ AVATAR_POSES = [
 ]
 
 
-async def generate_avatar_pose(user_id: int, variant: str) -> str:
+async def generate_avatar_pose(user_id, variant=None):
     recent = recent_settings(user_id)
     pool = [pose for pose in AVATAR_POSES if pose not in recent] or AVATAR_POSES
     pose = random.choice(pool)
@@ -1617,30 +1747,17 @@ async def generate_avatar_pose(user_id: int, variant: str) -> str:
     return pose
 
 
-# ---------------------------------------------------------------------------
-# Debug
-# ---------------------------------------------------------------------------
-
-def _debug_name(label: str, suffix: str) -> str:
+# ============ DEBUG ============
+def _debug_name(label, suffix):
     stem = re.sub(r"[^A-Za-z0-9_-]+", "_", label).strip("_") or "debug"
     return f"{stem}_{int(time.time())}.{suffix}"
 
 
-async def _debug_send(
-    bot,
-    chat_id: int,
-    png_bytes: bytes,
-    *,
-    label: str,
-    upscale: bool = False,
-    gate: bool = False,
-) -> None:
-    """Deliver a render plus its metrics to the debug chat."""
+async def _debug_send(bot, chat_id, png_bytes, *, label, upscale=False, gate=False):
     if not DEBUG_CHAT_ID:
         return
-
     try:
-        with Image.open(io.BytesIO(png_bytes)) as im:
+        with Image.open(BytesIO(png_bytes)) as im:
             dims = f"{im.width}x{im.height}"
             px = im.width * im.height
         score = sharpness_score(png_bytes)
@@ -1653,7 +1770,6 @@ async def _debug_send(
             f"bpp: {density:.3f}",
             f"sharpness: {score:.1f}",
         ]
-
         if gate:
             lines.append(f"gate: {await nude_check(png_bytes)}")
 
@@ -1666,30 +1782,20 @@ async def _debug_send(
                 lines.append(f"upscale failed: {exc}")
 
         await bot.send_document(
-            chat_id=DEBUG_CHAT_ID,
-            document=payload,
-            filename=_debug_name(label, "png"),
-            caption="\n".join(lines)[:1024],
-            write_timeout=180,
-            read_timeout=180,
-        )
+            chat_id=DEBUG_CHAT_ID, document=payload, filename=_debug_name(label, "png"),
+            caption="\n".join(lines)[:1024], write_timeout=180, read_timeout=180)
     except Exception:
-        logger.exception("debug send failed for %s", label)
+        logger.exception(f"debug send failed for {label}")
 
 
-# ---------------------------------------------------------------------------
-# Input dispatch
-# ---------------------------------------------------------------------------
-
+# ============ INPUT DISPATCH ============
 async def custom_input_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Route free text that belongs to a pending prompt rather than a chat turn."""
     message = update.effective_message
     user = update.effective_user
     if not message or not user or not message.text:
         return
 
-    state = get_state(user.id)
-    pending = state.get("pending")
+    pending = get_state(user.id).get("pending")
 
     if pending == "custom_location":
         await custom_location_input(update, context)
@@ -1710,10 +1816,7 @@ async def custom_input_dispatcher(update: Update, context: ContextTypes.DEFAULT_
     await chat_handler(update, context)
 
 
-# ---------------------------------------------------------------------------
-# Chat
-# ---------------------------------------------------------------------------
-
+# ============ CHAT ============
 async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
@@ -1725,15 +1828,15 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     state = get_state(user.id)
-    history = state.get("history", [])
+    history = state.setdefault("history", [])
     history.append({"role": "user", "content": text})
     state["history"] = history[-20:]
 
     try:
         await context.bot.send_chat_action(chat_id=message.chat_id, action="typing")
-        reply = await generate_ai_response(state["history"], user.id)
+        reply = await generate_ai_response(state["history"])
     except Exception:
-        logger.exception("chat failed for user %s", user.id)
+        logger.exception(f"chat failed for user {user.id}")
         await message.reply_text("Lost my train of thought. Say that again?")
         return
 
@@ -1743,31 +1846,20 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     state["history"].append({"role": "assistant", "content": reply})
     state["history"] = state["history"][-20:]
-
     await message.reply_text(reply[:4000])
-# ---------------------------------------------------------------------------
-# Venue and room picker
-# ---------------------------------------------------------------------------
 
+
+# ============ VENUE PICKER ============
 VENUES = [
-    ("home", "Home"),
-    ("hotel", "Hotel"),
-    ("office", "Office"),
-    ("studio", "Studio"),
-    ("gym", "Gym"),
-    ("pool", "Pool"),
-    ("beach", "Beach"),
-    ("park", "Park"),
-    ("bar", "Bar"),
-    ("club", "Club"),
-    ("car", "Car"),
-    ("rooftop", "Rooftop"),
+    ("home", "Home"), ("hotel", "Hotel"), ("office", "Office"), ("studio", "Studio"),
+    ("gym", "Gym"), ("pool", "Pool"), ("beach", "Beach"), ("park", "Park"),
+    ("bar", "Bar"), ("club", "Club"), ("car", "Car"), ("rooftop", "Rooftop"),
 ]
 
 VENUE_LABELS = dict(VENUES)
 
 
-def venue_keyboard() -> InlineKeyboardMarkup:
+def venue_keyboard():
     rows, row = [], []
     for key, label in VENUES:
         row.append(InlineKeyboardButton(label, callback_data=f"venue_{key}"))
@@ -1780,7 +1872,7 @@ def venue_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _toggle(bucket: list, item: str) -> list:
+def _toggle(bucket, item):
     if item in bucket:
         bucket.remove(item)
     else:
@@ -1797,10 +1889,7 @@ async def location_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     state["probes"] = []
     state["pending"] = None
 
-    await update.effective_message.reply_text(
-        "Where are we shooting?",
-        reply_markup=venue_keyboard(),
-    )
+    await update.effective_message.reply_text("Where are we shooting?", reply_markup=venue_keyboard())
 
 
 async def venue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1820,33 +1909,26 @@ async def venue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     state["venue"] = venue
     state["rooms"] = []
     state["features"] = {}
+    label = VENUE_LABELS.get(venue, venue.title())
 
-    known = rooms_for_venue(venue)
-    if known:
+    if rooms_for_venue(venue):
         await query.edit_message_text(
-            f"{VENUE_LABELS.get(venue, venue.title())}. Which rooms are in play?",
-            reply_markup=room_keyboard(venue, []),
-        )
+            f"{label}. Which rooms are in play?", reply_markup=room_keyboard(venue, []))
     else:
         state["pending"] = "custom_rooms"
-        await query.edit_message_text(
-            f"{VENUE_LABELS.get(venue, venue.title())}. List the rooms, separated by commas."
-        )
+        await query.edit_message_text(f"{label}. List the rooms, separated by commas.")
 
 
 async def custom_location_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     state = get_state(user.id)
-    venue = update.effective_message.text.strip()
 
-    state["venue"] = venue
+    state["venue"] = update.effective_message.text.strip()
     state["rooms"] = []
     state["features"] = {}
     state["pending"] = "custom_rooms"
 
-    await update.effective_message.reply_text(
-        "Noted. Which rooms are in play? Separate them with commas."
-    )
+    await update.effective_message.reply_text("Noted. Which rooms are in play? Separate them with commas.")
 
 
 async def room_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1858,14 +1940,13 @@ async def room_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     venue = state.get("venue") or ""
 
     if query.data == "room_done":
-        rooms = state.get("rooms", [])
+        rooms = state.get("rooms") or []
         if not rooms:
             await query.edit_message_text("Pick at least one room first.")
             return
         await query.edit_message_text(
             "Now the features inside those rooms.",
-            reply_markup=present_keyboard(venue, rooms, []),
-        )
+            reply_markup=present_keyboard(venue, rooms, []))
         return
 
     if query.data == "room_custom":
@@ -1878,9 +1959,7 @@ async def room_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if 0 <= index < len(rooms):
         _toggle(state["rooms"], rooms[index])
 
-    await query.edit_message_reply_markup(
-        reply_markup=room_keyboard(venue, state["rooms"])
-    )
+    await query.edit_message_reply_markup(reply_markup=room_keyboard(venue, state["rooms"]))
 
 
 async def custom_rooms_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1888,22 +1967,16 @@ async def custom_rooms_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     state = get_state(user.id)
     venue = state.get("venue") or ""
 
-    supplied = [
-        part.strip()
-        for part in update.effective_message.text.split(",")
-        if part.strip()
-    ]
+    supplied = [p.strip() for p in update.effective_message.text.split(",") if p.strip()]
     if not supplied:
         await update.effective_message.reply_text("Nothing usable there. Try again.")
         return
 
     state["rooms"] = supplied
     state["pending"] = None
-
     await update.effective_message.reply_text(
         "Now the features inside those rooms.",
-        reply_markup=present_keyboard(venue, supplied, []),
-    )
+        reply_markup=present_keyboard(venue, supplied, []))
 
 
 async def present_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1913,7 +1986,7 @@ async def present_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     user = update.effective_user
     state = get_state(user.id)
     venue = state.get("venue") or ""
-    rooms = state.get("rooms", [])
+    rooms = state.get("rooms") or []
     features = state.setdefault("features", {})
 
     if query.data == "present_done":
@@ -1924,9 +1997,7 @@ async def present_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if query.data == "present_custom":
         state["pending"] = "custom_features"
-        await query.edit_message_text(
-            "Describe the feature. Prefix it with the room if it matters."
-        )
+        await query.edit_message_text("Describe the feature. Prefix it with the room if it matters.")
         return
 
     _, room_index, feat_index = query.data.split("_")
@@ -1935,19 +2006,17 @@ async def present_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         room = rooms[room_index]
         options = present_features(venue, room)
         if 0 <= feat_index < len(options):
-            bucket = features.setdefault(room, [])
-            _toggle(bucket, options[feat_index])
+            _toggle(features.setdefault(room, []), options[feat_index])
 
     await query.edit_message_reply_markup(
-        reply_markup=present_keyboard(venue, rooms, [f for g in features.values() for f in g])
-    )
+        reply_markup=present_keyboard(venue, rooms, [f for g in features.values() for f in g]))
 
 
 async def custom_features_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     state = get_state(user.id)
     venue = state.get("venue") or ""
-    rooms = state.get("rooms", [])
+    rooms = state.get("rooms") or []
     features = state.setdefault("features", {})
 
     text = update.effective_message.text.strip()
@@ -1960,12 +2029,10 @@ async def custom_features_input(update: Update, context: ContextTypes.DEFAULT_TY
 
     chosen = [f for group in features.values() for f in group]
     await update.effective_message.reply_text(
-        "Added. Anything else?",
-        reply_markup=present_keyboard(venue, rooms, chosen),
-    )
+        "Added. Anything else?", reply_markup=present_keyboard(venue, rooms, chosen))
 
 
-async def _show_probes(query, user_id: int, venue: str, rooms: list, chosen: list) -> None:
+async def _show_probes(query, user_id, venue, rooms, chosen):
     state = get_state(user_id)
     baseline = probe_options(venue, rooms)
 
@@ -1973,7 +2040,7 @@ async def _show_probes(query, user_id: int, venue: str, rooms: list, chosen: lis
     try:
         ai_probes = await generate_probes(venue, rooms, known)
     except Exception as exc:
-        logger.warning("probe generation failed for %s: %s", venue, exc)
+        logger.warning(f"probe generation failed for {venue}: {exc}")
         ai_probes = []
 
     state["probe_pool"] = (baseline + ai_probes)[:MAX_PROBES]
@@ -1981,8 +2048,7 @@ async def _show_probes(query, user_id: int, venue: str, rooms: list, chosen: lis
 
     await query.edit_message_text(
         "Anything else worth pinning down?",
-        reply_markup=probe_keyboard(state["probe_pool"], []),
-    )
+        reply_markup=probe_keyboard(state["probe_pool"], []))
 
 
 async def probe_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1991,7 +2057,7 @@ async def probe_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     user = update.effective_user
     state = get_state(user.id)
-    pool = state.get("probe_pool", [])
+    pool = state.get("probe_pool") or []
 
     if query.data == "probe_done":
         await _commit_location(query, user.id)
@@ -2006,15 +2072,13 @@ async def probe_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if 0 <= index < len(pool):
         _toggle(state["probes"], pool[index])
 
-    await query.edit_message_reply_markup(
-        reply_markup=probe_keyboard(pool, state["probes"])
-    )
+    await query.edit_message_reply_markup(reply_markup=probe_keyboard(pool, state["probes"]))
 
 
 async def custom_probe_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     state = get_state(user.id)
-    pool = state.get("probe_pool", [])
+    pool = state.setdefault("probe_pool", [])
 
     text = update.effective_message.text.strip()
     if not text:
@@ -2027,19 +2091,18 @@ async def custom_probe_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     state["pending"] = None
 
     await update.effective_message.reply_text(
-        "Added. Anything else?",
-        reply_markup=probe_keyboard(pool, state["probes"]),
-    )
+        "Added. Anything else?", reply_markup=probe_keyboard(pool, state["probes"]))
 
 
-async def _commit_location(query, user_id: int) -> None:
+async def _commit_location(query, user_id):
     state = get_state(user_id)
     venue = state.get("venue") or ""
-    rooms = state.get("rooms", [])
-    features = state.get("features", {})
-    probes = state.get("probes", [])
+    rooms = state.get("rooms") or []
+    features = state.get("features") or {}
+    probes = state.get("probes") or []
+    label = VENUE_LABELS.get(venue, venue)
 
-    lines = [f"Venue: {VENUE_LABELS.get(venue, venue)}"]
+    lines = [f"Venue: {label}"]
     for room in rooms:
         picked = features.get(room, [])
         lines.append(f"{room}: " + (", ".join(picked) if picked else "as is"))
@@ -2047,26 +2110,25 @@ async def _commit_location(query, user_id: int) -> None:
         lines.append("Also: " + ", ".join(probes))
 
     notes = "\n".join(lines)
-    state["location_notes"] = notes
-    state["pending"] = None
+    state["location"] = label
     set_location(user_id, notes)
+    state["pending"] = None
 
     await query.edit_message_text(
         f"Locked in.\n\n{notes}\n\nUse /clear to drop it.",
         reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Clear", callback_data="loc_clear")]]
-        ),
-    )
+            [[InlineKeyboardButton("Clear", callback_data="loc_clear")]]))
 
 
 async def clear_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     state = get_state(user.id)
-    state["location_notes"] = ""
-    state["venue"] = None
+    state["location"] = None
+    state["location_notes"] = None
     state["rooms"] = []
-    state["features"] = {}
     state["probes"] = []
+    state["venue"] = None
+    state["features"] = {}
 
     if update.callback_query:
         await update.callback_query.answer()
@@ -2075,15 +2137,10 @@ async def clear_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.effective_message.reply_text("Location cleared.")
 
 
-# ---------------------------------------------------------------------------
-# Settings commands
-# ---------------------------------------------------------------------------
-
+# ============ SETTINGS COMMANDS ============
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "Harley here. /avatar for a photo, /location to set the scene, "
-        "/settings for the rest."
-    )
+        "Harley here. /avatar for a photo, /location to set the scene, /settings for the rest.")
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2094,17 +2151,16 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/privacy - outfit level\n"
         "/settings - current setup\n"
         "/clear - drop the location\n"
-        "/reset - back to defaults"
-    )
+        "/reset - back to defaults")
 
 
 async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    state = get_state(user.id)
+    state = get_state(update.effective_user.id)
     rows = [
-        f"variant: {state.get('variant', DEFAULT_VARIANT)}",
-        f"privacy: {state.get('privacy', DEFAULT_PRIVACY)}",
-        f"reward model: {state.get('reward_model', REWARD_MODEL_DEFAULT)}",
+        f"variant: {state.get('variant') or DEFAULT_VARIANT}",
+        f"privacy: {state.get('privacy') or DEFAULT_PRIVACY}",
+        f"task model: {state.get('task_model') or IMAGE_MODEL}",
+        f"reward model: {state.get('reward_model') or REWARD_MODEL_DEFAULT}",
         f"location: {state.get('location_notes') or 'unset'}",
     ]
     await update.effective_message.reply_text("\n".join(rows))
@@ -2112,24 +2168,23 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def variant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "Anatomy:",
-        reply_markup=variant_keyboard(get_state(update.effective_user.id).get("variant")),
-    )
+        "Anatomy:", reply_markup=variant_keyboard(get_state(update.effective_user.id).get("variant")))
 
 
 async def setvariant_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     variant = query.data.split("_", 1)[1]
+    if variant not in HARLEY_VARIANTS:
+        await query.edit_message_text("Unknown variant.")
+        return
     get_state(update.effective_user.id)["variant"] = variant
     await query.edit_message_text(f"Variant set to {variant}.")
 
 
 async def privacy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "Outfit level:",
-        reply_markup=privacy_keyboard(get_state(update.effective_user.id).get("privacy")),
-    )
+        "Outfit level:", reply_markup=privacy_keyboard(get_state(update.effective_user.id).get("privacy")))
 
 
 async def privacy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2142,8 +2197,7 @@ async def privacy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def setreward_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = getattr(update, "callback_query", None)
-    user = update.effective_user
-    state = get_state(user.id)
+    state = get_state(update.effective_user.id)
 
     if query:
         await query.answer()
@@ -2151,75 +2205,23 @@ async def setreward_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         data = update.effective_message.text.strip()
 
-    if data == "same":
-        await (query.edit_message_text if query else update.effective_message.reply_text)(
-            f"Reward model stays {state.get('reward_model', REWARD_MODEL_DEFAULT)}."
-        )
-        return
+    reply = query.edit_message_text if query else update.effective_message.reply_text
 
+    if data in ("same", "setreward"):
+        await reply(f"Reward model stays {state.get('reward_model') or REWARD_MODEL_DEFAULT}.")
+        return
     if data not in MODEL_EXPLICIT:
-        await (query.edit_message_text if query else update.effective_message.reply_text)(
-            f"{data} cannot do the nude reward. Pick another."
-        )
+        await reply(f"{data} cannot do the nude reward. Pick another.")
         return
 
     state["reward_model"] = data
-    try:
-        get_spec(state.get("variant", DEFAULT_VARIANT), nude=True)
-    except Exception as exc:
-        logger.warning("reward spec warm-up failed for %s: %s", data, exc)
-
-    await (query.edit_message_text if query else update.effective_message.reply_text)(
-        f"Reward model set to {data}."
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test commands
-# ---------------------------------------------------------------------------
-
-async def payload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    state = get_state(user.id)
-    spec = get_spec(state.get("variant", DEFAULT_VARIANT), nude=False)
-    prompt, negative = await build_prompt(
-        user.id,
-        state.get("variant", DEFAULT_VARIANT),
-        nude=False,
-        room_notes=state.get("location_notes", ""),
-    )
-    await update.effective_message.reply_text(
-        f"model: {spec['model']}\n"
-        f"box: {IMAGE_WIDTH}x{IMAGE_HEIGHT}\n"
-        f"steps: {spec['steps']} cfg: {spec['cfg']}\n"
-        f"format: {spec['output_format']}\n\n"
-        f"positive:\n{prompt}\n\n"
-        f"negative:\n{negative or '(empty)'}"[:4000]
-    )
-
-
-async def imgmodels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    try:
-        data = await _venice_get("/models")
-    except Exception as exc:
-        await update.effective_message.reply_text(f"Could not list models: {exc}")
-        return
-
-    lines = []
-    for item in data.get("data", []):
-        spec = item.get("model_spec", {})
-        lines.append(
-            f"{item.get('id')}  res {spec.get('resolution') or '-'}  "
-            f"steps_max {spec.get('steps_max') or '-'}"
-        )
-    await update.effective_message.reply_text("\n".join(lines)[:4000] or "empty")
+    get_spec(nude=True, model=data)
+    await reply(f"Reward model set to {data}.")
 
 
 async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "Task model:",
-        reply_markup=model_keyboard(get_state(update.effective_user.id).get("task_model")),
-    )
+        "Task model:", reply_markup=model_keyboard(get_state(update.effective_user.id).get("task_model")))
 
 
 async def setmodel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2230,15 +2232,46 @@ async def setmodel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await query.edit_message_text(f"Task model set to {model}.")
 
 
+# ============ TEST COMMANDS ============
+async def payload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    state = get_state(user.id)
+    spec = get_spec(state.get("variant"), nude=False, model=state.get("task_model"))
+    prompt, negative = await build_prompt(user.id, nude=False)
+    await update.effective_message.reply_text(
+        f"model: {spec['model']}\n"
+        f"box: {spec['width']}x{spec['height']}\n"
+        f"steps: {spec['steps']} cfg: {spec['cfg']}\n"
+        f"format: {spec['output_format']}\n\n"
+        f"positive:\n{prompt}\n\n"
+        f"negative:\n{negative or '(empty)'}"[:4000])
+
+
+async def imgmodels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        data = await _venice_get("/models?type=image")
+    except Exception as exc:
+        await update.effective_message.reply_text(f"Could not list models: {exc}")
+        return
+
+    lines = []
+    for item in data.get("data", []):
+        spec = item.get("model_spec", {})
+        lines.append(
+            f"{item.get('id')}  res {spec.get('resolution') or '-'}  "
+            f"steps_max {(spec.get('steps') or {}).get('max') or '-'}")
+    await update.effective_message.reply_text(("\n".join(lines) or "empty")[:4000])
+
+
 async def tryn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     state = get_state(user.id)
-    variant = state.get("variant", DEFAULT_VARIANT)
-    notes = state.get("location_notes", "")
 
     await update.effective_message.reply_text("Running a task batch.")
     try:
-        png = await _render_best(user.id, variant, nude=False, room_notes=notes)
+        png = await _render_best(
+            user.id, state.get("variant"), nude=False,
+            room_notes=state.get("location_notes") or "")
     except Exception as exc:
         await update.effective_message.reply_text(f"Batch failed: {exc}")
         return
@@ -2248,11 +2281,10 @@ async def tryn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def testreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     state = get_state(user.id)
-    variant = state.get("variant", DEFAULT_VARIANT)
 
     await update.effective_message.reply_text("Running a reward batch.")
     try:
-        png = await _render_best(user.id, variant, nude=True)
+        png = await _render_best(user.id, state.get("variant"), nude=True)
     except Exception as exc:
         await update.effective_message.reply_text(f"Batch failed: {exc}")
         return
@@ -2262,14 +2294,12 @@ async def testreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def tryreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     state = get_state(user.id)
-    model = state.get("reward_model", REWARD_MODEL_DEFAULT)
-    variant = state.get("variant", DEFAULT_VARIANT)
-    negative = reward_negative(variant)
+    model = state.get("reward_model") or REWARD_MODEL_DEFAULT
+    variant = state.get("variant")
+    spec = get_spec(variant, nude=True, model=model)
+    prompt, negative = await build_prompt(user.id, variant, nude=True)
 
     await update.effective_message.reply_text(f"Reward on {model}.")
-    prompt = await build_reward_prompt(user.id, variant)
-    spec = get_spec(variant, nude=True, model=model)
-
     try:
         png = await _request_image(prompt, negative, spec)
     except Exception as exc:
@@ -2284,72 +2314,52 @@ async def tryreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def avatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     state = get_state(user.id)
-    variant = state.get("variant", DEFAULT_VARIANT)
-    pose = await generate_avatar_pose(user.id, variant)
+    pose = await generate_avatar_pose(user.id)
 
     try:
         png = await _render_best(
-            user.id,
-            variant,
-            nude=False,
-            room_notes=f"{state.get('location_notes', '')}\nPose: {pose}".strip(),
-        )
+            user.id, state.get("variant"), nude=False,
+            room_notes=f"{state.get('location_notes') or ''}\nPose: {pose}".strip())
     except Exception:
-        logger.exception("avatar failed for %s", user.id)
+        logger.exception(f"avatar failed for {user.id}")
         await update.effective_message.reply_text("Could not get that shot. Try again.")
         return
-    await send_avatar_photo(context.bot, update.effective_chat.id, png)
+    await send_avatar_photo(context.bot, update.effective_chat.id, user.id, png)
 
 
 async def debugavatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     state = get_state(user.id)
-    pose = await generate_avatar_pose(user.id, state.get("variant", DEFAULT_VARIANT))
+    pose = await generate_avatar_pose(user.id)
     try:
-        png = await _render_best(user.id, state.get("variant", DEFAULT_VARIANT), nude=False, room_notes=pose)
+        png = await _render_best(user.id, state.get("variant"), nude=False, room_notes=pose)
     except Exception as exc:
         await update.effective_message.reply_text(f"Failed: {exc}")
         return
     await _debug_send(context.bot, user.id, png, label="avatar", upscale=True)
 
 
-# ---------------------------------------------------------------------------
-# Reset
-# ---------------------------------------------------------------------------
-
+# ============ RESET ============
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    reset_state(user.id)
+    reset_state(update.effective_user.id)
     await update.effective_message.reply_text("Back to defaults.")
 
 
-# ---------------------------------------------------------------------------
-# Scheduler
-# ---------------------------------------------------------------------------
-
+# ============ SCHEDULER ============
 async def reward_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     for user_id in all_user_ids():
         state = get_state(user_id)
-        if not state.get("rewards_on", True):
+        if not state.get("_rewards_on", True):
             continue
-        variant = state.get("variant", DEFAULT_VARIANT)
         try:
             await deliver_reward(
-                context.bot,
-                user_id,
-                user_id,
-                variant,
-                caption="Your daily.",
-            )
+                context.bot, user_id, user_id, state.get("variant"), caption="Your daily.")
         except Exception:
-            logger.exception("scheduled reward failed for %s", user_id)
+            logger.exception(f"scheduled reward failed for {user_id}")
         await asyncio.sleep(2)
 
 
-# ---------------------------------------------------------------------------
-# Errors
-# ---------------------------------------------------------------------------
-
+# ============ ERRORS ============
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("handler error", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
@@ -2359,17 +2369,15 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             pass
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
+# ============ MAIN ============
 def main() -> None:
     if not BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN is empty")
+        raise SystemExit("BOT_TOKEN is empty - check BOT_TOKEN, TELEGRAM_TOKEN or TELEGRAM_BOT_TOKEN")
     if not VENICE_API_KEY:
         raise SystemExit("VENICE_API_KEY is empty")
 
     ensure_schema()
+    load_model_spec()
 
     app = (
         Application.builder()
