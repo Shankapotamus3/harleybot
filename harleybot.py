@@ -588,6 +588,19 @@ ROOM_OPTIONS = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# Tunables read by the render pipeline and the scheduler
+# ---------------------------------------------------------------------------
+
+RENDER_TRIES = 8
+SHARPNESS_FLOOR = 90.0
+MUSH_BYTES_PER_PX = 0.35
+NUDE_GATE = os.getenv("NUDE_GATE", "0") == "1"
+MAX_PROBES = 10
+REWARD_HOUR = int(os.getenv("REWARD_HOUR", "9"))
+REWARD_MODEL_DEFAULT = "chroma"
+DEFAULT_VARIANT = "penis"
+DEFAULT_PRIVACY = "clothed"
 
 def get_probe_key(location):
     low = (location or "").lower()
