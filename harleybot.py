@@ -9,8 +9,9 @@ CHANGES IN THIS REVISION
   1. Kids Present removed from CONTEXT_OPTIONS, generate_task_text, present_callback
      and the location keyboard. Existing "kids" rows migrate to "alone" at boot.
   2. Sharpness gate rewritten to variance-of-Laplacian. The old FIND_EDGES stddev
-     scored the backdrop gradient and passed blurred frames. MIN_SHARPNESS recalibrated.
-  3. check_render now FAILS an attempt (upscaled / undersized) instead of only warning.
+     scored the backdrop gradient and passed blurred frames.
+  3. check_render FAILS undersized renders. Oversized ones are accepted and logged -
+     we downscale anyway, so a bigger image than asked for costs nothing.
   4. reward_prompt: framing contradictions removed. One framing, cropped at mid-thigh.
   5. SHARP_TAIL no longer duplicated - build_prompt is the single injection point.
   6. STUDIO: hard key light instead of "subtle rim light" on a featureless backdrop.
@@ -25,11 +26,19 @@ CHANGES IN THIS REVISION
  15. handle_photo commits before the user lookup.
  16. trans/nonbinary get a real outfit list instead of silently falling back to male.
  17. Global error handler.
+ 18. IMAGE_MODEL default fixed: grok-imagine-image-quality does not exist in the live
+     catalogue. grok-imagine-image does. MODEL_CHOICES updated to real ids only.
+ 19. The /models response carries NO constraints.maxWidth or maxHeight for any model,
+     so the pixel-mode box is always a guess. NATIVE_CAPS and KNOWN_MODELS now pin it
+     explicitly for the pixel models actually in use.
+ 20. Per-model sharpness floor (MODEL_MIN_SHARPNESS) so one soft SDXL finetune does not
+     have to be judged against a global floor set for a sharp model.
+ 21. _payload falls back to the model's own maximum box instead of the hardcoded
+     960x1280 env default, which every pixel model was ignoring.
 
-IMAGE_RESOLUTION is still 2K by default. With check_render now failing undersized
-renders, a model that answers a 2K request with ~1K gets caught and retried instead
-of being sharpened into mush. Watch the log for UNDERSIZED 2K RENDER; if it is
-constant, set IMAGE_RESOLUTION=1K and let the local downscale do the work.
+IMAGE_RESOLUTION stays 2K. check_render now fails undersized renders, so a model that
+answers 2K with ~1K gets retried instead of being sharpened into mush. If UNDERSIZED 2K
+RENDER is constant in the log, set IMAGE_RESOLUTION=1K and let the local downscale work.
 """
 
 import os
@@ -70,7 +79,7 @@ VISION_MODEL = os.getenv("VISION_MODEL", "claude-opus-4-8-fast").strip()
 PROBE_MODELS = [m.strip() for m in os.getenv("PROBE_MODELS", "openai-gpt-oss-120b,gemma-4-31b-it,mistral-small-3-2-24b-instruct").split(",") if m.strip()]
 # Tasks: sharp, R-rated. Rewards: explicit. Sharp models first, chroma last - it never blurs
 # less than 1440x1920 and it is what every policy rejection was landing on.
-IMAGE_MODEL = os.getenv("IMAGE_MODEL", "grok-imagine-image-quality").strip()
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "grok-imagine-image").strip()
 IMAGE_MODEL_REWARD = "nano-banana-pro"
 IMAGE_FALLBACKS = ["nano-banana-pro", "chroma"]
 IMAGE_FORMAT = os.getenv("IMAGE_FORMAT", "png").strip()
@@ -88,11 +97,17 @@ IMAGE_MAX_SIDE = os.getenv("IMAGE_MAX_SIDE", "1280").strip()
 # Sharp frames score in the hundreds to thousands, mush under ~100. Recalibrate if
 # the model mix changes: log ten good renders and set this at ~40% of the lowest.
 MIN_SHARPNESS = 150.0
+# Per-model override. SD/SDXL finetunes are soft by nature and score an order of
+# magnitude below a sharp model; judging them against the global floor just means
+# they never survive an attempt.
+MODEL_MIN_SHARPNESS = {"lustify-v8": 10.0, "lustify-v7": 10.0, "lustify-sdxl": 10.0,
+                       "wai-Illustrious": 10.0, "venice-sd35": 10.0}
 MODEL_SPECS = {}
 
 # Used when the live spec is empty, so a failed /models fetch cannot cripple the payload.
+# The live catalogue carries no maxWidth/maxHeight for anything, so these are load-bearing.
 KNOWN_MODELS = {
-    "grok-imagine-image-quality": {
+    "grok-imagine-image": {
         "mode": "ratio",
         "ratios": ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "2:1", "1:2"],
         "res": ["1K", "2K"],
@@ -105,15 +120,16 @@ KNOWN_MODELS = {
     "nano-banana-pro": {
         "mode": "ratio",
         "ratios": ["1:1", "4:3", "3:4", "16:9", "9:16", "3:2", "2:3"],
-        "res": ["1K", "2K"],
+        "res": ["1K", "2K", "4K"],
     },
     "chroma": {"mode": "pixels", "max_w": 1280, "max_h": 1280, "steps_max": 10},
-    "z-image-turbo": {"mode": "pixels", "max_w": 1280, "max_h": 1280},
+    "z-image-turbo": {"mode": "pixels", "max_w": 1280, "max_h": 1280, "steps_max": 8},
+    "lustify-v8": {"mode": "pixels", "max_w": 1440, "max_h": 1920, "steps_max": 50},
 }
 
-# Models that render near 1K and merely upscale when `resolution` is present.
-# They get their real maximum box instead, so the pixels are native rather than interpolated.
-NATIVE_CAPS = {"chroma": (960, 1280)}
+# Models that render at a fixed native size and ignore the box we send.
+# They get their real dimensions pinned so check_render has something to match.
+NATIVE_CAPS = {"chroma": (960, 1280), "lustify-v8": (1440, 1920)}
 
 SHARP_TAIL = "sharp focus, natural skin texture, directional studio light, 85mm"
 NEGATIVE_PROMPT = "blurry, soft focus, bokeh, plastic skin, extra fingers, fused fingers"
@@ -360,20 +376,20 @@ def sharpness_score(image_bytes):
         return 0.0
 
 def check_render(size, data):
-    """Compare the returned render against what was asked for. True if usable.
+    """True if the render is usable.
 
-    Now returns a verdict rather than only logging, so a silently upscaled or
-    undersized frame costs an attempt instead of being sharpened into mush.
+    Undersized fails - the model returned less than it promised. Oversized passes:
+    we downscale to IMAGE_MAX_SIDE regardless, so a bigger frame than asked for is
+    free pixels rather than a defect. It is still logged.
     """
     w, h = size
     req_w, req_h = data.get("width"), data.get("height")
     if req_w and req_h:
-        if w > req_w * 1.2 or h > req_h * 1.2:
-            logger.warning(f"UPSCALED RENDER: asked {req_w}x{req_h}, got {w}x{h}")
-            return False
         if w < req_w * 0.8 or h < req_h * 0.8:
             logger.warning(f"UNDERSIZED RENDER: asked {req_w}x{req_h}, got {w}x{h}")
             return False
+        if w > req_w * 1.2 or h > req_h * 1.2:
+            logger.info(f"OVERSIZED RENDER (accepted): asked {req_w}x{req_h}, got {w}x{h}")
     elif data.get("resolution") == "2K" and max(w, h) < 1500:
         logger.warning(f"UNDERSIZED 2K RENDER: {w}x{h} - model is not honouring 2K")
         return False
@@ -947,6 +963,9 @@ def get_spec(model):
 
     Only caches on a successful fetch. The old version cached {} on any failure,
     so one boot-time blip poisoned that model for the life of the process.
+
+    Note: the live catalogue returns no constraints.maxWidth/maxHeight for ANY model,
+    so the pixel-mode branch always falls through to KNOWN_MODELS / NATIVE_CAPS.
     """
     if model in MODEL_SPECS:
         return MODEL_SPECS[model]
@@ -990,7 +1009,11 @@ def build_prompt(raw_prompt):
     return f"{cleaned}, {SHARP_TAIL}"
 
 def _apply_native_caps(data, model):
-    """Models that render at ~1K and merely upscale get their real box, not a resolution hint."""
+    """Models that render at a fixed native size get their real box pinned.
+
+    They ignore whatever we send, so pinning it is the only way check_render has a
+    meaningful target.
+    """
     native = NATIVE_CAPS.get(model)
     if not native:
         return data
@@ -1019,10 +1042,13 @@ def _payload(prompt, model, negative=None):
             data["cfg_scale"] = float(IMAGE_CFG)
     else:
         div = max(1, int(c.get('widthHeightDivisor') or 8))
+        # The catalogue gives no maxWidth/maxHeight, so this falls through to KNOWN_MODELS
+        # or the generic 1280. Defaulting the box to the model maximum beats the old
+        # hardcoded 960x1280 that every pixel model was quietly ignoring.
         max_w = int(c.get('maxWidth') or known.get("max_w") or 1280)
         max_h = int(c.get('maxHeight') or known.get("max_h") or 1280)
-        w = min(int(os.getenv("IMAGE_WIDTH", "960")), max_w)
-        h = min(int(os.getenv("IMAGE_HEIGHT", "1280")), max_h)
+        w = min(int(os.getenv("IMAGE_WIDTH", str(max_w))), max_w)
+        h = min(int(os.getenv("IMAGE_HEIGHT", str(max_h))), max_h)
         data["width"] = max(div, (w // div) * div)
         data["height"] = max(div, (h // div) * div)
         # Chroma declares defaultResolution but no resolutions array - without this it renders at 1K
@@ -1094,13 +1120,14 @@ def _extract_bytes(result):
 async def _request_image(prompt, negative=None, chain=None, min_sharp=None):
     headers = {"Authorization": f"Bearer {VENICE_API_KEY}", "Content-Type": "application/json"}
     prompt = build_prompt(prompt)
-    floor = MIN_SHARPNESS if min_sharp is None else min_sharp
     if not chain:
         chain = [IMAGE_MODEL] + [m for m in IMAGE_FALLBACKS if m != IMAGE_MODEL]
     # get_spec blocks. Do it off the loop, once per model, before the attempt loop.
     for model in chain:
         await asyncio.to_thread(get_spec, model)
     for model in chain:
+        # Per-model floor: an SDXL finetune is judged against its own scale, not the global.
+        floor = min_sharp if min_sharp is not None else MODEL_MIN_SHARPNESS.get(model, MIN_SHARPNESS)
         data = _payload(prompt, model, negative)
         for attempt in range(3):
             logger.info(f"Image payload [{model}]: {json.dumps({k: v for k, v in data.items() if k not in ('prompt', 'negative_prompt')})}")
@@ -1386,7 +1413,7 @@ async def payload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"TASK {IMAGE_MODEL}\n{task_payload}\n\n"
         f"REWARD {reward_model}\n{reward_payload}\n\n"
         f"chains: task {[IMAGE_MODEL] + IMAGE_FALLBACKS} | reward {reward_chain()}\n"
-        f"min sharpness: {MIN_SHARPNESS}\n\n"
+        f"floors: global {MIN_SHARPNESS} | overrides {MODEL_MIN_SHARPNESS}\n\n"
         f"task spec: {json.dumps(MODEL_SPECS.get(IMAGE_MODEL, {})) or 'EMPTY'}\n"
         f"reward spec: {json.dumps(MODEL_SPECS.get(reward_model, {})) or 'EMPTY'}"
     )
@@ -1397,7 +1424,7 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user = session.query(UserState).filter_by(user_id=user_id).first()
         if user:
-            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_MODEL}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY} | aspect: {IMAGE_ASPECT} | res: {IMAGE_RESOLUTION} | sharpen: {IMAGE_SHARPEN} | max_side: {IMAGE_MAX_SIDE}\nsteps: {IMAGE_STEPS} | cfg: {IMAGE_CFG} (both pixel-mode models only) | min_sharp: {MIN_SHARPNESS} (variance-of-Laplacian)\n\n/payload for the exact JSON")
+            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_MODEL}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY} | aspect: {IMAGE_ASPECT} | res: {IMAGE_RESOLUTION} | sharpen: {IMAGE_SHARPEN} | max_side: {IMAGE_MAX_SIDE}\nsteps: {IMAGE_STEPS} | cfg: {IMAGE_CFG} (pixel-mode models only) | floors: global {MIN_SHARPNESS}, overrides {MODEL_MIN_SHARPNESS}\n\n/payload for the exact JSON")
         else:
             await update.message.reply_text("No user record found")
     finally:
@@ -2237,7 +2264,7 @@ async def debugavatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Debug pair - task then reward. Task model {IMAGE_MODEL}, reward model {IMAGE_MODEL_REWARD or 'same'}, "
         f"variant {variant['label']}, cap {min(int(IMAGE_MAX_SIDE), 1280)}px, cfg {IMAGE_CFG}, steps {IMAGE_STEPS}, "
-        f"upscale {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY}, min sharpness {MIN_SHARPNESS} (Laplacian variance)."
+        f"upscale {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY}, floors: global {MIN_SHARPNESS} overrides {MODEL_MIN_SHARPNESS}."
     )
     dom = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
            f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
@@ -2304,7 +2331,8 @@ async def tryreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reward_negative(variant), [model], upscale=False, gate=False,
     )
 
-MODEL_CHOICES = ["grok-imagine-image-quality", "grok-imagine-image-2-0", "nano-banana-pro", "chroma", "z-image-turbo"]
+MODEL_CHOICES = ["grok-imagine-image", "grok-imagine-image-2-0", "nano-banana-pro",
+                 "flux-3-image", "lustify-v8", "chroma", "z-image-turbo"]
 
 async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton(m, callback_data=f"setmodel_{m}")] for m in MODEL_CHOICES]
@@ -2319,7 +2347,7 @@ async def setmodel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     IMAGE_MODEL = m
     await asyncio.to_thread(get_spec, m)
-    await query.edit_message_text(f"Task model: {m}. /debugavatar to test.\n\ngrok = sharpest, R-rated, hides genitals. nano-banana = sharp, rejects explicit. chroma = explicit but soft, last resort. z-image = fast.")
+    await query.edit_message_text(f"Task model: {m}. /debugavatar to test.\n\ngrok = sharpest, R-rated, hides genitals. nano-banana = sharp, rejects explicit. chroma = explicit but soft, last resort. lustify = explicit, soft. z-image = fast.")
 
 async def rewardmodel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton(m, callback_data=f"setreward_{m}")] for m in MODEL_CHOICES]
@@ -2467,7 +2495,8 @@ def main():
     logger.info("BOT STARTING")
     logger.info(f"Text: {TEXT_MODEL} | Vision: {VISION_MODEL} | Probes: {PROBE_MODELS}")
     logger.info(f"Task model: {IMAGE_MODEL} | Reward model: {IMAGE_MODEL_REWARD or 'same'} | fallbacks: {IMAGE_FALLBACKS}")
-    logger.info(f"Format: {IMAGE_FORMAT} | Upscale: {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY} | Aspect: {IMAGE_ASPECT} | Res: {IMAGE_RESOLUTION} | Sharpen: {IMAGE_SHARPEN} | MaxSide: {IMAGE_MAX_SIDE} | Steps: {IMAGE_STEPS} | CFG: {IMAGE_CFG} | MinSharp: {MIN_SHARPNESS}")
+    logger.info(f"Format: {IMAGE_FORMAT} | Upscale: {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY} | Aspect: {IMAGE_ASPECT} | Res: {IMAGE_RESOLUTION} | Sharpen: {IMAGE_SHARPEN} | MaxSide: {IMAGE_MAX_SIDE} | Steps: {IMAGE_STEPS} | CFG: {IMAGE_CFG}")
+    logger.info(f"Floors: global {MIN_SHARPNESS} | overrides {MODEL_MIN_SHARPNESS}")
     logger.info(f"Native caps: {NATIVE_CAPS}")
     logger.info(f"Venue presets: {len(VENUE_BASELINE)}")
     logger.info(f"Cloudinary configured: {bool(os.getenv('CLOUDINARY_CLOUD_NAME'))} / {bool(os.getenv('CLOUDINARY_API_KEY'))} / {bool(os.getenv('CLOUDINARY_API_SECRET'))}")
