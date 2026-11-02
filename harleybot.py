@@ -2611,4 +2611,24 @@ def main():
     application.add_handler(CallbackQueryHandler(complete_callback, pattern="^complete_"))
     application.add_handler(CallbackQueryHandler(blocked_callback, pattern="^blocked_"))
     application.add_handler(CallbackQueryHandler(giveup_callback, pattern="^giveup_"))
-    application.add_handler(CallbackQueryHandler(retry_callback, pattern="
+    application.add_handler(CallbackQueryHandler(retry_callback, pattern="^retry_"))
+    application.add_handler(CallbackQueryHandler(schedule_callback, pattern="^sched_"))
+    application.add_handler(CallbackQueryHandler(reset_callback, pattern="^reset_"))
+    application.add_handler(CallbackQueryHandler(mercy_callback, pattern="^mercy_"))
+    application.add_handler(CallbackQueryHandler(reward_surprise_callback, pattern="^reward_surprise$"))
+    application.add_handler(CallbackQueryHandler(retry_callback, pattern="^retry_"))
+        application.add_handler(CallbackQueryHandler(schedule_callback, pattern="^sched_"))
+        application.add_handler(CallbackQueryHandler(reset_callback, pattern="^reset_"))
+        application.add_handler(CallbackQueryHandler(mercy_callback, pattern="^mercy_"))
+        application.add_handler(CallbackQueryHandler(setmodel_callback, pattern="^setmodel_"))
+        application.add_handler(CallbackQueryHandler(setreward_callback, pattern="^setreward_"))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_input_dispatcher))
+        application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            bootstrap_retries=5,
+    )
+
+if __name__ == "__main__":
+    main()
