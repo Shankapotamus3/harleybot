@@ -58,8 +58,9 @@ IMAGE_SHARPEN = os.getenv("IMAGE_SHARPEN", "1").strip()
 IMAGE_STEPS = os.getenv("IMAGE_STEPS", "30").strip()
 IMAGE_CFG = os.getenv("IMAGE_CFG", "5").strip()
 IMAGE_MAX_SIDE = os.getenv("IMAGE_MAX_SIDE", "1280").strip()
-# Mean edge energy below this counts as a bad render and gets regenerated.
-MIN_SHARPNESS = 12.0
+# Edge energy below this counts as a bad render and gets regenerated. Low because a clean
+# studio portrait on a seamless backdrop has very few edges - 12 was rejecting good frames.
+MIN_SHARPNESS = 4.0
 MODEL_SPEC = {}
 MODEL_SPECS = {}
 
@@ -1005,9 +1006,10 @@ def _extract_bytes(result):
     except Exception:
         return None
 
-async def _request_image(prompt, negative=None, chain=None):
+async def _request_image(prompt, negative=None, chain=None, min_sharp=None):
     headers = {"Authorization": f"Bearer {VENICE_API_KEY}", "Content-Type": "application/json"}
     prompt = build_prompt(prompt)
+    floor = MIN_SHARPNESS if min_sharp is None else min_sharp
     if not chain:
         chain = [IMAGE_MODEL] + [m for m in IMAGE_FALLBACKS if m != IMAGE_MODEL]
     for model in chain:
@@ -1028,7 +1030,7 @@ async def _request_image(prompt, negative=None, chain=None):
                 await asyncio.to_thread(check_render, image_size(raw), data)
                 score = await asyncio.to_thread(sharpness_score, raw)
                 logger.info(f"Sharpness score [{model}]: {score:.1f}")
-                if score < MIN_SHARPNESS:
+                if floor and score < floor:
                     if attempt < 2:
                         logger.warning(f"[{model}] bad render (score {score:.1f}), regenerating")
                         continue
@@ -1128,9 +1130,9 @@ async def send_avatar_photo(context, chat_id, image_bytes, caption):
         logger.error(f"Send photo error: {e}")
     return False
 
-async def _debug_send(context, user_id, label, prompt, negative, chain=None, upscale=False):
+async def _debug_send(context, user_id, label, prompt, negative, chain=None, upscale=False, gate=True):
     """Raw and normalized as documents, then normalized again as a photo for like-for-like."""
-    raw = await _request_image(prompt, negative, chain)
+    raw = await _request_image(prompt, negative, chain, min_sharp=None if gate else 0)
     if not raw:
         await context.bot.send_message(chat_id=user_id, text=f"{label}: no image returned - check the log.")
         return
@@ -2177,7 +2179,7 @@ async def imgmodels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n".join(lines[i:i + 25]))
 
 async def tryreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fire one reward at a named model without touching the defaults."""
+    """Fire one reward at a named model without touching the defaults or judging it."""
     if not context.args:
         await update.message.reply_text("usage: /tryreward <model-id> [wish]")
         return
@@ -2192,7 +2194,7 @@ async def tryreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Trying {model}...")
     await _debug_send(
         context, update.effective_user.id, "TRY", reward_prompt(variant, wish),
-        reward_negative(variant), [model], upscale=False,
+        reward_negative(variant), [model], upscale=False, gate=False,
     )
 
 MODEL_CHOICES = ["grok-imagine-image-quality", "grok-imagine-image-2-0", "nano-banana-pro", "chroma", "z-image-turbo"]
