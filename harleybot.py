@@ -43,13 +43,16 @@ CHANGES IN THIS REVISION
      confounded by random pose and gear.
  26. lustify floor raised to 100. The distribution is bimodal with a 15x empty gap
      between 23.6 and 344.5, so there is no calibration ambiguity.
- 27. NEGATIVE_PROMPT_NUDE cut from ~180 chars. 28. then partially restored - see below.
+ 27. NEGATIVE_PROMPT_NUDE was cut to ~65 chars, then restored. Cutting it raised the
+     floor and destroyed the ceiling (best score fell 727 -> 55), so the garment list
+     is load-bearing for structure, not just for nudity.
  28. Nudity moved into the POSITIVE prompt. The bare word "nude" followed by a harness
-     and boots reads as "dressed with accessories", and the shortened negative had
-     removed the only thing keeping clothes off. The clause now precedes the gear and
-     the gear is framed as worn "over bare skin". Groin negation terms restored.
- 29. /tryn takes a task|reward mode, reports the delivered score as well as the raw
-     one, and runs a one-word nude check so both axes are scored.
+     and boots reads as "dressed with accessories". The clause now precedes the gear and
+     the gear is framed as worn "over bare skin". Kept alongside the restored negative.
+ 29. /tryn takes a task|reward mode, reports the delivered score as well as the raw one,
+     and runs a one-word nude check so both axes are scored.
+ 30. nude_check max_tokens raised 10 -> 24 and now logs the raw reply or HTTP status on
+     a miss. At 10 the reply was truncating before the keyword and every verdict was "?".
 
 IMAGE_RESOLUTION stays 2K. check_render fails undersized renders, so a model that
 answers 2K with ~1K gets retried instead of being sharpened into mush. If UNDERSIZED 2K
@@ -116,6 +119,8 @@ MIN_SHARPNESS = 150.0
 # they never survive an attempt.
 # lustify's distribution is bimodal (14.6/16.9/23.6 vs 344.5/727.6) with a 15x empty
 # gap, so 100 sits in dead space between the two populations.
+# If you ever shorten NEGATIVE_PROMPT_NUDE again, the ceiling falls to ~55 and this
+# has to come down to about 30, at which point there is no sharp mode left.
 MODEL_MIN_SHARPNESS = {"lustify-v8": 100.0, "lustify-v7": 10.0, "lustify-sdxl": 10.0,
                        "wai-Illustrious": 10.0, "venice-sd35": 10.0}
 MODEL_SPECS = {}
@@ -156,9 +161,13 @@ SHARP_TAIL = "sharp focus, natural skin texture, directional studio light, 85mm"
 # uses NEGATIVE_PROMPT_NUDE, the task path NEGATIVE_PROMPT_SEXY. Left for reference.
 NEGATIVE_PROMPT = "blurry, soft focus, bokeh, plastic skin, extra fingers, fused fingers"
 NEGATIVE_PROMPT_SEXY = "stiff catalogue pose, stock photo, mannequin, plastic skin, extra fingers, fused fingers"
-# Groin terms are back - they are the entire nudity enforcement. "flat lighting" stays
-# for the collapse. "clothing" alone is still too broad, it strips the harness too.
-NEGATIVE_PROMPT_NUDE = "bra, panties, briefs, skirt, clothing over the groin, censored, mosaic, extra fingers, flat lighting"
+# The long garment list is load-bearing twice over: it enforces nudity AND it feeds the
+# model concrete vocabulary to build structure against. Cutting it to four terms raised
+# the floor from ~15 to ~22 but dropped the ceiling from 727 to 55. Do not shorten it
+# without moving MODEL_MIN_SHARPNESS["lustify-v8"] down with it.
+NEGATIVE_PROMPT_NUDE = ("briefs, boxers, panties, knickers, trousers, jeans, skirt, towel, sheet, sarong, "
+                        "loincloth, drapery, fabric over the groin, clothing over the groin, censored, mosaic, "
+                        "extra fingers, flat lighting")
 # "subtle rim light" was a softness cue and a seamless backdrop gives the edge detector
 # nothing to work with. Hard key, crisp shadow edges.
 STUDIO = "against a seamless charcoal studio backdrop, hard key light from camera left, crisp shadow edges"
@@ -704,9 +713,8 @@ def reward_prompt(variant, wish=None):
     """Nudity is asserted positively and early.
 
     The bare word "nude" followed by a list of garments reads as "dressed with
-    accessories" - which is exactly what the model did once the negative was shortened.
-    The clause now sits before the gear and the gear is framed as worn over bare skin.
-    SHARP_TAIL is added by build_prompt, not here.
+    accessories". The clause now sits before the gear and the gear is framed as worn
+    over bare skin. SHARP_TAIL is added by build_prompt, not here.
     """
     wish_text = f", {wish[:120]}" if wish else ""
     clause = variant.get("clause") or "genitals clearly visible"
@@ -771,12 +779,16 @@ async def generate_ai_response(prompt, temperature=0.9):
         return None
 
 async def nude_check(image_bytes):
-    """One-word verdict on whether the groin is actually bare. Test batches only."""
+    """One-word verdict on whether the groin is actually bare. Test batches only.
+
+    max_tokens is 24, not 10 - at 10 the reply truncated before the keyword and every
+    verdict came back "?". Misses log the raw reply so a silent failure is visible.
+    """
     try:
         b64 = base64.b64encode(image_bytes).decode()
         data = {"model": VISION_MODEL, "messages": [{"role": "user", "content": [
-            {"type": "text", "text": "Is the person's groin area completely bare, with no clothing over it? Answer one word: BARE or COVERED."},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}], "max_tokens": 10}
+            {"type": "text", "text": "Answer with one word only: BARE if the person's groin is completely uncovered, COVERED if any clothing is over it."},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}], "max_tokens": 24}
         r = await asyncio.to_thread(
             requests.post, f"{VENICE_API_URL}/chat/completions",
             headers={"Authorization": f"Bearer {VENICE_API_KEY}", "Content-Type": "application/json"},
@@ -787,6 +799,9 @@ async def nude_check(image_bytes):
                 return "BARE"
             if "COVERED" in t:
                 return "COVERED"
+            logger.warning(f"Nude check unparsed: {t[:60]!r}")
+        else:
+            logger.warning(f"Nude check HTTP {r.status_code}: {r.text[:120]}")
     except Exception as e:
         logger.warning(f"Nude check failed: {e}")
     return "?"
@@ -1802,7 +1817,7 @@ async def probe_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session.close()
 
 async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton(f"{i}️⃣ {RISK_LEVELS[i]['name']}", callback_data=f"risk_{i}") for i in range(1, 6)]]
+    keyboard = [[InlineKeyboardButton(f"{i}️⃣ {RISK_LEVELS[i]['name']}", callback_data=f"risk_{i}")] for i in range(1, 6)]
     await update.message.reply_text("Select risk:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def risk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
