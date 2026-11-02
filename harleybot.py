@@ -14,35 +14,42 @@ CHANGES IN THIS REVISION
   4. reward_prompt: framing contradictions removed. One framing, cropped at mid-thigh.
   5. SHARP_TAIL no longer duplicated - build_prompt is the single injection point.
   6. STUDIO: hard key light instead of "subtle rim light" on a featureless backdrop.
-  7. NEGATIVE_PROMPT_NUDE trimmed, "cropped at the hips" dropped (it fought the prompt).
-  8. normalize_for_telegram: unsharp 140%->80%, threshold 5, JPEG q94.
-  9. steps/cfg now sent in ratio mode when the live spec declares them.
- 10. Timeout jobs are cancelled before re-arming; auto_clear_task guards on expires_at.
- 11. handle_blocker_input no longer leaves the user trapped after 3 reworks.
- 12. Scheduler skips users who never finished setup; per-user rollback on error.
- 13. get_spec only caches on success; specs prefetched off the event loop.
- 14. naive/aware datetime helpers so SQLite does not raise.
- 15. handle_photo commits before the user lookup.
- 16. trans/nonbinary get a real outfit list instead of silently falling back to male.
- 17. Global error handler.
- 18. IMAGE_MODEL default fixed: grok-imagine-image-quality does not exist in the live
+  7. normalize_for_telegram: unsharp 140%->80%, threshold 5, JPEG q94.
+  8. steps/cfg now sent in ratio mode when the live spec declares them.
+  9. Timeout jobs are cancelled before re-arming; auto_clear_task guards on expires_at.
+ 10. handle_blocker_input no longer leaves the user trapped after 3 reworks.
+ 11. Scheduler skips users who never finished setup; per-user rollback on error.
+ 12. get_spec only caches on success; specs prefetched off the event loop.
+ 13. naive/aware datetime helpers so SQLite does not raise.
+ 14. handle_photo commits before the user lookup.
+ 15. trans/nonbinary get a real outfit list instead of silently falling back to male.
+ 16. Global error handler.
+ 17. IMAGE_MODEL default fixed: grok-imagine-image-quality does not exist in the live
      catalogue. grok-imagine-image does. MODEL_CHOICES updated to real ids only.
- 19. The /models response carries NO constraints.maxWidth or maxHeight for any model,
+ 18. The /models response carries NO constraints.maxWidth or maxHeight for any model,
      so the pixel-mode box is always a guess. NATIVE_CAPS and KNOWN_MODELS pin it.
- 20. Per-model sharpness floor (MODEL_MIN_SHARPNESS).
- 21. _payload falls back to the model's own maximum box instead of the hardcoded
+ 19. Per-model sharpness floor (MODEL_MIN_SHARPNESS).
+ 20. _payload falls back to the model's own maximum box instead of the hardcoded
      960x1280 env default, which every pixel model was ignoring.
- 22. lustify-v8 caps corrected to 960x1280. The API rejects anything above 1280 per
+ 21. lustify-v8 caps corrected to 960x1280. The API rejects anything above 1280 per
      side, so 1440x1920 was always a wasted 400 first attempt.
- 23. OUTPUT_SCALE added. lustify renders at 1.5x the box it is given, so check_render
+ 22. OUTPUT_SCALE added. lustify renders at 1.5x the box it is given, so check_render
      compares against the expected output rather than the raw request.
- 24. _prune_payload clamps width/height proportionally. Independent clamps squared a
+ 23. _prune_payload clamps width/height proportionally. Independent clamps squared a
      3:4 request off into 1280x1280 and the model returned a square.
- 25. REWARD_POSES rebuilt. Every entry was floor-based and half were heavy
+ 24. REWARD_POSES rebuilt. Every entry was floor-based and half were heavy
      foreshortening, which a soft SDXL model renders as mush on a mid-thigh crop.
-     Vertical torsos and a standing option instead.
- 26. /tryn added - N renders from ONE prompt at one model, sent as documents with the
-     score attached, so model comparisons are not confounded by random pose and gear.
+ 25. /tryn added - N renders from ONE prompt at one model, so model comparisons are not
+     confounded by random pose and gear.
+ 26. lustify floor raised to 100. The distribution is bimodal with a 15x empty gap
+     between 23.6 and 344.5, so there is no calibration ambiguity.
+ 27. NEGATIVE_PROMPT_NUDE cut from ~180 chars. 28. then partially restored - see below.
+ 28. Nudity moved into the POSITIVE prompt. The bare word "nude" followed by a harness
+     and boots reads as "dressed with accessories", and the shortened negative had
+     removed the only thing keeping clothes off. The clause now precedes the gear and
+     the gear is framed as worn "over bare skin". Groin negation terms restored.
+ 29. /tryn takes a task|reward mode, reports the delivered score as well as the raw
+     one, and runs a one-word nude check so both axes are scored.
 
 IMAGE_RESOLUTION stays 2K. check_render fails undersized renders, so a model that
 answers 2K with ~1K gets retried instead of being sharpened into mush. If UNDERSIZED 2K
@@ -107,7 +114,9 @@ MIN_SHARPNESS = 150.0
 # Per-model override. SD/SDXL finetunes are soft by nature and score an order of
 # magnitude below a sharp model; judging them against the global floor just means
 # they never survive an attempt.
-MODEL_MIN_SHARPNESS = {"lustify-v8": 10.0, "lustify-v7": 10.0, "lustify-sdxl": 10.0,
+# lustify's distribution is bimodal (14.6/16.9/23.6 vs 344.5/727.6) with a 15x empty
+# gap, so 100 sits in dead space between the two populations.
+MODEL_MIN_SHARPNESS = {"lustify-v8": 100.0, "lustify-v7": 10.0, "lustify-sdxl": 10.0,
                        "wai-Illustrious": 10.0, "venice-sd35": 10.0}
 MODEL_SPECS = {}
 
@@ -143,10 +152,13 @@ NATIVE_CAPS = {"chroma": (960, 1280), "lustify-v8": (960, 1280)}
 OUTPUT_SCALE = {"lustify-v8": 1.5}
 
 SHARP_TAIL = "sharp focus, natural skin texture, directional studio light, 85mm"
+# NOTE: NEGATIVE_PROMPT is currently unused. Neither path includes it - the reward path
+# uses NEGATIVE_PROMPT_NUDE, the task path NEGATIVE_PROMPT_SEXY. Left for reference.
 NEGATIVE_PROMPT = "blurry, soft focus, bokeh, plastic skin, extra fingers, fused fingers"
 NEGATIVE_PROMPT_SEXY = "stiff catalogue pose, stock photo, mannequin, plastic skin, extra fingers, fused fingers"
-# No "cropped at the hips" - it used to fight the framing instruction and the model hedged.
-NEGATIVE_PROMPT_NUDE = "briefs, boxers, panties, knickers, trousers, jeans, skirt, towel, sheet, sarong, loincloth, drapery, fabric over the groin, clothing over the groin, censored, mosaic"
+# Groin terms are back - they are the entire nudity enforcement. "flat lighting" stays
+# for the collapse. "clothing" alone is still too broad, it strips the harness too.
+NEGATIVE_PROMPT_NUDE = "bra, panties, briefs, skirt, clothing over the groin, censored, mosaic, extra fingers, flat lighting"
 # "subtle rim light" was a softness cue and a seamless backdrop gives the edge detector
 # nothing to work with. Hard key, crisp shadow edges.
 STUDIO = "against a seamless charcoal studio backdrop, hard key light from camera left, crisp shadow edges"
@@ -689,16 +701,30 @@ def reward_chain():
     return None
 
 def reward_prompt(variant, wish=None):
-    """One framing only. 'face filling the upper third' used to fight 'hips up' and the
-    model hedged, which is what a soft subject looks like. SHARP_TAIL is added by
-    build_prompt, not here."""
+    """Nudity is asserted positively and early.
+
+    The bare word "nude" followed by a list of garments reads as "dressed with
+    accessories" - which is exactly what the model did once the negative was shortened.
+    The clause now sits before the gear and the gear is framed as worn over bare skin.
+    SHARP_TAIL is added by build_prompt, not here.
+    """
     wish_text = f", {wish[:120]}" if wish else ""
     clause = variant.get("clause") or "genitals clearly visible"
-    return (f"Raw editorial photograph of {HARLEY_BASE}, {variant.get('body', '')}, {NUDE} {random.choice(REWARD_GEAR)}, "
-            f"{clause}, {random.choice(REWARD_POSES)}{wish_text}, cropped at mid-thigh, {STUDIO}")
+    return (f"Raw editorial photograph of {HARLEY_BASE}, {variant.get('body', '')}, {NUDE}, "
+            f"{clause}, {random.choice(REWARD_POSES)}{wish_text}, "
+            f"wearing only {random.choice(REWARD_GEAR)} over bare skin, cropped at mid-thigh, {STUDIO}")
 
 def reward_negative(variant):
     return NEGATIVE_PROMPT_NUDE + (variant.get("nude_negative") or "")
+
+def task_prompt(variant):
+    """Clothed task path. Kept separate from reward_prompt so /tryn can test either."""
+    return (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
+            f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
+            f"framed from mid-thigh up, {STUDIO}")
+
+def task_negative(variant):
+    return NEGATIVE_PROMPT_SEXY + (variant.get("clothed_negative") or "")
 
 def task_keyboard(task_id, title):
     return InlineKeyboardMarkup([
@@ -743,6 +769,27 @@ async def generate_ai_response(prompt, temperature=0.9):
     except Exception as e:
         logger.error(f"AI error: {e}")
         return None
+
+async def nude_check(image_bytes):
+    """One-word verdict on whether the groin is actually bare. Test batches only."""
+    try:
+        b64 = base64.b64encode(image_bytes).decode()
+        data = {"model": VISION_MODEL, "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Is the person's groin area completely bare, with no clothing over it? Answer one word: BARE or COVERED."},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}], "max_tokens": 10}
+        r = await asyncio.to_thread(
+            requests.post, f"{VENICE_API_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {VENICE_API_KEY}", "Content-Type": "application/json"},
+            json=data, timeout=25)
+        if r.status_code == 200:
+            t = r.json()['choices'][0]['message']['content'].upper()
+            if "BARE" in t:
+                return "BARE"
+            if "COVERED" in t:
+                return "COVERED"
+    except Exception as e:
+        logger.warning(f"Nude check failed: {e}")
+    return "?"
 
 def _parse_probe_lines(content):
     out, seen = [], set()
@@ -1240,10 +1287,7 @@ async def generate_avatar_pose(user, pose_type="dominant"):
         variant = harley_variant(user)
         if pose_type == "reward":
             return await _build_and_send(user, reward_prompt(variant), user.user_id, reward_negative(variant), reward_chain(), upscale=True)
-        prompt = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
-                  f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
-                  f"framed from mid-thigh up, {STUDIO}")
-        return await _build_and_send(user, prompt, user.user_id, NEGATIVE_PROMPT_SEXY + (variant.get("clothed_negative") or ""), upscale=False)
+        return await _build_and_send(user, task_prompt(variant), user.user_id, task_negative(variant), upscale=False)
     except Exception as e:
         logger.error(f"Avatar error: {e}")
         import traceback
@@ -1758,7 +1802,7 @@ async def probe_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session.close()
 
 async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton(f"{i}️⃣ {RISK_LEVELS[i]['name']}", callback_data=f"risk_{i}")] for i in range(1, 6)]
+    keyboard = [[InlineKeyboardButton(f"{i}️⃣ {RISK_LEVELS[i]['name']}", callback_data=f"risk_{i}") for i in range(1, 6)]]
     await update.message.reply_text("Select risk:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def risk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2292,10 +2336,7 @@ async def debugavatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"upscale {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY}, floors: global {MIN_SHARPNESS} overrides {MODEL_MIN_SHARPNESS}, "
         f"output scale {OUTPUT_SCALE}."
     )
-    dom = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
-           f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
-           f"framed from mid-thigh up, {STUDIO}")
-    await _debug_send(context, user_id, "TASK", dom, NEGATIVE_PROMPT_SEXY + (variant.get("clothed_negative") or ""), upscale=False)
+    await _debug_send(context, user_id, "TASK", task_prompt(variant), task_negative(variant), upscale=False)
     await asyncio.sleep(2)
     await _debug_send(context, user_id, "REWARD", reward_prompt(variant), reward_negative(variant), reward_chain(), upscale=True)
 
@@ -2358,30 +2399,42 @@ async def tryreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def tryn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fire N renders at one model from ONE prompt.
+    """Fire N renders at one model from ONE prompt, scored on both axes.
 
     /tryreward rebuilds the prompt each call, so comparing four of them compares four
-    different poses and gear. This holds the prompt constant and attaches the score,
-    which is the only way to read model quality out of a run.
+    different poses and gear. This holds the prompt constant and reports sharpness
+    (raw and delivered) plus a nude verdict, which is the only way to read a model out
+    of a run. Mode is task|reward, default reward.
     """
-    if len(context.args) < 2:
-        await update.message.reply_text("usage: /tryn <model-id> <count 1-6> [wish]")
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("usage: /tryn <model-id> <count 1-6> [task|reward] [wish]")
         return
-    model = context.args[0]
+    model = args[0]
     try:
-        n = max(1, min(int(context.args[1]), 6))
+        n = max(1, min(int(args[1]), 6))
     except ValueError:
         n = 3
-    wish = " ".join(context.args[2:]).strip()[:120] or None
+    mode = "reward"
+    rest = args[2:]
+    if rest and rest[0].lower() in ("task", "reward"):
+        mode = rest[0].lower()
+        rest = rest[1:]
+    wish = " ".join(rest).strip()[:120] or None
     session = get_session()
     try:
         user = session.query(UserState).filter_by(user_id=update.effective_user.id).first()
         variant = harley_variant(user) if user else HARLEY_VARIANTS["vagina"]
     finally:
         session.close()
-    prompt = reward_prompt(variant, wish)
-    negative = reward_negative(variant)
-    await update.message.reply_text(f"{n} renders of one prompt on {model}. cfg {IMAGE_CFG}, steps {IMAGE_STEPS}.")
+    if mode == "task":
+        prompt = task_prompt(variant)
+        negative = task_negative(variant)
+    else:
+        prompt = reward_prompt(variant, wish)
+        negative = reward_negative(variant)
+    await update.message.reply_text(f"{n} renders of one {mode} prompt on {model}. cfg {IMAGE_CFG}, steps {IMAGE_STEPS}.")
+    cap = min(int(IMAGE_MAX_SIDE), 1280)
     for i in range(n):
         raw = await _request_image(prompt, negative, [model], min_sharp=0)
         if not raw:
@@ -2389,11 +2442,14 @@ async def tryn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
         w, h = await asyncio.to_thread(image_size, raw)
         score = await asyncio.to_thread(sharpness_score, raw)
+        norm = await asyncio.to_thread(normalize_for_telegram, raw, cap, IMAGE_SHARPEN == "1")
+        dscore = await asyncio.to_thread(sharpness_score, norm) if norm else 0.0
+        verdict = await nude_check(norm) if norm else "?"
         try:
             await context.bot.send_document(
                 chat_id=update.effective_user.id, document=BytesIO(raw),
                 filename=f"tryn_{i + 1}.{sniff_ext(raw)}",
-                caption=f"{model} {i + 1}/{n} | {w}x{h} | sharpness {score:.1f}"
+                caption=f"{model} {i + 1}/{n} {mode} | {w}x{h} | raw {score:.1f} | delivered {dscore:.1f} | {verdict}"
             )
         except Exception as e:
             await update.message.reply_text(f"{i + 1}/{n}: send failed - {e}")
