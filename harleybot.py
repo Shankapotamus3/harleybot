@@ -10,8 +10,7 @@ CHANGES IN THIS REVISION
      and the location keyboard. Existing "kids" rows migrate to "alone" at boot.
   2. Sharpness gate rewritten to variance-of-Laplacian. The old FIND_EDGES stddev
      scored the backdrop gradient and passed blurred frames.
-  3. check_render FAILS undersized renders. Oversized ones are accepted and logged -
-     we downscale anyway, so a bigger image than asked for costs nothing.
+  3. check_render FAILS undersized renders. Oversized ones are accepted and logged.
   4. reward_prompt: framing contradictions removed. One framing, cropped at mid-thigh.
   5. SHARP_TAIL no longer duplicated - build_prompt is the single injection point.
   6. STUDIO: hard key light instead of "subtle rim light" on a featureless backdrop.
@@ -29,14 +28,19 @@ CHANGES IN THIS REVISION
  18. IMAGE_MODEL default fixed: grok-imagine-image-quality does not exist in the live
      catalogue. grok-imagine-image does. MODEL_CHOICES updated to real ids only.
  19. The /models response carries NO constraints.maxWidth or maxHeight for any model,
-     so the pixel-mode box is always a guess. NATIVE_CAPS and KNOWN_MODELS now pin it
-     explicitly for the pixel models actually in use.
- 20. Per-model sharpness floor (MODEL_MIN_SHARPNESS) so one soft SDXL finetune does not
-     have to be judged against a global floor set for a sharp model.
+     so the pixel-mode box is always a guess. NATIVE_CAPS and KNOWN_MODELS pin it.
+ 20. Per-model sharpness floor (MODEL_MIN_SHARPNESS).
  21. _payload falls back to the model's own maximum box instead of the hardcoded
      960x1280 env default, which every pixel model was ignoring.
+ 22. lustify-v8 caps corrected to 960x1280. The API rejects anything above 1280 per
+     side ("Number must be less than or equal to 1280"), so 1440x1920 was always a
+     wasted 400 first attempt.
+ 23. OUTPUT_SCALE added. lustify renders at 1.5x the box it is given, so check_render
+     now compares against the expected output rather than the raw request.
+ 24. _prune_payload clamps width/height proportionally. Independent clamps squared a
+     3:4 request off into 1280x1280 and the model returned a square.
 
-IMAGE_RESOLUTION stays 2K. check_render now fails undersized renders, so a model that
+IMAGE_RESOLUTION stays 2K. check_render fails undersized renders, so a model that
 answers 2K with ~1K gets retried instead of being sharpened into mush. If UNDERSIZED 2K
 RENDER is constant in the log, set IMAGE_RESOLUTION=1K and let the local downscale work.
 """
@@ -77,8 +81,7 @@ VENICE_UPSCALE_URL = "https://api.venice.ai/api/v1/image/upscale"
 TEXT_MODEL = os.getenv("TEXT_MODEL", "venice-uncensored-role-play").strip()
 VISION_MODEL = os.getenv("VISION_MODEL", "claude-opus-4-8-fast").strip()
 PROBE_MODELS = [m.strip() for m in os.getenv("PROBE_MODELS", "openai-gpt-oss-120b,gemma-4-31b-it,mistral-small-3-2-24b-instruct").split(",") if m.strip()]
-# Tasks: sharp, R-rated. Rewards: explicit. Sharp models first, chroma last - it never blurs
-# less than 1440x1920 and it is what every policy rejection was landing on.
+# Tasks: sharp, R-rated. Rewards: explicit. Sharp models first, chroma last.
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "grok-imagine-image").strip()
 IMAGE_MODEL_REWARD = "nano-banana-pro"
 IMAGE_FALLBACKS = ["nano-banana-pro", "chroma"]
@@ -124,12 +127,16 @@ KNOWN_MODELS = {
     },
     "chroma": {"mode": "pixels", "max_w": 1280, "max_h": 1280, "steps_max": 10},
     "z-image-turbo": {"mode": "pixels", "max_w": 1280, "max_h": 1280, "steps_max": 8},
-    "lustify-v8": {"mode": "pixels", "max_w": 1440, "max_h": 1920, "steps_max": 50},
+    "lustify-v8": {"mode": "pixels", "max_w": 960, "max_h": 1280, "steps_max": 50},
 }
 
-# Models that render at a fixed native size and ignore the box we send.
-# They get their real dimensions pinned so check_render has something to match.
-NATIVE_CAPS = {"chroma": (960, 1280), "lustify-v8": (1440, 1920)}
+# Models that render at a fixed size and ignore the box we send. They get their real
+# input dimensions pinned so the request does not bounce off the 1280 ceiling.
+NATIVE_CAPS = {"chroma": (960, 1280), "lustify-v8": (960, 1280)}
+
+# Models that return more pixels than the box they were given. check_render compares
+# against the expected output rather than the request, so this is not read as a defect.
+OUTPUT_SCALE = {"lustify-v8": 1.5}
 
 SHARP_TAIL = "sharp focus, natural skin texture, directional studio light, 85mm"
 NEGATIVE_PROMPT = "blurry, soft focus, bokeh, plastic skin, extra fingers, fused fingers"
@@ -379,17 +386,19 @@ def check_render(size, data):
     """True if the render is usable.
 
     Undersized fails - the model returned less than it promised. Oversized passes:
-    we downscale to IMAGE_MAX_SIDE regardless, so a bigger frame than asked for is
-    free pixels rather than a defect. It is still logged.
+    we downscale to IMAGE_MAX_SIDE regardless. The expected size is the requested box
+    times the model's known output multiplier, so a 1.5x render is not a defect.
     """
     w, h = size
     req_w, req_h = data.get("width"), data.get("height")
     if req_w and req_h:
-        if w < req_w * 0.8 or h < req_h * 0.8:
-            logger.warning(f"UNDERSIZED RENDER: asked {req_w}x{req_h}, got {w}x{h}")
+        scale = OUTPUT_SCALE.get(data.get("model"), 1.0)
+        exp_w, exp_h = req_w * scale, req_h * scale
+        if w < exp_w * 0.8 or h < exp_h * 0.8:
+            logger.warning(f"UNDERSIZED RENDER: expected ~{exp_w:.0f}x{exp_h:.0f}, got {w}x{h}")
             return False
-        if w > req_w * 1.2 or h > req_h * 1.2:
-            logger.info(f"OVERSIZED RENDER (accepted): asked {req_w}x{req_h}, got {w}x{h}")
+        if w > exp_w * 1.2 or h > exp_h * 1.2:
+            logger.info(f"OVERSIZED RENDER (accepted): expected ~{exp_w:.0f}x{exp_h:.0f}, got {w}x{h}")
     elif data.get("resolution") == "2K" and max(w, h) < 1500:
         logger.warning(f"UNDERSIZED 2K RENDER: {w}x{h} - model is not honouring 2K")
         return False
@@ -1009,10 +1018,10 @@ def build_prompt(raw_prompt):
     return f"{cleaned}, {SHARP_TAIL}"
 
 def _apply_native_caps(data, model):
-    """Models that render at a fixed native size get their real box pinned.
+    """Models that render at a fixed size get their real input box pinned.
 
-    They ignore whatever we send, so pinning it is the only way check_render has a
-    meaningful target.
+    lustify-v8 rejects anything over 1280 per side, so pinning it avoids a guaranteed
+    400 on the first attempt.
     """
     native = NATIVE_CAPS.get(model)
     if not native:
@@ -1087,11 +1096,21 @@ def _prune_payload(data, body):
             bound = issue.get('maximum') if issue.get('code') == 'too_big' else issue.get('minimum')
             if k in data and bound is not None:
                 try:
-                    data[k] = type(data[k])(bound)
+                    bound = type(data[k])(bound)
+                except Exception:
+                    bound = None
+                if bound is not None:
+                    if k in ('width', 'height') and issue.get('code') == 'too_big':
+                        # Scale both sides by the tightest factor, otherwise an independent
+                        # clamp squares a 3:4 request off into 1280x1280.
+                        other = 'height' if k == 'width' else 'width'
+                        cur = data.get(k) or bound
+                        factor = bound / cur if cur else 1.0
+                        if other in data and factor < 1.0:
+                            data[other] = max(64, int(data[other] * factor) // 8 * 8)
+                    data[k] = bound
                     changed = True
                     continue
-                except Exception:
-                    pass
         for k in keys:
             k = str(k).split('.')[-1]
             if k in data and k != "prompt":
@@ -1424,7 +1443,7 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user = session.query(UserState).filter_by(user_id=user_id).first()
         if user:
-            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_MODEL}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY} | aspect: {IMAGE_ASPECT} | res: {IMAGE_RESOLUTION} | sharpen: {IMAGE_SHARPEN} | max_side: {IMAGE_MAX_SIDE}\nsteps: {IMAGE_STEPS} | cfg: {IMAGE_CFG} (pixel-mode models only) | floors: global {MIN_SHARPNESS}, overrides {MODEL_MIN_SHARPNESS}\n\n/payload for the exact JSON")
+            await update.message.reply_text(f"✅ Bot is working!\n\nflags: outfit={user.awaiting_custom_outfit}/{user.awaiting_outfit_detail}, loc={user.awaiting_custom_location}/{user.awaiting_location_detail}, interval={user.awaiting_interval}, reward={user.awaiting_reward_wish}\n\nlocation: {user.custom_location or 'Not set'}\nvenue key: {get_probe_key(user.custom_location or '')}\ndetail: {user.location_detail or 'none'}\nprobes: {len(probes_for(user))}\noutfit: {user.outfit_detail or 'none'}\nvariant: {user.harley_variant}\ntext: {TEXT_MODEL} | vision: {VISION_MODEL}\nmodel: {IMAGE_MODEL} -> {IMAGE_FALLBACKS} | reward: {IMAGE_MODEL_REWARD or 'same'}\nformat: {IMAGE_FORMAT} | upscale: {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY} | aspect: {IMAGE_ASPECT} | res: {IMAGE_RESOLUTION} | sharpen: {IMAGE_SHARPEN} | max_side: {IMAGE_MAX_SIDE}\nsteps: {IMAGE_STEPS} | cfg: {IMAGE_CFG} (pixel-mode models only) | floors: global {MIN_SHARPNESS}, overrides {MODEL_MIN_SHARPNESS}\noutput scale: {OUTPUT_SCALE}\n\n/payload for the exact JSON")
         else:
             await update.message.reply_text("No user record found")
     finally:
@@ -2264,7 +2283,8 @@ async def debugavatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Debug pair - task then reward. Task model {IMAGE_MODEL}, reward model {IMAGE_MODEL_REWARD or 'same'}, "
         f"variant {variant['label']}, cap {min(int(IMAGE_MAX_SIDE), 1280)}px, cfg {IMAGE_CFG}, steps {IMAGE_STEPS}, "
-        f"upscale {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY}, floors: global {MIN_SHARPNESS} overrides {MODEL_MIN_SHARPNESS}."
+        f"upscale {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY}, floors: global {MIN_SHARPNESS} overrides {MODEL_MIN_SHARPNESS}, "
+        f"output scale {OUTPUT_SCALE}."
     )
     dom = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
            f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
@@ -2350,7 +2370,7 @@ async def setmodel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(f"Task model: {m}. /debugavatar to test.\n\ngrok = sharpest, R-rated, hides genitals. nano-banana = sharp, rejects explicit. chroma = explicit but soft, last resort. lustify = explicit, soft. z-image = fast.")
 
 async def rewardmodel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton(m, callback_data=f"setreward_{m}")] for m in MODEL_CHOICES]
+    keyboard = [[InlineKeyboardButton(m, callback_data=f"setreward_{m}") for m in MODEL_CHOICES]]
     keyboard.append([InlineKeyboardButton("same as task", callback_data="setreward_same")])
     await update.message.reply_text(
         f"Reward model: {IMAGE_MODEL_REWARD or 'same'}\n\nPick one, then /testreward.",
@@ -2497,7 +2517,7 @@ def main():
     logger.info(f"Task model: {IMAGE_MODEL} | Reward model: {IMAGE_MODEL_REWARD or 'same'} | fallbacks: {IMAGE_FALLBACKS}")
     logger.info(f"Format: {IMAGE_FORMAT} | Upscale: {IMAGE_UPSCALE}/{IMAGE_UPSCALE_CREATIVITY} | Aspect: {IMAGE_ASPECT} | Res: {IMAGE_RESOLUTION} | Sharpen: {IMAGE_SHARPEN} | MaxSide: {IMAGE_MAX_SIDE} | Steps: {IMAGE_STEPS} | CFG: {IMAGE_CFG}")
     logger.info(f"Floors: global {MIN_SHARPNESS} | overrides {MODEL_MIN_SHARPNESS}")
-    logger.info(f"Native caps: {NATIVE_CAPS}")
+    logger.info(f"Native caps: {NATIVE_CAPS} | output scale: {OUTPUT_SCALE}")
     logger.info(f"Venue presets: {len(VENUE_BASELINE)}")
     logger.info(f"Cloudinary configured: {bool(os.getenv('CLOUDINARY_CLOUD_NAME'))} / {bool(os.getenv('CLOUDINARY_API_KEY'))} / {bool(os.getenv('CLOUDINARY_API_SECRET'))}")
     logger.info("=" * 60)
