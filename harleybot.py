@@ -33,12 +33,16 @@ CHANGES IN THIS REVISION
  21. _payload falls back to the model's own maximum box instead of the hardcoded
      960x1280 env default, which every pixel model was ignoring.
  22. lustify-v8 caps corrected to 960x1280. The API rejects anything above 1280 per
-     side ("Number must be less than or equal to 1280"), so 1440x1920 was always a
-     wasted 400 first attempt.
+     side, so 1440x1920 was always a wasted 400 first attempt.
  23. OUTPUT_SCALE added. lustify renders at 1.5x the box it is given, so check_render
-     now compares against the expected output rather than the raw request.
+     compares against the expected output rather than the raw request.
  24. _prune_payload clamps width/height proportionally. Independent clamps squared a
      3:4 request off into 1280x1280 and the model returned a square.
+ 25. REWARD_POSES rebuilt. Every entry was floor-based and half were heavy
+     foreshortening, which a soft SDXL model renders as mush on a mid-thigh crop.
+     Vertical torsos and a standing option instead.
+ 26. /tryn added - N renders from ONE prompt at one model, sent as documents with the
+     score attached, so model comparisons are not confounded by random pose and gear.
 
 IMAGE_RESOLUTION stays 2K. check_render fails undersized renders, so a model that
 answers 2K with ~1K gets retried instead of being sharpened into mush. If UNDERSIZED 2K
@@ -622,13 +626,15 @@ HARLEY_OUTFITS = [
     "leather harness and ripped denim shorts",
 ]
 
+# Vertical torsos and a standing option. The old list was all floor-based with two
+# heavy foreshortening poses, which a soft SDXL model renders as mush on a mid-thigh crop.
 REWARD_POSES = [
-    "kneeling, one knee forward, hips back",
-    "kneeling upright, hands behind head, chest forward",
-    "sitting back on her heels, arms overhead",
+    "kneeling upright, thighs vertical, hands behind head, chest forward",
+    "kneeling, one knee forward, torso upright, chin lifted",
     "kneeling, hand in hair, throat exposed",
-    "reclining on one elbow, top leg open, face turned to the lens",
-    "lying back on both elbows, knees up, chin tucked to the chest",
+    "standing, weight on one hip, hands behind back",
+    "half-turned away, looking back over her shoulder",
+    "sitting back on her heels, torso tall, arms overhead",
 ]
 REWARD_GEAR = [
     "a black leather chest harness",
@@ -2351,11 +2357,53 @@ async def tryreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reward_negative(variant), [model], upscale=False, gate=False,
     )
 
+async def tryn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fire N renders at one model from ONE prompt.
+
+    /tryreward rebuilds the prompt each call, so comparing four of them compares four
+    different poses and gear. This holds the prompt constant and attaches the score,
+    which is the only way to read model quality out of a run.
+    """
+    if len(context.args) < 2:
+        await update.message.reply_text("usage: /tryn <model-id> <count 1-6> [wish]")
+        return
+    model = context.args[0]
+    try:
+        n = max(1, min(int(context.args[1]), 6))
+    except ValueError:
+        n = 3
+    wish = " ".join(context.args[2:]).strip()[:120] or None
+    session = get_session()
+    try:
+        user = session.query(UserState).filter_by(user_id=update.effective_user.id).first()
+        variant = harley_variant(user) if user else HARLEY_VARIANTS["vagina"]
+    finally:
+        session.close()
+    prompt = reward_prompt(variant, wish)
+    negative = reward_negative(variant)
+    await update.message.reply_text(f"{n} renders of one prompt on {model}. cfg {IMAGE_CFG}, steps {IMAGE_STEPS}.")
+    for i in range(n):
+        raw = await _request_image(prompt, negative, [model], min_sharp=0)
+        if not raw:
+            await update.message.reply_text(f"{i + 1}/{n}: no image")
+            continue
+        w, h = await asyncio.to_thread(image_size, raw)
+        score = await asyncio.to_thread(sharpness_score, raw)
+        try:
+            await context.bot.send_document(
+                chat_id=update.effective_user.id, document=BytesIO(raw),
+                filename=f"tryn_{i + 1}.{sniff_ext(raw)}",
+                caption=f"{model} {i + 1}/{n} | {w}x{h} | sharpness {score:.1f}"
+            )
+        except Exception as e:
+            await update.message.reply_text(f"{i + 1}/{n}: send failed - {e}")
+        await asyncio.sleep(2)
+
 MODEL_CHOICES = ["grok-imagine-image", "grok-imagine-image-2-0", "nano-banana-pro",
                  "flux-3-image", "lustify-v8", "chroma", "z-image-turbo"]
 
 async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton(m, callback_data=f"setmodel_{m}")] for m in MODEL_CHOICES]
+    keyboard = [[InlineKeyboardButton(m, callback_data=f"setmodel_{m}") for m in MODEL_CHOICES]]
     await update.message.reply_text(f"Task model: {IMAGE_MODEL}\nReward model: {IMAGE_MODEL_REWARD or 'same'}\n\nPick one, then /debugavatar to test.", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def setmodel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2537,6 +2585,7 @@ def main():
     application.add_handler(CommandHandler("testreward", testreward_cmd))
     application.add_handler(CommandHandler("imgmodels", imgmodels_cmd))
     application.add_handler(CommandHandler("tryreward", tryreward_cmd))
+    application.add_handler(CommandHandler("tryn", tryn_cmd))
     application.add_handler(CommandHandler("model", model_cmd))
     application.add_handler(CommandHandler("rewardmodel", rewardmodel_cmd))
     application.add_handler(CommandHandler("gender", gender_cmd))
