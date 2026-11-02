@@ -5,15 +5,13 @@ Harley's voice comes from a local system prompt. No character_slug dependency.
 Fixed avatar with a penis/vagina toggle, real vision verification.
 Venue features: static presets by default, AI extension when the API cooperates.
 
-IMAGING CHANGED ONLY. Everything else is the original file.
-
 Changelog:
-- reward prompt reverted to the wording that produced 315
-- per-model regeneration restored (_request_image + check_render), batching gone
-- nudity retry pass with a stripped prompt when nothing reads BARE
-- blur vocabulary added to the nude negative
-- fallback reports the real verdict; UNSURE preferred over COVERED
-- user wish passed into the reward prompt
+- setreward_callback defined (was registered but missing)
+- reward_negative helper restored
+- _debug_send accepts upscale/gate; filename sanitised
+- lustify-v8 back to 1440x1920 / 50 steps; box defaults to the model maximum
+- duplicate /model handler removed; error_handler registered
+- probes_for guarded against bad JSON
 """
 
 import os
@@ -123,19 +121,15 @@ KNOWN_MODELS = {
         "ratios": ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "2:1", "1:2"],
         "res": ["1K", "2K"],
     },
-    "grok-imagine-image-quality": {
-        "mode": "ratio",
-        "ratios": ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "2:1", "1:2"],
-        "res": ["1K", "2K"],
-    },
     "nano-banana-pro": {
         "mode": "ratio",
         "ratios": ["1:1", "4:3", "3:4", "16:9", "9:16", "3:2", "2:3"],
         "res": ["1K", "2K"],
     },
     "chroma": {"mode": "pixels", "max_w": 1280, "max_h": 1280, "steps_max": 10},
-    "lustify-v8": {"mode": "pixels", "max_w": 1280, "max_h": 1280},
-    "z-image-turbo": {"mode": "pixels", "max_w": 1280, "max_h": 1280},
+    # lustify renders natively at 1440x1920 and hard-rejects anything taller.
+    "lustify-v8": {"mode": "pixels", "max_w": 1440, "max_h": 1920, "steps_max": 50},
+    "z-image-turbo": {"mode": "pixels", "max_w": 1280, "max_h": 1280, "steps_max": 8},
 }
 
 MODEL_EXPLICIT = {"lustify-v8", "chroma", "wai-illu"}
@@ -682,7 +676,11 @@ def variant_phrase(variant):
 
 
 def probes_for(user):
-    return json.loads(user.location_probes or '[]')
+    try:
+        data = json.loads(user.location_probes or '[]')
+        return data if isinstance(data, list) else []
+    except (ValueError, TypeError):
+        return []
 
 
 def venue_baseline(user, location):
@@ -710,6 +708,10 @@ def reward_prompt_hard(variant, wish=None):
     return (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}, fully nude, naked, "
             f"no clothing at all, {variant['clause']}{wish_text}, standing, framed from the hips up, "
             f"{STUDIO}, {SHARP_TAIL}")
+
+
+def reward_negative(variant):
+    return NEGATIVE_PROMPT_NUDE + (variant.get("nude_negative") or "")
 
 
 def task_keyboard(task_id, title):
@@ -858,7 +860,10 @@ def parse_verification(response):
 
 
 async def generate_task_text(user, session=None, depth=0):
-    outfit_items = json.loads(user.outfit_items or '[]')
+    try:
+        outfit_items = json.loads(user.outfit_items or '[]')
+    except (ValueError, TypeError):
+        outfit_items = []
     gender = user.gender or "nonbinary"
     max_risk = user.risk_level or 5
     location = user.custom_location or user.location or "Unknown"
@@ -894,7 +899,10 @@ async def generate_task_text(user, session=None, depth=0):
     if session:
         session.commit()
 
-    recent_settings = json.loads(user.recent_settings or '[]')
+    try:
+        recent_settings = json.loads(user.recent_settings or '[]')
+    except (ValueError, TypeError):
+        recent_settings = []
     recent_text = "\n".join(f"- {r}" for r in recent_settings[-8:]) if recent_settings else "none yet"
     blockers = []
     if session:
@@ -1034,8 +1042,10 @@ def _payload(prompt, model, negative=None):
         div = max(1, int(c.get('widthHeightDivisor') or 8))
         max_w = int(c.get('maxWidth') or known.get("max_w") or 1280)
         max_h = int(c.get('maxHeight') or known.get("max_h") or 1280)
-        w = min(int(os.getenv("IMAGE_WIDTH", "960")), max_w)
-        h = min(int(os.getenv("IMAGE_HEIGHT", "1280")), max_h)
+        # Default to the model's own ceiling rather than a shared 960 box; an
+        # under-sized request is what the model then upscales into mush.
+        w = min(int(os.getenv("IMAGE_WIDTH", str(max_w))), max_w)
+        h = min(int(os.getenv("IMAGE_HEIGHT", str(max_h))), max_h)
         data["width"] = max(div, (w // div) * div)
         data["height"] = max(div, (h // div) * div)
         if c.get('resolutions') or c.get('defaultResolution'):
@@ -1223,7 +1233,7 @@ async def _render_best(prompt, negative, chain=None, require_bare=False, retry_p
     if require_bare and retry_prompt:
         logger.info("nudity retry pass")
         for model in chain:
-            raw, score = await _request_image(retry_prompt, negative + NEGATIVE_HARD, [model])
+            raw, score = await _request_image(retry_prompt, (negative or "") + NEGATIVE_HARD, [model])
             if not raw:
                 continue
             if best_any is None or score > best_any[0]:
@@ -1309,9 +1319,8 @@ async def generate_avatar_pose(user, pose_type="dominant"):
     try:
         variant = harley_variant(user)
         if pose_type == "reward":
-            neg = NEGATIVE_PROMPT_NUDE + variant["nude_negative"]
             return await _build_and_send(
-                user, reward_prompt(variant), user.user_id, neg, reward_chain(),
+                user, reward_prompt(variant), user.user_id, reward_negative(variant), reward_chain(),
                 require_bare=True, retry_prompt=reward_prompt_hard(variant))
         prompt = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
                   f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
@@ -1328,9 +1337,8 @@ async def generate_avatar_pose(user, pose_type="dominant"):
 async def deliver_reward(context, user, wish=None, session=None):
     user_id = user.user_id
     variant = harley_variant(user)
-    neg = NEGATIVE_PROMPT_NUDE + variant["nude_negative"]
     image_bytes, score, verdict = await _build_and_send(
-        user, reward_prompt(variant, wish), user_id, neg, reward_chain(),
+        user, reward_prompt(variant, wish), user_id, reward_negative(variant), reward_chain(),
         require_bare=True, retry_prompt=reward_prompt_hard(variant, wish))
     if not image_bytes:
         await context.bot.send_message(chat_id=user_id, text="Couldn't get it out of the camera. Try /avatar.")
@@ -1362,19 +1370,26 @@ async def send_avatar_photo(context, chat_id, image_bytes, caption):
     return await send_render(context, chat_id, image_bytes, caption)
 
 
-async def _debug_send(context, user_id, label, prompt, negative, chain=None):
+async def _debug_send(context, user_id, label, prompt, negative, chain=None,
+                      upscale=False, gate=True):
+    """Batch harness. Every draw is delivered with its score; `gate` only annotates the
+    floor so a gated and an ungated run are comparable."""
+    floor_note = "gated" if gate else "floor off"
     batch = await _render_batch(prompt, negative, chain)
+    safe_label = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_") or "draw"
     sent = 0
     for score, raw, err in batch:
         if err:
             await context.bot.send_message(chat_id=user_id, text=f"{label}: {err[:120]}")
             continue
+        if upscale:
+            raw = await _upscale(raw)
         sent += 1
         try:
             await context.bot.send_document(
                 chat_id=user_id, document=BytesIO(raw),
-                filename=f"{label.lower()}_{score:.0f}.{sniff_ext(raw)}",
-                caption=f"{label} {score:.0f} | {len(raw)}b")
+                filename=f"{safe_label}_{score:.0f}.{sniff_ext(raw)}",
+                caption=f"{label} {score:.0f} | {len(raw)}b | {floor_note}")
         except Exception as e:
             logger.warning(f"Debug send failed: {e}")
     if not sent:
@@ -2401,10 +2416,10 @@ async def debugavatar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dom = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
            f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
            f"framed from mid-thigh up, {STUDIO}, {SHARP_TAIL}")
-    await _debug_send(context, user_id, "TASK", dom, NEGATIVE_PROMPT_SEXY + variant["clothed_negative"])
+    await _debug_send(context, user_id, "TASK", dom, NEGATIVE_PROMPT_SEXY + variant["clothed_negative"], gate=False)
     await asyncio.sleep(2)
     await _debug_send(context, user_id, "REWARD", reward_prompt(variant),
-                      NEGATIVE_PROMPT_NUDE + variant["nude_negative"], reward_chain())
+                      reward_negative(variant), reward_chain(), gate=False)
 
 
 async def testreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2417,12 +2432,12 @@ async def testreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         session.close()
     wish = " ".join(context.args).strip()[:120] if context.args else None
-    model = IMAGE_MODEL_REWARD
+    model = IMAGE_MODEL_REWARD or IMAGE_MODEL
     floor = MODEL_MIN_SHARPNESS.get(model, DEFAULT_MIN_SHARPNESS)
     await update.message.reply_text(f"Reward test on {model}, floor {floor:.0f}...")
     try:
         raw, score, verdict = await _render_best(
-            reward_prompt(variant, wish), NEGATIVE_PROMPT_NUDE + variant["nude_negative"],
+            reward_prompt(variant, wish), reward_negative(variant),
             reward_chain(), require_bare=True, retry_prompt=reward_prompt_hard(variant, wish))
         if not raw:
             await update.message.reply_text("No images came back at all - check the log.")
@@ -2432,6 +2447,69 @@ async def testreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("testreward failed")
         await update.message.reply_text(f"testreward crashed: {type(e).__name__}: {e}")
+
+
+async def imgmodels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Dump the live image catalogue with each model's caps, so a swap is a lookup."""
+    try:
+        r = await asyncio.to_thread(
+            requests.get, f"{VENICE_API_URL}/models?type=image",
+            headers={"Authorization": f"Bearer {VENICE_API_KEY}"}, timeout=30,
+        )
+        payload = r.json()
+    except Exception as e:
+        await update.message.reply_text(f"catalogue fetch failed - {e}")
+        return
+    rows = []
+    for m in payload.get("data", []):
+        spec = m.get("model_spec") or {}
+        rows.append(f"{m.get('id', '?')} | res {','.join(spec.get('resolutions') or []) or '-'} | "
+                    f"steps<={spec.get('steps', {}).get('max', '-')} | {','.join(spec.get('traits') or [])}")
+    await update.message.reply_text("\n".join(rows)[:3900] or "empty catalogue")
+
+
+async def tryreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """N ungated reward draws: /tryreward [count] [wish]"""
+    user_id = update.effective_user.id
+    args = list(context.args)
+    n = 5
+    if args and args[0].isdigit():
+        n = max(1, min(int(args.pop(0)), 8))
+    session = get_session()
+    try:
+        user = session.query(UserState).filter_by(user_id=user_id).first()
+        variant = harley_variant(user) if user else HARLEY_VARIANTS["vagina"]
+    finally:
+        session.close()
+    wish = " ".join(args).strip()[:120] or None
+    await update.message.reply_text(f"{n} reward draws - {wish or 'surprise'}, floor off...")
+    for i in range(n):
+        await _debug_send(context, user_id, f"REWARD {i + 1}/{n}", reward_prompt(variant, wish),
+                          reward_negative(variant), reward_chain(), upscale=True, gate=False)
+        await asyncio.sleep(2)
+
+
+async def tryn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """N ungated task draws: /tryn [count]"""
+    user_id = update.effective_user.id
+    n = 5
+    if context.args and context.args[0].isdigit():
+        n = max(1, min(int(context.args[0]), 8))
+    session = get_session()
+    try:
+        user = session.query(UserState).filter_by(user_id=user_id).first()
+        variant = harley_variant(user) if user else HARLEY_VARIANTS["vagina"]
+    finally:
+        session.close()
+    await update.message.reply_text(f"{n} task draws, floor off...")
+    for i in range(n):
+        dom = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
+               f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
+               f"framed from mid-thigh up, {STUDIO}")
+        await _debug_send(context, user_id, f"TASK {i + 1}/{n}", dom,
+                          NEGATIVE_PROMPT_SEXY + (variant.get("clothed_negative") or ""),
+                          None, upscale=False, gate=False)
+        await asyncio.sleep(2)
 
 
 MODEL_CHOICES = ["grok-imagine-image", "chroma", "lustify-v8", "z-image-turbo", "nano-banana-pro"]
@@ -2451,7 +2529,37 @@ async def setmodel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     IMAGE_MODEL = m
     await asyncio.to_thread(get_spec, m)
-    await query.edit_message_text(f"Task model: {m}. /debugavatar to test.\n\nlustify = sharpest and explicit. grok = sharp, R-rated. chroma = explicit but soft. nano-banana = sharp, rejects explicit.")
+    await query.edit_message_text(
+        f"Task model: {m}. /debugavatar to test.\n\n"
+        "lustify = sharpest and explicit. grok = sharp, R-rated. chroma = explicit but soft. "
+        "nano-banana = sharp, rejects explicit."
+    )
+
+
+async def rewardmodel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [[InlineKeyboardButton(m, callback_data=f"setreward_{m}")] for m in MODEL_CHOICES]
+    keyboard.append([InlineKeyboardButton("same as task", callback_data="setreward_same")])
+    await update.message.reply_text(
+        f"Reward model: {IMAGE_MODEL_REWARD or 'same'}\n\nPick one, then /testreward.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def setreward_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global IMAGE_MODEL_REWARD
+    query = update.callback_query
+    await query.answer()
+    m = query.data.replace("setreward_", "")
+    if m == "same":
+        IMAGE_MODEL_REWARD = ""
+    elif m in MODEL_CHOICES:
+        IMAGE_MODEL_REWARD = m
+        await asyncio.to_thread(get_spec, m)
+    else:
+        return
+    shown = IMAGE_MODEL_REWARD or "same as task"
+    note = "" if IMAGE_MODEL_REWARD else "\n\n(grok and nano-banana hide genitals - the BARE gate will mostly fail on them)"
+    await query.edit_message_text(f"Reward model: {shown}. /testreward to test.{note}")
 
 
 # ============ SCHEDULER ============
@@ -2555,73 +2663,20 @@ async def reset_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Error.")
     finally:
         session.close()
-async def imgmodels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Dump the live image catalogue with each model's caps, so a swap is a lookup."""
-    try:
-        r = await asyncio.to_thread(
-            requests.get, f"{VENICE_API_URL}/models?type=image",
-            headers={"Authorization": f"Bearer {VENICE_API_KEY}"}, timeout=30,
-        )
-        payload = r.json()
-    except Exception as e:
-        await update.message.reply_text(f"catalogue fetch failed - {e}")
-        return
-    rows = []
-    for m in payload.get("data", []):
-        spec = m.get("model_spec") or {}
-        rows.append(f"{m.get('id', '?')} | res {','.join(spec.get('resolutions') or []) or '-'} | "
-                    f"steps<={spec.get('steps', {}).get('max', '-')} | {','.join(spec.get('traits') or [])}")
-    await update.message.reply_text("\n".join(rows)[:3900] or "empty catalogue")
 
-async def tryreward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """N ungated reward draws: /tryreward [count] [wish]"""
-    user_id = update.effective_user.id
-    args = list(context.args)
-    n = 5
-    if args and args[0].isdigit():
-        n = max(1, min(int(args.pop(0)), 8))
-    session = get_session()
-    try:
-        user = session.query(UserState).filter_by(user_id=user_id).first()
-        variant = harley_variant(user) if user else HARLEY_VARIANTS["vagina"]
-    finally:
-        session.close()
-    wish = " ".join(args).strip()[:120] or None
-    await update.message.reply_text(f"{n} reward draws - {wish or 'surprise'}, gate off...")
-    for i in range(n):
-        await _debug_send(context, user_id, f"REWARD {i + 1}/{n}", reward_prompt(variant, wish),
-                          reward_negative(variant), reward_chain(), upscale=True, gate=False)
-        await asyncio.sleep(2)
 
-async def tryn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """N ungated task draws: /tryn [count]"""
-    user_id = update.effective_user.id
-    n = 5
-    if context.args and context.args[0].isdigit():
-        n = max(1, min(int(context.args[0]), 8))
-    session = get_session()
+# ============ ERROR HANDLER ============
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Handler exception", exc_info=context.error)
     try:
-        user = session.query(UserState).filter_by(user_id=user_id).first()
-        variant = harley_variant(user) if user else HARLEY_VARIANTS["vagina"]
-    finally:
-        session.close()
-    await update.message.reply_text(f"{n} task draws, gate off...")
-    for i in range(n):
-        dom = (f"Raw editorial photograph of {HARLEY_BASE}, {variant['body']}{variant_phrase(variant)}, "
-               f"wearing {random.choice(HARLEY_OUTFITS)}, {random.choice(HARLEY_POSES)}, "
-               f"framed from mid-thigh up, {STUDIO}")
-        await _debug_send(context, user_id, f"TASK {i + 1}/{n}", dom,
-                          NEGATIVE_PROMPT_SEXY + (variant.get("clothed_negative") or ""),
-                          None, upscale=False, gate=False)
-        await asyncio.sleep(2)
+        if isinstance(update, Update) and update.effective_chat:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Somethin' shorted out, puddin'. Try again."
+            )
+    except Exception:
+        pass
 
-async def rewardmodel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton(m, callback_data=f"setreward_{m}")] for m in MODEL_CHOICES]
-    keyboard.append([InlineKeyboardButton("same as task", callback_data="setreward_same")])
-    await update.message.reply_text(
-        f"Reward model: {IMAGE_MODEL_REWARD or 'same'}\n\nPick one, then /testreward.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
 
 # ============ MAIN ============
 def main():
@@ -2637,6 +2692,7 @@ def main():
     ensure_schema()
     load_model_spec()
     application = Application.builder().token(TELEGRAM_TOKEN).build()
+    application.add_error_handler(error_handler)
     application.job_queue.run_repeating(
         scheduled_task_check, interval=60, first=10, name="scheduled_check",
         job_kwargs={"misfire_grace_time": 180, "coalesce": True, "max_instances": 1}
@@ -2652,7 +2708,6 @@ def main():
     application.add_handler(CommandHandler("tryn", tryn_cmd))
     application.add_handler(CommandHandler("model", model_cmd))
     application.add_handler(CommandHandler("rewardmodel", rewardmodel_cmd))
-    application.add_handler(CommandHandler("model", model_cmd))
     application.add_handler(CommandHandler("gender", gender_cmd))
     application.add_handler(CommandHandler("outfit", outfit_cmd))
     application.add_handler(CommandHandler("wherenow", wherenow_cmd))
@@ -2696,5 +2751,7 @@ def main():
         drop_pending_updates=True,
         bootstrap_retries=5,
     )
+
+
 if __name__ == "__main__":
     main()
