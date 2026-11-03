@@ -235,8 +235,9 @@ def main_menu():
         [InlineKeyboardButton("Schedule", callback_data="menu_schedule"),
          InlineKeyboardButton("Interval", callback_data="menu_interval")],
         [InlineKeyboardButton("Settings", callback_data="menu_settings"),
-         InlineKeyboardButton("Rewards", callback_data="menu_rewards")],
-        [InlineKeyboardButton("Status", callback_data="menu_status")],
+         InlineKeyboardButton("Auto pics", callback_data="menu_autopics")],
+        [InlineKeyboardButton("Rewards", callback_data="menu_rewards"),
+         InlineKeyboardButton("Status", callback_data="menu_status")],
     ])
 
 
@@ -309,6 +310,32 @@ async def wish_skip_callback(update, context):
 
 async def reward_cmd(update, context):
     await ask_reward(update, context, update.effective_user.id)
+
+
+def autopics_keyboard(on):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Turn off" if on else "Turn on",
+                                                      callback_data="autopics_toggle")]])
+
+
+async def autopics_cmd(update, context):
+    state = st.get_state(update.effective_user.id)
+    on = bool(state.get("avatar_enabled"))
+    await update.effective_message.reply_text(
+        f"Scheduled photos: {'on' if on else 'off'}"
+        f" (every {state.get('avatar_interval_minutes') or 60} min)",
+        reply_markup=autopics_keyboard(on))
+
+
+async def autopics_callback(update, context):
+    q = update.callback_query
+    await q.answer()
+    state = st.get_state(update.effective_user.id)
+    state["avatar_enabled"] = not bool(state.get("avatar_enabled"))
+    if state["avatar_enabled"]:
+        state["last_avatar_sent_at"] = None
+    await q.edit_message_text(
+        f"Scheduled photos: {'on' if state['avatar_enabled'] else 'off'}.",
+        reply_markup=autopics_keyboard(state["avatar_enabled"]))
 
 
 async def custom_input(update, context):
@@ -429,8 +456,9 @@ async def start_cmd(update, context):
 async def help_cmd(update, context):
     await update.effective_message.reply_text(
         "/task a challenge\n/location venue and rooms\n/outfit what you're wearing\n"
-        "/avatar a photo\n/reward a reward render\n/variant her anatomy\n"
-        "/risk /kinks /schedule /interval\n/settings /rewards /status\n/clear /reset",
+        "/avatar a photo\n/reward a reward render\n/autopics scheduled photos\n"
+        "/variant her anatomy\n/risk /kinks /schedule /interval\n"
+        "/settings /rewards /status\n/clear /reset",
         reply_markup=main_menu())
 
 
@@ -443,6 +471,7 @@ async def settings_cmd(update, context):
         f"task model: {state.get('task_model') or venice.IMAGE_MODEL}\n"
         f"reward model: {state.get('reward_model') or venice.IMAGE_MODEL_REWARD}\n"
         f"location: {state.get('location_notes') or 'unset'}\n"
+        f"auto pics: {'on' if state.get('avatar_enabled') else 'off'}\n"
         f"points: {state.get('points') or 0} streak: {state.get('streak') or 0}",
         reply_markup=main_menu())
 
@@ -471,6 +500,8 @@ async def menu_callback(update, context):
         await interval_cmd(update, context)
     elif route == "settings":
         await settings_cmd(update, context)
+    elif route == "autopics":
+        await autopics_cmd(update, context)
     elif route == "rewards":
         await rewards_cmd(update, context)
     elif route == "status":
@@ -1167,6 +1198,9 @@ async def scheduled_check(context):
             if session.query(st.Task).filter_by(user_id=row.user_id, status="pending").first():
                 continue
             state = st.get_state(row.user_id)
+            if not state.get("gender") or not state.get("location"):
+                state["next_task_time"] = now + timedelta(minutes=15)
+                continue
             text, risk = await tk.generate_task_text(state, session, voice=HARLEY_VOICE)
             task = st.Task(user_id=row.user_id, task_text=text, risk_level=risk, created_at=now,
                            expires_at=now + timedelta(minutes=30))
@@ -1228,6 +1262,7 @@ def main():
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CommandHandler("avatar", avatar_cmd))
     app.add_handler(CommandHandler("reward", reward_cmd))
+    app.add_handler(CommandHandler("autopics", autopics_cmd))
     app.add_handler(CommandHandler("debugavatar", debugavatar_cmd))
     app.add_handler(CommandHandler("tryn", tryn_cmd))
     app.add_handler(CommandHandler("testreward", testreward_cmd))
@@ -1244,6 +1279,7 @@ def main():
 
     app.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu_"))
     app.add_handler(CallbackQueryHandler(wish_skip_callback, pattern="^wish_skip$"))
+    app.add_handler(CallbackQueryHandler(autopics_callback, pattern="^autopics_toggle$"))
     app.add_handler(CallbackQueryHandler(venue_callback, pattern="^venue_"))
     app.add_handler(CallbackQueryHandler(room_callback, pattern="^room_"))
     app.add_handler(CallbackQueryHandler(present_feature_callback, pattern="^pf_"))
