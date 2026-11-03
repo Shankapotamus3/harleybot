@@ -27,7 +27,7 @@ HARLEY_VARIANTS = {
     "vagina": {"label": "Vagina", "body": "curvy athletic figure, medium breasts",
                "clothed": "", "lead": "", "clause": "genitals clearly visible, breasts bare"},
     "penis": {"label": "Penis", "body": "curvy athletic figure, medium breasts, futanari",
-              "clothed": "obvious bulge in the front of her clothes, visibly packing",
+              "clothed": "prominent visible bulge in the front of her clothes, straining against the fabric",
               "lead": "futanari, penis, balls", "clause": "penis and balls clearly visible"},
 }
 DEFAULT_VARIANT = "vagina"
@@ -249,30 +249,57 @@ async def generate_render(state, *, nude=False, scene_extra=""):
 
     async def build():
         if nude:
+            scene = ", ".join(p for p in (backdrop, scene_extra) if p)
             return prompts.build(subject_clause(state), nude=True,
                                  gear=random.choice(REWARD_GEAR),
                                  pose=random.choice(REWARD_POSES),
                                  clause=v["clause"],
-                                 scene=backdrop)
-        bits = subject_clause(state) + [random.choice(HARLEY_OUTFITS)]
+                                 scene=scene)
+        bits = subject_clause(state)
         if v.get("clothed"):
             bits.append(v["clothed"])
         return prompts.build(bits, nude=False,
+                             outfit=random.choice(HARLEY_OUTFITS),
                              pose=random.choice(HARLEY_POSES),
                              scene=scene_extra)
 
     return await render.render_best(spec, build)
 
 
-async def deliver_reward(bot, user_id, *, caption):
+async def deliver_reward(bot, user_id, *, caption, wish=""):
     state = st.get_state(user_id)
-    png = await generate_render(state, nude=True)
+    png = await generate_render(state, nude=True, scene_extra=wish)
     verdict = await verify.nude_check(png)
     if verdict == "COVERED":
-        retry = await generate_render(state, nude=True)
+        retry = await generate_render(state, nude=True, scene_extra=wish)
         if await verify.nude_check(retry) != "COVERED":
             png = retry
     await storage.deliver(bot, user_id, user_id, png, caption=caption, prefix="reward")
+
+
+async def ask_reward(update, context, user_id):
+    st.get_state(user_id)["pending"] = "reward_wish"
+    await update.effective_message.reply_text(
+        "Reward earned. What do you want to see?",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Anything", callback_data="wish_skip")]]))
+
+
+async def wish_skip_callback(update, context):
+    q = update.callback_query
+    await q.answer()
+    user_id = update.effective_user.id
+    st.get_state(user_id)["pending"] = None
+    await q.edit_message_text("Coming up...")
+    try:
+        await deliver_reward(context.bot, user_id, caption="Yours.")
+    except Exception:
+        logger.exception("reward failed")
+        await q.edit_message_text("Render failed.")
+
+
+async def reward_cmd(update, context):
+    await ask_reward(update, context, update.effective_user.id)
 
 
 async def custom_input(update, context):
@@ -281,6 +308,16 @@ async def custom_input(update, context):
         return
     state = st.get_state(user.id)
     pending = state.get("pending")
+    if pending == "reward_wish":
+        wish = msg.text.strip()[:200]
+        state["pending"] = None
+        await msg.reply_text("Coming up...")
+        try:
+            await deliver_reward(context.bot, user.id, caption="Yours.", wish=wish)
+        except Exception:
+            logger.exception("reward failed")
+            await msg.reply_text("Render failed.")
+        return
     if pending == "custom_location":
         state["venue"] = msg.text.strip()
         state["rooms"] = []
@@ -383,8 +420,8 @@ async def start_cmd(update, context):
 async def help_cmd(update, context):
     await update.effective_message.reply_text(
         "/task a challenge\n/location venue and rooms\n/outfit what you're wearing\n"
-        "/avatar a photo\n/variant her anatomy\n/risk /kinks /schedule /interval\n"
-        "/settings /rewards /status\n/clear /reset",
+        "/avatar a photo\n/reward a reward render\n/variant her anatomy\n"
+        "/risk /kinks /schedule /interval\n/settings /rewards /status\n/clear /reset",
         reply_markup=main_menu())
 
 
@@ -497,8 +534,13 @@ async def model_callback(update, context):
 async def payload_cmd(update, context):
     state = st.get_state(update.effective_user.id)
     spec = venice.get_spec(state.get("task_model"))
-    prompt, negative = prompts.build(subject_clause(state) + [random.choice(HARLEY_OUTFITS)],
-                                     nude=False, pose=HARLEY_POSES[0])
+    bits = subject_clause(state)
+    v = variant_of(state)
+    if v.get("clothed"):
+        bits.append(v["clothed"])
+    prompt, negative = prompts.build(bits, nude=False,
+                                     outfit=random.choice(HARLEY_OUTFITS),
+                                     pose=HARLEY_POSES[0])
     await update.effective_message.reply_text(
         f"model: {spec['model']}\nbox: {spec['width']}x{spec['height']}\nsteps: {spec['steps']}\n\n"
         f"positive:\n{prompt}\n\nnegative:\n{negative}"[:4000])
@@ -836,7 +878,7 @@ async def rewards_cmd(update, context):
     need = tk.reward_threshold(state.get("streak") or 0)
     await update.effective_message.reply_text(
         f"Every {need} completions earns a reward.\nStreak {state.get('streak') or 0} | "
-        f"progress {state.get('challenges_since_reward') or 0}/{need}")
+        f"progress {state.get('challenges_since_reward') or 0}/{need}\n\n/reward to trigger one now.")
 
 
 async def complete_callback(update, context):
@@ -994,11 +1036,8 @@ async def handle_photo(update, context):
             need = tk.reward_threshold(state["streak"])
             if state["challenges_since_reward"] >= need:
                 state["challenges_since_reward"] = 0
-                await update.message.reply_text(f"+{gain}. Streak {state['streak']}.\n\nReward.")
-                try:
-                    await deliver_reward(context.bot, user.id, caption="Yours.")
-                except Exception:
-                    logger.exception("reward failed")
+                await update.message.reply_text(f"+{gain}. Streak {state['streak']}.")
+                await ask_reward(update, context, user.id)
             else:
                 await update.message.reply_text(f"+{gain}. Streak {state['streak']}.")
             return
@@ -1177,6 +1216,7 @@ def main():
     app.add_handler(CommandHandler("clear", clear_location))
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CommandHandler("avatar", avatar_cmd))
+    app.add_handler(CommandHandler("reward", reward_cmd))
     app.add_handler(CommandHandler("debugavatar", debugavatar_cmd))
     app.add_handler(CommandHandler("tryn", tryn_cmd))
     app.add_handler(CommandHandler("testreward", testreward_cmd))
@@ -1192,6 +1232,7 @@ def main():
     app.add_handler(CommandHandler("interval", interval_cmd))
 
     app.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu_"))
+    app.add_handler(CallbackQueryHandler(wish_skip_callback, pattern="^wish_skip$"))
     app.add_handler(CallbackQueryHandler(venue_callback, pattern="^venue_"))
     app.add_handler(CallbackQueryHandler(room_callback, pattern="^room_"))
     app.add_handler(CallbackQueryHandler(present_feature_callback, pattern="^pf_"))
