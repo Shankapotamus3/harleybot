@@ -25,10 +25,16 @@ HARLEY_BASE = ("Harley Quinn, white skin, blonde hair in pigtails with red and b
                "blue and red eyeshadow")
 HARLEY_VARIANTS = {
     "vagina": {"label": "Vagina", "body": "curvy athletic figure, medium breasts",
-               "clothed": "", "lead": "", "clause": "genitals clearly visible, breasts bare"},
+               "clothed": "", "lead": "female",
+               "clause": "genitals clearly visible, breasts bare",
+               "clothed_neg": ", penis, cock, bulge, male genitals, strap-on",
+               "nude_neg": ", penis, cock, bulge, male genitals, strap-on"},
     "penis": {"label": "Penis", "body": "curvy athletic figure, medium breasts, futanari",
-              "clothed": "prominent visible bulge in the front of her clothes, straining against the fabric",
-              "lead": "futanari, penis, balls", "clause": "penis and balls clearly visible"},
+              "clothed": "prominent bulge straining the fabric, shaft outline visible through the material, clearly packing",
+              "lead": "futanari, penis, balls",
+              "clause": "penis and balls clearly visible",
+              "clothed_neg": ", exposed penis, bare shaft, visible glans, penis pulled out, genitals on display",
+              "nude_neg": ""},
 }
 DEFAULT_VARIANT = "vagina"
 USE_LOCATION = os.environ.get("IMAGE_USE_LOCATION", "0") == "1"
@@ -254,14 +260,17 @@ async def generate_render(state, *, nude=False, scene_extra=""):
                                  gear=random.choice(REWARD_GEAR),
                                  pose=random.choice(REWARD_POSES),
                                  clause=v["clause"],
-                                 scene=scene)
+                                 scene=scene,
+                                 extra_negative=v.get("nude_neg") or "")
         bits = subject_clause(state)
         if v.get("clothed"):
             bits.append(v["clothed"])
+        scene = ", ".join(p for p in (scene_extra, "framed from the thighs up") if p)
         return prompts.build(bits, nude=False,
                              outfit=random.choice(HARLEY_OUTFITS),
                              pose=random.choice(HARLEY_POSES),
-                             scene=scene_extra)
+                             scene=scene,
+                             extra_negative=v.get("clothed_neg") or "")
 
     return await render.render_best(spec, build)
 
@@ -540,7 +549,9 @@ async def payload_cmd(update, context):
         bits.append(v["clothed"])
     prompt, negative = prompts.build(bits, nude=False,
                                      outfit=random.choice(HARLEY_OUTFITS),
-                                     pose=HARLEY_POSES[0])
+                                     pose=HARLEY_POSES[0],
+                                     scene="framed from the thighs up",
+                                     extra_negative=v.get("clothed_neg") or "")
     await update.effective_message.reply_text(
         f"model: {spec['model']}\nbox: {spec['width']}x{spec['height']}\nsteps: {spec['steps']}\n\n"
         f"positive:\n{prompt}\n\nnegative:\n{negative}"[:4000])
