@@ -1,6 +1,6 @@
 # core/state.py
-import os, json, logging
-from datetime import datetime, timezone
+import os, json, random, logging
+from datetime import datetime, timezone, timedelta
 from sqlalchemy import (create_engine, Column, Integer, BigInteger, String, DateTime,
                         Boolean, Text, inspect, text as sqltext)
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -44,7 +44,7 @@ class UserState(Base):
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     last_task_at = Column(DateTime(timezone=True), nullable=True)
     next_task_time = Column(DateTime(timezone=True), nullable=True)
-    scheduling_enabled = Column(Boolean, default=False)
+    scheduling_enabled = Column(Boolean, default=True)
     min_interval = Column(Integer, default=30)
     max_interval = Column(Integer, default=180)
     avatar_url = Column(Text, nullable=True)
@@ -56,7 +56,7 @@ class UserState(Base):
     challenges_since_reward = Column(Integer, default=0)
     last_avatar_sent_at = Column(DateTime(timezone=True), nullable=True)
     avatar_interval_minutes = Column(Integer, default=60)
-    avatar_enabled = Column(Boolean, default=True)
+    avatar_enabled = Column(Boolean, default=False)
     kink_exposure = Column(String(10), default="okay")
     kink_humiliation = Column(String(10), default="okay")
     kink_degradation = Column(String(10), default="okay")
@@ -142,7 +142,7 @@ def _url():
     return url
 
 
-engine = create_engine(_url(), pool_pre_ping=True)
+engine = create_engine(_url(), pool_pre_ping=True, pool_size=10, max_overflow=20, pool_recycle=300)
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
 
@@ -191,85 +191,4 @@ _PERSIST = {
 }
 for _k in ("exposure", "humiliation", "degradation", "bondage", "pain", "service", "edging",
            "watersports", "exhibitionism", "roleplay", "petplay", "feminization", "cbt",
-           "breathplay", "sensory", "temperature", "marking", "spanking", "nipple", "anal",
-           "gags", "social_media"):
-    _PERSIST[f"kink_{_k}"] = f"kink_{_k}"
-
-_JSON = {"rooms", "probes", "features", "recent_settings", "last_kinks_used", "outfit_items"}
-_VOLATILE = {"history", "probe_pool"}
-_STATES = {}
-
-
-class StateView(dict):
-    def __init__(self, row, session):
-        super().__init__()
-        self._row = row
-        self._session = session
-        for key, col in _PERSIST.items():
-            raw = getattr(row, col, None)
-            if key in _JSON and raw:
-                try:
-                    super().__setitem__(key, json.loads(raw))
-                except (ValueError, TypeError):
-                    super().__setitem__(key, [])
-            else:
-                super().__setitem__(key, raw)
-
-    def __setitem__(self, key, value):
-        super().__setitem__(key, value)
-        col = _PERSIST.get(key)
-        if not col or key in _VOLATILE:
-            return
-        try:
-            setattr(self._row, col, json.dumps(value) if key in _JSON else value)
-            self._session.commit()
-        except Exception as exc:
-            logger.warning(f"state write failed for {key}: {exc}")
-
-    def save(self):
-        try:
-            self._session.commit()
-        except Exception as exc:
-            logger.warning(f"state save failed: {exc}")
-
-    def setdefault(self, key, default=None):
-        if key not in self:
-            self[key] = default
-        return self[key]
-
-    @property
-    def user_id(self):
-        return self._row.user_id
-
-
-def get_state(user_id):
-    view = _STATES.get(user_id)
-    if view is not None:
-        return view
-    session = get_session()
-    row = session.query(UserState).filter_by(user_id=user_id).first()
-    if not row:
-        row = UserState(user_id=user_id, username="")
-        session.add(row)
-        session.commit()
-    view = StateView(row, session)
-    _STATES[user_id] = view
-    return view
-
-
-def drop_state(user_id):
-    view = _STATES.pop(user_id, None)
-    if view is not None:
-        view._session.close()
-
-
-def all_user_ids():
-    session = get_session()
-    try:
-        return [r.user_id for r in session.query(UserState.user_id).all()]
-    finally:
-        session.close()
-
-
-def session_of(state):
-    return state._session
+           "breathplay", "sensory
