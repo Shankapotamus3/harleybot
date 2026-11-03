@@ -189,6 +189,87 @@ _PERSIST = {
     "avatar_enabled": "avatar_enabled", "avatar_interval_minutes": "avatar_interval_minutes",
     "last_avatar_sent_at": "last_avatar_sent_at",
 }
-for _k in ("exposure", "humiliation", "degradation", "bondage", "pain", "service", "edging",
-           "watersports", "exhibitionism", "roleplay", "petplay", "feminization", "cbt",
-           "breathplay", "sensory
+
+for _k in ("exposure", "humiliation", "degradation", "bondage", "pain", "service", "edging", "watersports", "exhibitionism", "roleplay", "petplay", "feminization", "cbt", "breathplay", "sensory", "temperature", "marking", "spanking", "nipple", "anal", "gags", "social_media"):
+    _PERSIST[f"kink_{_k}"] = f"kink_{_k}"
+
+_JSON = {"rooms", "probes", "features", "recent_settings", "last_kinks_used", "outfit_items"}
+_VOLATILE = {"history", "probe_pool"}
+_STATES = {}
+
+
+class StateView(dict):
+    def __init__(self, row, session):
+        super().__init__()
+        self._row = row
+        self._session = session
+        for key, col in _PERSIST.items():
+            raw = getattr(row, col, None)
+            if key in _JSON and raw:
+                try:
+                    super().__setitem__(key, json.loads(raw))
+                except (ValueError, TypeError):
+                    super().__setitem__(key, [])
+            else:
+                super().__setitem__(key, raw)
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        col = _PERSIST.get(key)
+        if not col or key in _VOLATILE:
+            return
+        try:
+            setattr(self._row, col, json.dumps(value) if key in _JSON else value)
+            self._session.commit()
+        except Exception as exc:
+            logger.warning(f"state write failed for {key}: {exc}")
+
+    def save(self):
+        try:
+            self._session.commit()
+        except Exception as exc:
+            logger.warning(f"state save failed: {exc}")
+
+    def setdefault(self, key, default=None):
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    @property
+    def user_id(self):
+        return self._row.user_id
+
+
+def get_state(user_id):
+    view = _STATES.get(user_id)
+    if view is not None:
+        return view
+    session = get_session()
+    row = session.query(UserState).filter_by(user_id=user_id).first()
+    if not row:
+        row = UserState(
+            user_id=user_id, username="",
+            next_task_time=datetime.now(timezone.utc) + timedelta(minutes=random.randint(30, 180)))
+        session.add(row)
+        session.commit()
+    view = StateView(row, session)
+    _STATES[user_id] = view
+    return view
+
+
+def drop_state(user_id):
+    view = _STATES.pop(user_id, None)
+    if view is not None:
+        view._session.close()
+
+
+def all_user_ids():
+    session = get_session()
+    try:
+        return [r.user_id for r in session.query(UserState.user_id).all()]
+    finally:
+        session.close()
+
+
+def session_of(state):
+    return state._session
