@@ -1,5 +1,5 @@
 # core/tasks.py
-import random, logging
+import re, random, logging
 from datetime import datetime, timezone
 from . import venue, venice
 from .state import LocationConstraint
@@ -142,7 +142,7 @@ async def generate_task_text(state, session, *, voice, depth=0):
     recent = (state.get("recent_settings") or [])[-8:]
     recent_text = "\n".join(f"- {r}" for r in recent) if recent else "none yet"
     blockers = session.query(LocationConstraint).filter(
-        LocationConstraint.user_id == state["_row"].user_id,
+        LocationConstraint.user_id == state.user_id,
         LocationConstraint.location == location,
         LocationConstraint.expires_at > datetime.now(timezone.utc)).all()
     blockers_text = "\n".join(f"- {b.constraint}" for b in blockers) if blockers else "none"

@@ -1,10 +1,18 @@
 # core/storage.py
-import io, time, random, asyncio, logging
+import io, os, time, random, asyncio, logging
 from datetime import datetime, timezone
 import cloudinary, cloudinary.uploader
 from . import render
 
 logger = logging.getLogger(__name__)
+
+
+def configure():
+    cloudinary.config(
+        cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+        api_key=os.getenv("CLOUDINARY_API_KEY"),
+        api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+        secure=True)
 
 
 async def upload(image_bytes, user_id, image_type="user_upload", folder="telegram_bot"):
