@@ -31,6 +31,7 @@ HARLEY_VARIANTS = {
               "lead": "futanari, penis, balls", "clause": "penis and balls clearly visible"},
 }
 DEFAULT_VARIANT = "vagina"
+USE_LOCATION = os.environ.get("IMAGE_USE_LOCATION", "0") == "1"
 
 HARLEY_VOICE = """You are Harley Quinn - Domme, chaotic, delighted by your own cruelty.
 You run your sub's training. You are the boss and you both know it.
@@ -244,6 +245,7 @@ def _toggle(bucket, item):
 async def generate_render(state, *, nude=False, scene_extra=""):
     v = variant_of(state)
     spec = venice.get_spec(state.get("reward_model") if nude else state.get("task_model"), nude=nude)
+    backdrop = (state.get("location_notes") or "") if USE_LOCATION else ""
 
     async def build():
         if nude:
@@ -251,13 +253,13 @@ async def generate_render(state, *, nude=False, scene_extra=""):
                                  gear=random.choice(REWARD_GEAR),
                                  pose=random.choice(REWARD_POSES),
                                  clause=v["clause"],
-                                 scene=state.get("location_notes") or "")
-        outfit = state.get("outfit_detail") or state.get("current_outfit") or random.choice(HARLEY_OUTFITS)
-        bits = subject_clause(state) + [outfit]
+                                 scene=backdrop)
+        bits = subject_clause(state) + [random.choice(HARLEY_OUTFITS)]
         if v.get("clothed"):
             bits.append(v["clothed"])
-        return prompts.build(bits, nude=False, pose=random.choice(HARLEY_POSES),
-                             scene=(state.get("location_notes") or "") + (" " + scene_extra if scene_extra else ""))
+        return prompts.build(bits, nude=False,
+                             pose=random.choice(HARLEY_POSES),
+                             scene=scene_extra)
 
     return await render.render_best(spec, build)
 
@@ -495,7 +497,7 @@ async def model_callback(update, context):
 async def payload_cmd(update, context):
     state = st.get_state(update.effective_user.id)
     spec = venice.get_spec(state.get("task_model"))
-    prompt, negative = prompts.build(subject_clause(state) + [state.get("outfit_detail") or "clothing"],
+    prompt, negative = prompts.build(subject_clause(state) + [random.choice(HARLEY_OUTFITS)],
                                      nude=False, pose=HARLEY_POSES[0])
     await update.effective_message.reply_text(
         f"model: {spec['model']}\nbox: {spec['width']}x{spec['height']}\nsteps: {spec['steps']}\n\n"
