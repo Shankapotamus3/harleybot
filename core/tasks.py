@@ -17,10 +17,14 @@ RISK_LEVELS = {
 RISK_WEIGHTS = {1: 5, 2: 5, 3: 20, 4: 30, 5: 40}
 
 GENDER_GUIDELINES = {
-    "male": {"body_parts": ["chest", "abs", "cock", "balls", "ass"]},
-    "female": {"body_parts": ["cleavage", "breasts", "nipples", "pussy", "ass"]},
-    "trans": {"body_parts": ["chest", "breasts", "cock", "pussy", "ass"]},
-    "nonbinary": {"body_parts": ["chest", "breasts", "genitals", "ass"]},
+    "male": {"body_parts": ["flat chest", "abs", "cock", "balls", "ass"],
+             "note": "male — say chest, never breasts"},
+    "female": {"body_parts": ["cleavage", "breasts", "nipples", "pussy", "ass"],
+               "note": "female — no cock"},
+    "trans": {"body_parts": ["chest", "breasts", "cock", "pussy", "ass"],
+              "note": "breasts and cock both present"},
+    "nonbinary": {"body_parts": ["chest", "breasts", "genitals", "ass"],
+                  "note": ""},
 }
 
 KINK_CATEGORIES = {
@@ -88,6 +92,8 @@ FALLBACKS = {
     5: "Walk to the end of the {loc} hallway, expose yourself briefly, photograph the empty hall behind you",
 }
 
+MAX_FEATURES = 6
+
 
 def weighted_risk(max_risk=5):
     levels = [l for l in RISK_WEIGHTS if l <= max(1, max_risk)]
@@ -107,6 +113,17 @@ def get_user_kinks(state, level=None):
 
 def reward_threshold(streak):
     return max(3, random.randint(5, 10) - min(3, streak // 5))
+
+
+def _features(state, location):
+    """A short candidate list, not the whole venue dump."""
+    notes = (state.get("location_notes") or "").strip()
+    if notes:
+        return ""
+    raw = venue.venue_baseline(state, location)
+    items = [i.strip() for i in raw.split(",") if i.strip()]
+    random.shuffle(items)
+    return ", ".join(items[:MAX_FEATURES])
 
 
 async def generate_task_text(state, session, *, voice, depth=0):
@@ -147,16 +164,22 @@ async def generate_task_text(state, session, *, voice, depth=0):
         LocationConstraint.expires_at > datetime.now(timezone.utc)).all()
     blockers_text = "\n".join(f"- {b.constraint}" for b in blockers) if blockers else "none"
 
+    guide = GENDER_GUIDELINES.get(gender, GENDER_GUIDELINES["nonbinary"])
+    anatomy = ", ".join(guide["body_parts"])
+    anatomy_note = f" ({guide['note']})" if guide["note"] else ""
+    notes = (state.get("location_notes") or "").strip()
+    features = _features(state, location)
+    detail_block = f"\nWhere exactly: {notes}" if notes else ""
+    feature_block = f"\nFeatures in reach (choose ONE, do not list them): {features}" if features else ""
     rooms_line = f"\nRooms in play: {', '.join(rooms)}" if rooms else ""
+
     prompt = f"""Write ONE task for a {gender} sub. Stay in voice, but obey the format exactly.
 
-Location: {location}{rooms_line}
-Obvious features of a place like this: {venue.venue_baseline(state, location)}
-Extra detail from the sub: {state.get('location_notes') or "none"}
+Location: {location}{rooms_line}{detail_block}{feature_block}
 Context: {others}, {privacy} privacy
 Risk: {actual_risk}/5 - {RISK_LEVELS[actual_risk]['description']}
 Wearing: {outfit}
-Body parts: {', '.join(GENDER_GUIDELINES.get(gender, GENDER_GUIDELINES['nonbinary'])['body_parts'])}
+Anatomy - only these exist{anatomy_note}: {anatomy}
 DESIRED: {', '.join(yes_kinks) or 'none'}
 USE: {', '.join(selected)}
 
@@ -167,18 +190,19 @@ RECENTLY USED HERE - prefer variety:
 {recent_text}
 
 Work in this order:
-1. Silently list 10 concrete settings, mostly from the obvious features. Use the extra detail as additions, not the limit.
+1. Silently pick ONE setting from what is listed above.
 2. Cross off anything blocked.
-3. Choose the setting that best supports risk {actual_risk}/5, leaning towards what has been used least.
-4. Write the task around it.
+3. Check it fits risk {actual_risk}/5.
+4. Write the task around that single setting.
 
 Rules:
 - Single action, photo proof required
 - No time durations
 - Never use: {', '.join(forbidden) or 'nothing'}
-- Stay inside the rooms in play and name the room
+- Name the chosen setting. Mention ONE supporting detail at most. Do not enumerate other features.
+- Never name a body part the sub does not have
+- Stay inside the rooms in play
 - The sub photographs one-handed. If the action needs both hands, state how to prop the phone.
-- Name the setting explicitly
 - Trust the outfit description over the outfit label
 - Favour the specific over the generic
 
@@ -193,6 +217,9 @@ SETTING: <the setting, 2-5 words>"""
             if depth < 3 and kink in forbidden and any(w in response.lower() for w in words):
                 logger.warning(f"forbidden kink '{kink}' leaked, retrying")
                 return await generate_task_text(state, session, voice=voice, depth=depth + 1)
+        if depth < 3 and gender == "male" and "breast" in response.lower():
+            logger.warning("male sub got 'breasts', retrying")
+            return await generate_task_text(state, session, voice=voice, depth=depth + 1)
         setting, kept = None, []
         for line in response.splitlines():
             s = line.strip()
