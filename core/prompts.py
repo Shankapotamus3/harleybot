@@ -11,6 +11,8 @@ NEGATIVE_PROMPT_SEXY = "stiff catalogue pose, stock photo, mannequin, plastic sk
 NEGATIVE_PROMPT_NUDE = ("briefs, boxers, panties, knickers, trousers, jeans, skirt, towel, sheet, "
                         "sarong, loincloth, drapery, fabric over the groin, clothing over the groin, "
                         "censored, mosaic, partially covered")
+NEGATIVE_PROMPT_CLOTHED = ("nude, nudity, topless, bare breasts, exposed breasts, exposed genitals, "
+                           "bare crotch, undressed, stripped")
 NEGATIVE_HARD = ", any clothing, underwear, bra, panties, fabric, boots, stockings"
 STUDIO = "against a seamless charcoal studio backdrop, subtle rim light from behind"
 NUDE = "fully nude except for"
@@ -22,8 +24,7 @@ def _clean(prompt):
     return f"{cleaned}, {SHARP_TAIL}"
 
 
-def build(subject, *, nude, pose="", gear="", clause="", scene="", extra_negative=""):
-    """subject is app-supplied fragments. Returns (positive, negative)."""
+def build(subject, *, nude, pose="", gear="", clause="", scene="", outfit="", extra_negative=""):
     bits = [b for b in subject if b]
     if nude:
         if gear:
@@ -34,9 +35,11 @@ def build(subject, *, nude, pose="", gear="", clause="", scene="", extra_negativ
             bits.append(pose)
         negative = NEGATIVE_PROMPT_NUDE + extra_negative
     else:
+        if outfit:
+            bits.append(f"fully clothed in {outfit}")
         if pose:
             bits.append(pose)
-        negative = NEGATIVE_PROMPT_SEXY + NEGATIVE_HARD + extra_negative
+        negative = NEGATIVE_PROMPT_SEXY + NEGATIVE_PROMPT_CLOTHED + extra_negative
     if scene:
         bits.append(scene)
     bits.append(STUDIO)
