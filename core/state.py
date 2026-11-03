@@ -153,25 +153,19 @@ def get_session():
 
 def ensure_schema():
     insp = inspect(engine)
-    tables = set(insp.get_table_names())
-    additions = {
-        "tasks": {"sharpness": "INTEGER"},
-        "user_states": {
-            "variant": "VARCHAR(20)", "features": "TEXT", "venue": "VARCHAR(50)",
-            "pending": "VARCHAR(50)", "reward_model": "VARCHAR(50)", "task_model": "VARCHAR(50)",
-            "rooms": "TEXT", "risk_pre_kids": "INTEGER", "recent_settings": "TEXT",
-            "location_probes": "TEXT",
-        },
-    }
+    existing = set(insp.get_table_names())
     with engine.begin() as conn:
-        for table, cols in additions.items():
-            if table not in tables:
+        for table in Base.metadata.sorted_tables:
+            if table.name not in existing:
                 continue
-            have = {c["name"] for c in insp.get_columns(table)}
-            for col, ddl in cols.items():
-                if col not in have:
-                    logger.warning(f"migrating: {table}.{col}")
-                    conn.execute(sqltext(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {ddl}"))
+            have = {c["name"] for c in insp.get_columns(table.name)}
+            for column in table.columns:
+                if column.name in have:
+                    continue
+                ddl = column.type.compile(engine.dialect)
+                logger.warning(f"migrating: {table.name}.{column.name}")
+                conn.execute(sqltext(
+                    f'ALTER TABLE {table.name} ADD COLUMN IF NOT EXISTS "{column.name}" {ddl}'))
 
 
 _PERSIST = {
