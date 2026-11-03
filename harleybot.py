@@ -1,4 +1,4 @@
-# harley.py
+# harleybot.py
 import os
 os.environ.setdefault("IMAGE_MODEL", "chroma")
 os.environ.setdefault("IMAGE_FALLBACKS", "lustify-v8")
@@ -216,6 +216,23 @@ def model_keyboard(selected, prefix="model"):
                                  for m in TASK_MODELS])
 
 
+def main_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Get a task", callback_data="menu_task")],
+        [InlineKeyboardButton("Outfit", callback_data="menu_outfit"),
+         InlineKeyboardButton("Location", callback_data="menu_location")],
+        [InlineKeyboardButton("Avatar", callback_data="menu_avatar"),
+         InlineKeyboardButton("Variant", callback_data="menu_variant")],
+        [InlineKeyboardButton("Risk", callback_data="menu_risk"),
+         InlineKeyboardButton("Kinks", callback_data="menu_kinks")],
+        [InlineKeyboardButton("Schedule", callback_data="menu_schedule"),
+         InlineKeyboardButton("Interval", callback_data="menu_interval")],
+        [InlineKeyboardButton("Settings", callback_data="menu_settings"),
+         InlineKeyboardButton("Rewards", callback_data="menu_rewards")],
+        [InlineKeyboardButton("Status", callback_data="menu_status")],
+    ])
+
+
 def _toggle(bucket, item):
     if item in bucket:
         bucket.remove(item)
@@ -351,16 +368,22 @@ async def chat_handler(update, context):
 
 
 async def start_cmd(update, context):
+    state = st.get_state(update.effective_user.id)
+    if not state.get("gender"):
+        await update.effective_message.reply_text("First - gender:", reply_markup=gender_keyboard())
+        return
     await update.effective_message.reply_text(
-        "Harley here. /avatar for a photo, /location to set the scene, /task to get to work, "
-        "/settings for the rest.")
+        f"Harley here.\n\n{state.get('location') or 'No location set'} | "
+        f"risk {state.get('risk_level') or 5} | {state.get('points') or 0} pts",
+        reply_markup=main_menu())
 
 
 async def help_cmd(update, context):
     await update.effective_message.reply_text(
-        "/task - a challenge\n/location - venue and rooms\n/avatar - a photo\n/variant - anatomy\n"
-        "/privacy - outfit level\n/outfit /gender /risk /kinks\n/schedule /interval /status\n"
-        "/settings /clear /reset")
+        "/task a challenge\n/location venue and rooms\n/outfit what you're wearing\n"
+        "/avatar a photo\n/variant her anatomy\n/risk /kinks /schedule /interval\n"
+        "/settings /rewards /status\n/clear /reset",
+        reply_markup=main_menu())
 
 
 async def settings_cmd(update, context):
@@ -368,15 +391,49 @@ async def settings_cmd(update, context):
     await update.effective_message.reply_text(
         f"variant: {state.get('variant') or DEFAULT_VARIANT}\n"
         f"privacy: {state.get('privacy') or 'private'}\n"
+        f"outfit: {state.get('outfit_detail') or state.get('current_outfit') or 'unset'}\n"
         f"task model: {state.get('task_model') or venice.IMAGE_MODEL}\n"
         f"reward model: {state.get('reward_model') or venice.IMAGE_MODEL_REWARD}\n"
         f"location: {state.get('location_notes') or 'unset'}\n"
-        f"points: {state.get('points') or 0} streak: {state.get('streak') or 0}")
+        f"points: {state.get('points') or 0} streak: {state.get('streak') or 0}",
+        reply_markup=main_menu())
+
+
+async def menu_callback(update, context):
+    q = update.callback_query
+    await q.answer()
+    route = q.data.split("_", 1)[1]
+    if route == "task":
+        await issue_task(update, context)
+    elif route == "outfit":
+        await outfit_cmd(update, context)
+    elif route == "location":
+        await location_cmd(update, context)
+    elif route == "avatar":
+        await avatar_cmd(update, context)
+    elif route == "variant":
+        await variant_cmd(update, context)
+    elif route == "risk":
+        await risk_cmd(update, context)
+    elif route == "kinks":
+        await kinks_cmd(update, context)
+    elif route == "schedule":
+        await schedule_cmd(update, context)
+    elif route == "interval":
+        await interval_cmd(update, context)
+    elif route == "settings":
+        await settings_cmd(update, context)
+    elif route == "rewards":
+        await rewards_cmd(update, context)
+    elif route == "status":
+        await status_cmd(update, context)
 
 
 async def variant_cmd(update, context):
+    state = st.get_state(update.effective_user.id)
     await update.effective_message.reply_text(
-        "Anatomy:", reply_markup=variant_keyboard(st.get_state(update.effective_user.id).get("variant")))
+        f"Anatomy (currently {state.get('variant') or DEFAULT_VARIANT}):",
+        reply_markup=variant_keyboard(state.get("variant")))
 
 
 async def variant_callback(update, context):
@@ -386,8 +443,9 @@ async def variant_callback(update, context):
     if v not in HARLEY_VARIANTS:
         await q.edit_message_text("Unknown.")
         return
-    st.get_state(update.effective_user.id)["variant"] = v
-    await q.edit_message_text(f"Variant: {v}.")
+    state = st.get_state(update.effective_user.id)
+    state["variant"] = v
+    await q.edit_message_text(f"Variant: {v}.", reply_markup=variant_keyboard(v))
 
 
 async def privacy_cmd(update, context):
@@ -437,7 +495,6 @@ async def model_callback(update, context):
 async def payload_cmd(update, context):
     state = st.get_state(update.effective_user.id)
     spec = venice.get_spec(state.get("task_model"))
-    v = variant_of(state)
     prompt, negative = prompts.build(subject_clause(state) + [state.get("outfit_detail") or "clothing"],
                                      nude=False, pose=HARLEY_POSES[0])
     await update.effective_message.reply_text(
@@ -606,7 +663,7 @@ async def gender_callback(update, context):
     q = update.callback_query
     await q.answer()
     st.get_state(update.effective_user.id)["gender"] = q.data.split("_", 1)[1]
-    await q.edit_message_text("Saved.")
+    await q.edit_message_text("Saved.", reply_markup=main_menu())
 
 
 async def outfit_cmd(update, context):
@@ -677,7 +734,7 @@ async def kinks_back_callback(update, context):
 
 async def kinks_done_callback(update, context):
     await update.callback_query.answer()
-    await update.callback_query.edit_message_text("Saved.")
+    await update.callback_query.edit_message_text("Saved.", reply_markup=main_menu())
 
 
 async def skip_cmd(update, context):
@@ -1105,6 +1162,7 @@ def main():
 
     app = Application.builder().token(TOKEN).read_timeout(180).write_timeout(180).build()
     app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("menu", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CommandHandler("variant", variant_cmd))
@@ -1131,6 +1189,7 @@ def main():
     app.add_handler(CommandHandler("schedule", schedule_cmd))
     app.add_handler(CommandHandler("interval", interval_cmd))
 
+    app.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu_"))
     app.add_handler(CallbackQueryHandler(venue_callback, pattern="^venue_"))
     app.add_handler(CallbackQueryHandler(room_callback, pattern="^room_"))
     app.add_handler(CallbackQueryHandler(present_feature_callback, pattern="^pf_"))
