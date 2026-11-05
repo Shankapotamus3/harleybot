@@ -179,6 +179,17 @@ def _claim_exposure(response, effective, baseline):
     return kept.strip(), final
 
 
+def _tidy(text):
+    """Strip the template artefacts the model leaves behind."""
+    text = re.sub(r"_+", "", text)
+    text = re.sub(r"[ \t]*\([ \t]*\)", "", text)
+    text = re.sub(r"[ \t]*\)[ \t]*(?=[;,.])", "", text)
+    text = re.sub(r"[ \t]+([;,.])", r"\1", text)
+    text = re.sub(r";[ \t]*$", ".", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+
+
 async def generate_task_text(state, session, *, voice, depth=0):
     gender = state.get("gender") or "nonbinary"
     location = state.get("location") or "Unknown"
@@ -199,7 +210,11 @@ async def generate_task_text(state, session, *, voice, depth=0):
     stated = venue.normalise_privacy(privacy)
     default = venue.privacy_default(location)
     baseline_privacy = stated or default
-    mismatch = bool(stated) and venue.exposure_rank(stated) < venue.exposure_rank(default)
+
+    # Occupancy comes from the privacy level. context_others only adds children.
+    present = venue.PRIVACY_DESC[baseline_privacy]
+    if others == "kids":
+        present = f"{present}, and children may be about"
 
     move, target = None, 0
     if random.random() < float(os.getenv("EXPOSURE_CHANCE", "0.35")):
@@ -263,11 +278,17 @@ async def generate_task_text(state, session, *, voice, depth=0):
 
     move_line = (f"{move} - you are now {effective} "
                  f"({venue.PRIVACY_DESC[effective].lower()})" if move else "stays where it is")
+
     reconcile = ""
-    if mismatch:
-        reconcile = (f"Note: they say {venue.PRIVACY_DESC[stated].lower()}, but a {location} is "
-                     f"normally {venue.PRIVACY_LABELS[default].lower()}. Have the task say why it "
-                     f"is quiet - time of day, closed, empty lane - or let someone appear.\n")
+    if stated and stated != default:
+        if venue.exposure_rank(stated) > venue.exposure_rank(default):
+            reconcile = (f"Note: they say {venue.PRIVACY_DESC[stated].lower()}, busier than a "
+                         f"{location} normally is. Put someone actually about, and looking.\n")
+        else:
+            reconcile = (f"Note: they say {venue.PRIVACY_DESC[stated].lower()}, but a {location} is "
+                         f"normally {venue.PRIVACY_LABELS[default].lower()}. Have the task say why "
+                         f"it is quiet - time of day, closed, empty lane - or let someone appear.\n")
+
     no_cover_line = ("No cover at this location. Write so nobody sees, or let it be brief and seen.\n"
                      if no_cover else "")
     phone_line = ("propped, timed, or on a mirror - say what, in three words" if needs_prop
@@ -276,7 +297,7 @@ async def generate_task_text(state, session, *, voice, depth=0):
     prompt = f"""Write ONE task for a {gender} sub. Stay in voice, but obey the format exactly.
 
 Location: {location}{rooms_line}{detail_block}{feature_block}
-Context: {others}, {baseline_privacy} privacy
+Context: {present}
 Privacy: {baseline_privacy} - {venue.PRIVACY_DESC[baseline_privacy]}
 {reconcile}{no_cover_line}This setting changes that: {move_line}
 Cover during the task: {effective}
@@ -318,6 +339,10 @@ Rules:
 - Only hedge about gear that is not already in Wearing. If it is listed, treat it as fact.
 - Stay inside the rooms in play
 - Open with one clause grounding the privacy claim: "the place is dead", "it is early", "the door is locked"
+- The Context line is the truth about who is there. Never call the place empty, dead, quiet or
+  deserted at "a few people around" or "people are looking at you" - name who is about instead.
+- When people are looking, someone must actually be looking, listening or talking to the sub. Name
+  them and what they are doing.
 - Above "caught", the task must name its cover: what is between you and them, or what you are
   waiting for. "Turned away" alone is not cover for a strip.
 - Cover must match the skin. If it cannot, reduce the skin by one band rather than dropping the cover.
@@ -332,6 +357,8 @@ Rules:
 - Say what the photo must show, concretely - the thing, and how much of the body is in frame
 - Direction must be physically true. Kneeling means looking down at yourself.
 - If you name a surface, name a real material: "the tiled floor", "the lane boards".
+- Never leave a blank, underscore, bracket or dangling punctuation. If a detail is unknown, invent
+  a plausible one and name it.
 - Say "the photo", never "photos"
 - Trust the outfit description over the outfit label
 - Favour the specific over the generic
@@ -362,6 +389,7 @@ EXPOSURE: <alone|caught|about|watched>"""
             m = re.match(r"TASK:\s*(.+)", s, re.IGNORECASE)
             kept.append(m.group(1).strip() if m else line)
         response = "\n".join(l for l in kept if l.strip()).strip()
+        response = _tidy(response)
         if setting:
             state["recent_settings"] = (recent + [setting])[-8:]
         if response:
