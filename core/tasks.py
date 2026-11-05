@@ -94,6 +94,18 @@ FALLBACKS = {
 
 MAX_FEATURES = 6
 
+# What worn gear physically permits. Substring-matched against Wearing.
+GEAR_PHYSICS = {
+    "cage": "a caged cock cannot get erect - it strains, fills the cage, bulges between the bars",
+    "chastity": "caged means no erection - straining, plumping, bulging against the bars",
+    "blindfold": "a blindfolded sub cannot see the phone - give a timer, a count, or a mirror",
+    "rope": "roped arms cannot hold the phone",
+    "cuffs": "cuffed wrists mean the phone is propped or on a timer",
+    "plug": "sitting means the weight is on the plug",
+    "collar": "a collar means a leash is available",
+    "heels": "heels change the stance and the balance",
+}
+
 
 def weighted_risk(max_risk=5):
     levels = [l for l in RISK_WEIGHTS if l <= max(1, max_risk)]
@@ -120,6 +132,12 @@ def _features(state, location):
     return venue.venue_typical_features(state, location)
 
 
+def _gear_notes(outfit):
+    low = (outfit or "").lower()
+    hits = [v for k, v in GEAR_PHYSICS.items() if k in low]
+    return " / ".join(hits[:3])
+
+
 def _claim_exposure(response, effective, baseline):
     """Let the model raise the exposure it wrote. Never lower it."""
     claimed = None
@@ -127,7 +145,8 @@ def _claim_exposure(response, effective, baseline):
         if line.strip().upper().startswith("EXPOSURE:"):
             claimed = line.split(":", 1)[1].strip().lower().strip(" .")
     final = effective
-    if claimed in venue.EXPOSURE_LADDER:
+    claimed = venue.normalise_privacy(claimed)
+    if claimed:
         final = venue.EXPOSURE_LADDER[max(venue.exposure_rank(claimed),
                                           venue.exposure_rank(effective))]
     kept = "\n".join(l for l in response.splitlines()
@@ -141,9 +160,10 @@ async def generate_task_text(state, session, *, voice, depth=0):
     location = state.get("location") or "Unknown"
     rooms = state.get("rooms") or []
     others = state.get("context_others") or "alone"
-    privacy = state.get("privacy") or "private"
+    privacy = state.get("privacy") or ""
     actual_risk = weighted_risk(max_risk)
     outfit = state.get("outfit_detail") or state.get("current_outfit") or "clothing"
+    gear = _gear_notes(outfit)
 
     blockers = session.query(LocationConstraint).filter(
         LocationConstraint.user_id == state.user_id,
@@ -151,16 +171,20 @@ async def generate_task_text(state, session, *, voice, depth=0):
         LocationConstraint.expires_at > datetime.now(timezone.utc)).all()
     blockers_text = "\n".join(f"- {b.constraint}" for b in blockers) if blockers else "none"
 
-    baseline_privacy = privacy
-    move, delta = None, 0
-    if (venue.exposure_rank(baseline_privacy) < 2
-            and random.random() < float(os.getenv("EXPOSURE_CHANCE", "0.35"))):
-        move, delta = venue.pick_exposure(state, [b.constraint for b in blockers])
+    stated = venue.normalise_privacy(privacy)
+    default = venue.privacy_default(location)
+    baseline_privacy = stated or default
+    mismatch = bool(stated) and venue.exposure_rank(stated) < venue.exposure_rank(default)
 
-    effective = venue.effective_privacy(baseline_privacy, delta)
+    move, target = None, 0
+    if random.random() < float(os.getenv("EXPOSURE_CHANCE", "0.35")):
+        move, target = venue.pick_exposure(state, baseline_privacy,
+                                           [b.constraint for b in blockers])
+
+    effective = venue.effective_privacy(baseline_privacy, target)
+    delta = max(0, venue.exposure_rank(effective) - venue.exposure_rank(baseline_privacy))
     actual_risk = min(5, actual_risk + delta)
-    if venue.exposure_rank(effective) >= 2:
-        actual_risk = max(actual_risk, 2)
+    actual_risk = max(actual_risk, min(5, venue.exposure_rank(effective) + 1))
 
     yes_kinks = get_user_kinks(state, "yes")
     okay_kinks = get_user_kinks(state, "okay")
@@ -196,19 +220,27 @@ async def generate_task_text(state, session, *, voice, depth=0):
     feature_block = (f"\nTypical of a place like this, some of which she has not mentioned: "
                      f"{features}") if features else ""
     rooms_line = f"\nRooms in play: {', '.join(rooms)}" if rooms else ""
-    move_line = f"{move} (+{delta} exposure)" if move else "stays where it is"
+
+    move_line = (f"{move} - you are now {effective} "
+                 f"({venue.PRIVACY_DESC[effective].lower()})" if move else "stays where it is")
+    reconcile = ""
+    if mismatch:
+        reconcile = (f"Note: they say {venue.PRIVACY_DESC[stated].lower()}, but a {location} is "
+                     f"normally {venue.PRIVACY_LABELS[default].lower()}. Have the task say why it "
+                     f"is quiet - time of day, closed, empty lane - or let someone appear.\n")
     ceiling = (" - past your usual ceiling, and worth it"
                if delta and actual_risk > max_risk else "")
 
     prompt = f"""Write ONE task for a {gender} sub. Stay in voice, but obey the format exactly.
 
 Location: {location}{rooms_line}{detail_block}{feature_block}
-Context: {others}, {privacy} privacy
-Baseline privacy: {baseline_privacy}
-This one steps out: {move_line}
-Effective exposure if you use it: {effective}
+Context: {others}, {baseline_privacy} privacy
+Privacy: {baseline_privacy} - {venue.PRIVACY_DESC[baseline_privacy]}
+{reconcile}This setting changes that: {move_line}
+Cover during the task: {effective}
 Risk: {actual_risk}/5 - {RISK_LEVELS[actual_risk]['description']}{ceiling}
 Wearing: {outfit}
+Gear physics - obey these: {gear or "nothing special"}
 Anatomy - only these exist{anatomy_note}: {anatomy}
 DESIRED: {', '.join(yes_kinks) or 'none'}
 USE: {', '.join(selected)}
@@ -227,25 +259,33 @@ Work in this order:
 4. Write the task around that single setting.
 
 Rules:
-- Single action, photo proof required
+- Single action, one photo, photo proof required
 - No time durations
 - Never use: {', '.join(forbidden) or 'nothing'}
 - Name the chosen setting. Mention ONE supporting detail at most. Do not enumerate other features.
 - If the best setting is not in the sample, use it anyway as long as the venue supports it
 - Use a listed detail only if the task needs it. The sample is a guide, not a menu.
 - Never name a body part the sub does not have
+- Obey the gear physics. Never claim an erection in a cage, never ask a blindfolded sub to frame a shot.
+- Only hedge about gear that is not already in Wearing. If it is listed, treat it as fact.
 - Stay inside the rooms in play
-- If a way out is offered, the task happens at the threshold - one step past the door,
-  one foot on the balcony. Name the exit and what is on the other side of it.
+- Open with one clause grounding the privacy claim: "the place is dead", "it is early", "the door is locked"
+- If the setting costs cover, the task happens at that threshold - name the exit and what is on
+  the other side of it, then write the task at the new level
 - Do not put the sub fully outside. One step is enough.
-- The sub photographs one-handed. If the action needs both hands, state how to prop the phone.
+- Moving somewhere with fewer people is the escape if it gets too much
+- Say what the photo must show, concretely - the thing, and how much of the body is in frame
+- ALWAYS state where the phone goes - floor, shelf, propped, timer, mirror. Every task.
+- Direction must be physically true. Kneeling means looking down at yourself.
+- If you name a surface, name a real material: "the tiled floor", "the lane boards".
+- Say "the photo", never "photos"
 - Trust the outfit description over the outfit label
 - Favour the specific over the generic
 
 Reply exactly:
 TASK: <the task, naming the setting>
 SETTING: <the setting, 2-5 words>
-EXPOSURE: <private|semi|exposed|public>"""
+EXPOSURE: <alone|caught|about|watched>"""
 
     response = await venice.chat([{"role": "user", "content": prompt}], voice, temperature=0.95)
     if response:

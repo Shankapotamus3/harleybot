@@ -299,9 +299,10 @@ async def generate_probes(location, rooms=None, known=None):
 
 async def generate_rooms(location):
     prompt = (f"List up to 8 parts of a {location} that a photo task could be set in. "
-              f"Short labels, one to three words, the way someone who works there would name them: "
-              f"\"the lane\", \"the shoe counter\", \"the car park\". "
-              f"Only parts that actually exist in one. One per line, no numbering.")
+              f"Short labels, one to three words, the way someone who actually goes there would "
+              f"name them: \"the lane\", \"the shoe counter\", \"the car park\". "
+              f"Use the vocabulary of that specific kind of place - do not import words from "
+              f"other venues. Only parts that exist in one. One per line, no numbering.")
     return await _probe_call(prompt, 8, 3)
 
 

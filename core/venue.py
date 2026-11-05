@@ -30,7 +30,7 @@ VENUE_ALIASES = {
     "Supermarket": ["supermarket", "grocery", "shopping", "mall"],
     "Park": ["park", "garden", "common", "woods", "forest"],
     "Beach": ["beach", "shore", "seafront", "sand", "coast"],
-    "Bowling": ["bowling", "ten pin", "tenpin"],
+    "Bowling": ["bowling", "ten pin", "tenpin", "concourse"],
     "Arcade": ["arcade", "amusement"],
     "Library": ["library"],
     "Museum": ["museum", "gallery"],
@@ -59,7 +59,7 @@ VENUE_BASELINE = {
     "Supermarket": "trolley, shelf edge, freezer door, aisle end, checkout counter, mirror",
     "Park": "bench, tree trunk, railing, path, gate, hedge",
     "Beach": "railing, breakwater, dunes, beach hut, shoreline, promenade wall",
-    "Bowling": "ball return, scoring console, foul line, lane, vinyl seating, shoe rack, arcade cabinet",
+    "Bowling": "ball return, scoring console, foul line, lane boards, concourse, vinyl seating, shoe rack, arcade cabinet",
     "Arcade": "cabinet edge, change machine, stool, counter, doorway, corner",
     "Library": "stack aisle, reading table, study carrel, returns trolley, window seat",
     "Museum": "gallery bench, plinth, alcove, stairwell, cloakroom, roped-off corner",
@@ -100,6 +100,7 @@ ROOM_OPTIONS = {
         "lane": "foul line, lane boards, gutter, pin deck",
         "approach": "approach dots, ball rack, seating behind",
         "ball return": "return rails, ball cradle, console edge",
+        "concourse": "tiled floor, shoe rack, bench, bin",
         "seating": "vinyl bench, low table, coat hook",
         "arcade": "cabinet edge, change machine, stool",
         "shoe counter": "counter edge, rack, bench",
@@ -210,26 +211,68 @@ def notes_for_prompt(state, location, limit=8):
     return ", ".join(items)
 
 
-# ============ EXPOSURE ============
-EXPOSURE_LADDER = ["private", "semi", "exposed", "public"]
+# ============ PRIVACY ============
+# Ordered by how observed you are, not by venue class. Each level is a claim
+# about right now, so the sub's answer wins over the venue.
+PRIVACY_LEVELS = [
+    ("alone", "Nobody around", "Nobody can see you and nobody can walk in."),
+    ("caught", "Could be caught", "You're alone for now, but someone could appear at any moment."),
+    ("about", "People about", "People are around, but none of them are watching you."),
+    ("watched", "Being watched", "People are looking at you or talking to you. Nowhere to hide without moving."),
+]
+EXPOSURE_LADDER = [k for k, _, _ in PRIVACY_LEVELS]
+PRIVACY_LABELS = {k: short for k, short, _ in PRIVACY_LEVELS}
+PRIVACY_DESC = {k: desc for k, _, desc in PRIVACY_LEVELS}
 
-# Ways a task can step outside the room. Second value is how many rungs up.
-EXPOSURE_MOVES = {
-    "Home": [("step onto the balcony", 2), ("out the front door onto the step", 2),
-             ("into the hallway past your own door", 1),
-             ("up to the window with the curtain open", 1)],
-    "Hotel": [("into the corridor with the door left ajar", 2),
-              ("out onto the balcony", 2), ("down to the lobby", 2),
-              ("by the window with the curtain open", 1)],
-    "Gym": [("out to the car park", 2), ("into the changing corridor", 1)],
-    "Bar": [("out the front for a moment", 1), ("into the smoking area", 1)],
-    "Bowling": [("back to the car park", 2), ("into the arcade where it is darker", 1)],
-    "Work": [("into the stairwell", 1), ("out to the car park", 2)],
-    "Library": [("into the entrance foyer", 1), ("out onto the steps", 2)],
-    "Launderette": [("out to the pavement", 2)],
-    "Vehicle": [("out of the car", 1)],
-    "Generic": [("into the corridor", 1), ("just outside the door", 2)],
+# Rows written before this existed.
+LEGACY_PRIVACY = {"private": "alone", "semi": "caught",
+                  "exposed": "about", "public": "watched"}
+
+# Only a default now, used when nothing is set. Never overrides a choice.
+VENUE_PRIVACY = {
+    "Home": "alone", "Hotel": "alone", "Studio": "alone",
+    "Vehicle": "caught", "Work": "caught", "Sauna": "caught",
+    "Doctor": "caught", "Generic": "caught",
+    "Gym": "about", "Pool": "about", "Bar": "about", "Restaurant": "about",
+    "Cinema": "about", "Rooftop": "about", "Bowling": "about",
+    "Arcade": "about", "Beach": "about", "Park": "about",
+    "Supermarket": "watched", "Retail Store": "watched", "Library": "watched",
+    "Museum": "watched", "Airport": "watched", "Launderette": "watched",
+    "Church": "watched",
 }
+
+# What a setting does to your cover, mid-task. The number is the FLOOR that
+# setting implies, not an amount to add: a balcony is level 2 whether you
+# started at 0 or 1.
+EXPOSURE_MOVES = {
+    "Home": [("the door left on the latch", 1),
+             ("step onto the balcony the street can see", 2),
+             ("out to the front step", 2),
+             ("someone knocks at the front door", 2)],
+    "Hotel": [("the corridor door left ajar, footsteps going past", 1),
+              ("out onto the balcony", 2), ("down to the lobby", 2)],
+    "Bowling": [("a staff member walks the concourse behind you", 2),
+                ("back to the car park", 2)],
+    "Gym": [("someone comes into the changing corridor", 2),
+            ("out to the car park", 2)],
+    "Bar": [("someone comes out for a smoke", 2)],
+    "Work": [("someone takes the stairwell", 1), ("out to the car park", 2)],
+    "Library": [("someone walks the stack aisle", 1), ("out onto the steps", 2)],
+    "Launderette": [("someone comes in with a basket", 2),
+                    ("out to the pavement", 2)],
+    "Vehicle": [("someone parks alongside", 2)],
+    "Generic": [("footsteps in the corridor", 1), ("just outside the door", 2)],
+}
+
+
+def normalise_privacy(value):
+    value = (value or "").strip().lower()
+    value = LEGACY_PRIVACY.get(value, value)
+    return value if value in PRIVACY_DESC else ""
+
+
+def privacy_default(location):
+    return VENUE_PRIVACY.get(get_probe_key(location), VENUE_PRIVACY["Generic"])
 
 
 def exposure_rank(level):
@@ -239,20 +282,24 @@ def exposure_rank(level):
         return 0
 
 
-def effective_privacy(baseline, delta):
-    return EXPOSURE_LADDER[min(3, exposure_rank(baseline) + delta)]
+def effective_privacy(baseline, target):
+    """A setting sets a floor. It never lowers cover."""
+    return EXPOSURE_LADDER[max(exposure_rank(baseline), min(3, target))]
 
 
-def pick_exposure(state, blockers=()):
-    """One way out of this venue, or (None, 0). Respects active blockers."""
+def pick_exposure(state, baseline, blockers=()):
+    """Only moves that actually cost cover. (None, 0) if none do."""
     place = state.get("venue") or state.get("location") or ""
     moves = EXPOSURE_MOVES.get(get_probe_key(place), EXPOSURE_MOVES["Generic"])
+    here = exposure_rank(baseline)
     live = []
-    for move, delta in moves:
+    for move, target in moves:
+        if target <= here:
+            continue
         words = [w for w in move.split() if len(w) > 3]
         if any(w in (b or "").lower() for b in blockers for w in words):
             continue
-        live.append((move, delta))
+        live.append((move, target))
     if not live:
         return None, 0
     return random.choice(live)

@@ -34,7 +34,7 @@ class UserState(Base):
     last_kinks_used = Column(Text, default=None)
     context_alone = Column(Boolean, default=True)
     context_others = Column(String(100), default=None)
-    context_privacy = Column(String(20), default="private")
+    context_privacy = Column(String(20), default="alone")
     risk_level = Column(Integer, default=5)
     risk_pre_kids = Column(Integer, default=None)
     points = Column(Integer, default=0)
