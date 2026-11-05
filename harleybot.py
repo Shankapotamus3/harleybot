@@ -39,6 +39,7 @@ HARLEY_VARIANTS = {
 DEFAULT_VARIANT = "vagina"
 USE_LOCATION = os.environ.get("IMAGE_USE_LOCATION", "0") == "1"
 TASK_PIC_CHANCE = float(os.getenv("TASK_PIC_CHANCE", "0.3"))
+REWARD_POINTS = int(os.getenv("REWARD_POINTS", "200"))
 
 HARLEY_VOICE = """You are Harley Quinn - Domme, chaotic, delighted by your own cruelty.
 You run your sub's training. You are the boss and you both know it.
@@ -369,7 +370,7 @@ async def start_cmd(update, context):
     await update.effective_message.reply_text(
         f"Harley here.\n\n{state.get('location') or 'No location set'} | "
         f"{state.get('intensity') or 'standard'} | cover: {venue.PRIVACY_LABELS[cover]} | "
-        f"{state.get('points') or 0} pts",
+        f"{state.get('points') or 0}/{REWARD_POINTS} pts",
         reply_markup=main_menu())
 
 
@@ -395,6 +396,7 @@ async def settings_cmd(update, context):
         f"reward model: {state.get('reward_model') or venice.IMAGE_MODEL_REWARD}\n"
         f"location: {state.get('location') or 'unset'}\n"
         f"task pic chance: {TASK_PIC_CHANCE}\n"
+        f"reward at: {REWARD_POINTS} pts\n"
         f"points: {state.get('points') or 0} streak: {state.get('streak') or 0}",
         reply_markup=main_menu())
 
@@ -792,10 +794,11 @@ async def status_cmd(update, context):
 
 async def rewards_cmd(update, context):
     state = st.get_state(update.effective_user.id)
-    need = tk.reward_threshold(state.get("streak") or 0)
+    pts = state.get("points") or 0
+    left = max(0, REWARD_POINTS - pts)
     await update.effective_message.reply_text(
-        f"Every {need} completions earns a reward.\nStreak {state.get('streak') or 0} | "
-        f"progress {state.get('challenges_since_reward') or 0}/{need}\n\n/reward to trigger one now.")
+        f"Rewards fire on their own at {REWARD_POINTS} points, then take {REWARD_POINTS} back.\n\n"
+        f"Points: {pts}\n{left} to go.\n\n/reward triggers one now without spending.")
 
 
 async def complete_callback(update, context):
@@ -969,22 +972,21 @@ async def handle_photo(update, context):
             task.cloudinary_url, task.cloudinary_public_id = up["url"], up["public_id"]
 
         if verified == "yes":
+            gain = 10 * task.risk_level
             task.status, task.completed_at, task.photo_url = "completed", now, photo.file_id
             task.followup_target = None
             context.user_data.pop("blocked_task_id", None)
-            state["points"] = (state.get("points") or 0) + 10 * task.risk_level
+            state["points"] = (state.get("points") or 0) + gain
             state["streak"] = (state.get("streak") or 0) + 1
             state["completed_tasks"] = (state.get("completed_tasks") or 0) + 1
-            state["challenges_since_reward"] = (state.get("challenges_since_reward") or 0) + 1
+            due = (state.get("points") or 0) >= REWARD_POINTS
+            if due:
+                state["points"] = max(0, (state.get("points") or 0) - REWARD_POINTS)
             session.commit()
-            gain = 10 * task.risk_level
-            need = tk.reward_threshold(state["streak"], task.exposure or 0)
-            if state["challenges_since_reward"] >= need:
-                state["challenges_since_reward"] = 0
-                await update.message.reply_text(f"+{gain}. Streak {state['streak']}.")
+            await update.message.reply_text(
+                f"+{gain}. Streak {state['streak']}. {state.get('points') or 0} pts.")
+            if due:
                 await ask_reward(update, context, user.id)
-            else:
-                await update.message.reply_text(f"+{gain}. Streak {state['streak']}.")
             return
 
         if task.verification_attempts >= 3:
