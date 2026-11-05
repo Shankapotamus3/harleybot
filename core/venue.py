@@ -264,6 +264,38 @@ EXPOSURE_MOVES = {
     "Generic": [("footsteps in the corridor", 1), ("just outside the door", 2)],
 }
 
+# Quieter ground inside the same venue, for when the level is already high.
+COVER_SPOTS = {
+    "Home": ["the hallway", "the far corner of the room", "behind the door"],
+    "Hotel": ["the bathroom", "the lift alcove", "the end of the corridor"],
+    "Bowling": ["the arcade corner", "the far end of the concourse", "the toilets"],
+    "Bar": ["the far end of the bar", "outside", "the toilets"],
+    "Gym": ["the changing corridor", "the corner behind the racks", "the car park"],
+    "Supermarket": ["the far aisle", "the stockroom door", "the car park"],
+    "Retail Store": ["the changing room", "the back of the shop", "the car park"],
+    "Library": ["the far stack aisle", "behind the returns trolley", "the foyer"],
+    "Museum": ["the roped-off corner", "the stairwell", "the cloakroom"],
+    "Pool": ["the changing cubicle", "the far end of the poolside", "the showers"],
+    "Cinema": ["the back row", "the aisle", "the foyer"],
+    "Airport": ["the toilets", "the far gate seating", "the window over the apron"],
+    "Launderette": ["behind the open machine door", "the corner by the sink", "the pavement"],
+    "Work": ["the stairwell", "the toilets", "the car park"],
+    "Park": ["behind the hedge", "the far path", "behind a tree"],
+    "Beach": ["the dunes", "behind the breakwater", "the beach hut"],
+    "Church": ["a side aisle", "behind a pillar", "the porch"],
+    "Rooftop": ["behind the stair hut", "the far parapet", "behind the vent housing"],
+    "Generic": ["a corner", "the corridor", "just outside"],
+}
+
+COVER_WORDS = ("no cover", "nowhere", "can't hide", "cant hide", "no hiding",
+               "open plan", "open space", "nowhere private", "nowhere to hide",
+               "in the open", "nowhere to stand")
+
+
+def is_no_cover(text):
+    low = (text or "").lower()
+    return any(w in low for w in COVER_WORDS)
+
 
 def normalise_privacy(value):
     value = (value or "").strip().lower()
@@ -303,3 +335,8 @@ def pick_exposure(state, baseline, blockers=()):
     if not live:
         return None, 0
     return random.choice(live)
+
+
+def cover_hint(location):
+    spots = COVER_SPOTS.get(get_probe_key(location), COVER_SPOTS["Generic"])
+    return random.choice(spots)

@@ -6,15 +6,19 @@ from .state import LocationConstraint
 
 logger = logging.getLogger(__name__)
 
+PROP_CHANCE = float(os.getenv("PROP_CHANCE", "0.15"))
+
 RISK_LEVELS = {
-    1: {"name": "Safe", "description": "Private, no exposure, completely controlled environment"},
-    2: {"name": "Low", "description": "Private with minor vulnerability (unlocked door, thin walls)"},
-    3: {"name": "Medium", "description": "Semi-private (near windows, balcony, could be heard/seen)"},
-    4: {"name": "High", "description": "Semi-public (visible areas, shared spaces, immediate exposure risk)"},
-    5: {"name": "Extreme", "description": "Public-adjacent (hallways, stairwells, high exposure possible)"},
+    1: {"name": "Comfortable", "description": "Nothing comes off, clothing shifted aside"},
+    2: {"name": "Mild", "description": "A hem or waistband moved, one quick moment"},
+    3: {"name": "Committed", "description": "Whatever is over the subject, opened properly"},
+    4: {"name": "Bold", "description": "That, taken far enough that nothing is in the way of the shot"},
+    5: {"name": "Brazen", "description": "Off entirely, or stripped right down - only if the cover carries it"},
 }
 
 RISK_WEIGHTS = {1: 5, 2: 5, 3: 20, 4: 30, 5: 40}
+
+INTENSITY_SHIFT = {"gentle": -1, "standard": 0, "harsh": 1}
 
 GENDER_GUIDELINES = {
     "male": {"body_parts": ["flat chest", "abs", "cock", "balls", "ass"],
@@ -94,16 +98,37 @@ FALLBACKS = {
 
 MAX_FEATURES = 6
 
-# What worn gear physically permits. Substring-matched against Wearing.
+# What worn gear physically permits, including how it is reached.
 GEAR_PHYSICS = {
-    "cage": "a caged cock cannot get erect - it strains, fills the cage, bulges between the bars",
-    "chastity": "caged means no erection - straining, plumping, bulging against the bars",
+    "cage": "worn on the cock - nothing shows until the trousers are open and pulled below it, "
+            "underwear with them. A shirt off reveals nothing.",
+    "chastity": "same as a cage - trousers open and down past it, underwear pulled below. "
+                "Shirt is irrelevant to the shot.",
     "blindfold": "a blindfolded sub cannot see the phone - give a timer, a count, or a mirror",
     "rope": "roped arms cannot hold the phone",
     "cuffs": "cuffed wrists mean the phone is propped or on a timer",
     "plug": "sitting means the weight is on the plug",
     "collar": "a collar means a leash is available",
     "heels": "heels change the stance and the balance",
+}
+
+# How much comes off, by risk. Above "caught" this is only legal if the cover in
+# the task can carry it.
+SKIN_BY_RISK = {
+    1: "the item over the subject shifted aside, nothing off",
+    2: "the item over the subject opened, one quick moment",
+    3: "the item over the subject opened properly and pulled clear - shirt hem up, or trousers "
+       "and underwear down past the hip",
+    4: "as above, and taken far enough that there is nothing in the way of the shot",
+    5: "that item off entirely, or stripped right down - only if the cover allows it",
+}
+
+COVER_BEATS = {
+    "alone": "no cover needed - take your time",
+    "caught": "keep it quick and low, phone close to the body, have something to hand",
+    "about": "turn away from the room or put something solid between you and them - name it",
+    "watched": "cover is compulsory: behind something solid, in an alcove, facing the wall, or wait "
+               "for the sightline to clear. Name it, and say what you are waiting for",
 }
 
 
@@ -156,12 +181,11 @@ def _claim_exposure(response, effective, baseline):
 
 async def generate_task_text(state, session, *, voice, depth=0):
     gender = state.get("gender") or "nonbinary"
-    max_risk = state.get("risk_level") or 5
     location = state.get("location") or "Unknown"
     rooms = state.get("rooms") or []
     others = state.get("context_others") or "alone"
     privacy = state.get("privacy") or ""
-    actual_risk = weighted_risk(max_risk)
+    intensity = state.get("intensity") or "standard"
     outfit = state.get("outfit_detail") or state.get("current_outfit") or "clothing"
     gear = _gear_notes(outfit)
 
@@ -170,6 +194,7 @@ async def generate_task_text(state, session, *, voice, depth=0):
         LocationConstraint.location == location,
         LocationConstraint.expires_at > datetime.now(timezone.utc)).all()
     blockers_text = "\n".join(f"- {b.constraint}" for b in blockers) if blockers else "none"
+    no_cover = any(venue.is_no_cover(b.constraint) for b in blockers)
 
     stated = venue.normalise_privacy(privacy)
     default = venue.privacy_default(location)
@@ -183,8 +208,17 @@ async def generate_task_text(state, session, *, voice, depth=0):
 
     effective = venue.effective_privacy(baseline_privacy, target)
     delta = max(0, venue.exposure_rank(effective) - venue.exposure_rank(baseline_privacy))
-    actual_risk = min(5, actual_risk + delta)
-    actual_risk = max(actual_risk, min(5, venue.exposure_rank(effective) + 1))
+
+    actual_risk = venue.exposure_rank(effective) + 1 + INTENSITY_SHIFT.get(intensity, 0)
+    if venue.exposure_rank(effective) >= 2:
+        actual_risk += 1
+    if no_cover:
+        actual_risk -= 1
+    actual_risk = max(1, min(5, actual_risk))
+    if no_cover:
+        actual_risk = min(4, actual_risk)
+
+    needs_prop = random.random() < PROP_CHANCE
 
     yes_kinks = get_user_kinks(state, "yes")
     okay_kinks = get_user_kinks(state, "okay")
@@ -221,6 +255,12 @@ async def generate_task_text(state, session, *, voice, depth=0):
                      f"{features}") if features else ""
     rooms_line = f"\nRooms in play: {', '.join(rooms)}" if rooms else ""
 
+    cover_beat = COVER_BEATS[effective]
+    cover_spot = venue.cover_hint(location) if venue.exposure_rank(effective) >= 2 else ""
+    if no_cover:
+        cover_beat = ("no cover here - keep it to one item, shoot close to the body, and use a wall "
+                      "you can face. Brief and accepted beats hidden and impossible.")
+
     move_line = (f"{move} - you are now {effective} "
                  f"({venue.PRIVACY_DESC[effective].lower()})" if move else "stays where it is")
     reconcile = ""
@@ -228,17 +268,22 @@ async def generate_task_text(state, session, *, voice, depth=0):
         reconcile = (f"Note: they say {venue.PRIVACY_DESC[stated].lower()}, but a {location} is "
                      f"normally {venue.PRIVACY_LABELS[default].lower()}. Have the task say why it "
                      f"is quiet - time of day, closed, empty lane - or let someone appear.\n")
-    ceiling = (" - past your usual ceiling, and worth it"
-               if delta and actual_risk > max_risk else "")
+    no_cover_line = ("No cover at this location. Write so nobody sees, or let it be brief and seen.\n"
+                     if no_cover else "")
+    phone_line = ("propped, timed, or on a mirror - say what, in three words" if needs_prop
+                  else "in one hand, nothing put down")
 
     prompt = f"""Write ONE task for a {gender} sub. Stay in voice, but obey the format exactly.
 
 Location: {location}{rooms_line}{detail_block}{feature_block}
 Context: {others}, {baseline_privacy} privacy
 Privacy: {baseline_privacy} - {venue.PRIVACY_DESC[baseline_privacy]}
-{reconcile}This setting changes that: {move_line}
+{reconcile}{no_cover_line}This setting changes that: {move_line}
 Cover during the task: {effective}
-Risk: {actual_risk}/5 - {RISK_LEVELS[actual_risk]['description']}{ceiling}
+Cover (required): {cover_beat}{f" - available here: {cover_spot}" if cover_spot else ""}
+Risk: {actual_risk}/5 - {RISK_LEVELS[actual_risk]['description']}
+Skin for risk {actual_risk}: {SKIN_BY_RISK[actual_risk]}
+Phone: {phone_line}
 Wearing: {outfit}
 Gear physics - obey these: {gear or "nothing special"}
 Anatomy - only these exist{anatomy_note}: {anatomy}
@@ -267,15 +312,24 @@ Rules:
 - Use a listed detail only if the task needs it. The sample is a guide, not a menu.
 - Never name a body part the sub does not have
 - Obey the gear physics. Never claim an erection in a cage, never ask a blindfolded sub to frame a shot.
+- The task must expose what it photographs. If the subject is under clothing, say what moves and
+  how far - never pair "shirt off" with something the shirt does not reveal.
+- Underwear is not a separate layer to count. It moves with the garment above it.
 - Only hedge about gear that is not already in Wearing. If it is listed, treat it as fact.
 - Stay inside the rooms in play
 - Open with one clause grounding the privacy claim: "the place is dead", "it is early", "the door is locked"
-- If the setting costs cover, the task happens at that threshold - name the exit and what is on
-  the other side of it, then write the task at the new level
+- Above "caught", the task must name its cover: what is between you and them, or what you are
+  waiting for. "Turned away" alone is not cover for a strip.
+- Cover must match the skin. If it cannot, reduce the skin by one band rather than dropping the cover.
+- If the person is stripped, the cover has to sit between them and every approach, not just the
+  one you can see.
 - Do not put the sub fully outside. One step is enough.
-- Moving somewhere with fewer people is the escape if it gets too much
+- Waiting is described as an event, not a duration: "until the group at the counter turns away".
+- The phone is in one hand by default. Undress FIRST, then take the photo - do not try to do both.
+- Only use a prop when the thing being photographed is in both hands, or the shot needs distance.
+- If you use a prop, say what it is in three words or fewer. No elaborate rigs.
+- A mirror counts as a prop. Do not reach for one unless the shot needs the front of the body.
 - Say what the photo must show, concretely - the thing, and how much of the body is in frame
-- ALWAYS state where the phone goes - floor, shelf, propped, timer, mirror. Every task.
 - Direction must be physically true. Kneeling means looking down at yourself.
 - If you name a surface, name a real material: "the tiled floor", "the lane boards".
 - Say "the photo", never "photos"

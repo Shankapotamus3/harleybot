@@ -36,6 +36,7 @@ class UserState(Base):
     context_others = Column(String(100), default=None)
     context_privacy = Column(String(20), default="alone")
     risk_level = Column(Integer, default=5)
+    intensity = Column(String(20), default="standard")
     risk_pre_kids = Column(Integer, default=None)
     points = Column(Integer, default=0)
     streak = Column(Integer, default=0)
@@ -180,7 +181,7 @@ _PERSIST = {
     "recent_settings": "recent_settings", "last_kinks_used": "last_kinks_used",
     "outfit_detail": "outfit_detail", "current_outfit": "current_outfit",
     "outfit_items": "outfit_items", "gender": "gender",
-    "risk_level": "risk_level", "risk_pre_kids": "risk_pre_kids",
+    "risk_level": "risk_level", "intensity": "intensity", "risk_pre_kids": "risk_pre_kids",
     "points": "points", "streak": "streak", "completed_tasks": "completed_tasks",
     "consecutive_failures": "consecutive_failures",
     "challenges_since_reward": "challenges_since_reward",
