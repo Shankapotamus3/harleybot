@@ -260,21 +260,14 @@ def parse_probe_lines(content):
     return out
 
 
-async def generate_probes(location, rooms=None, known=None):
-    known = known or []
-    where = f"a {location}, specifically the {', '.join(rooms)}" if rooms else f"a {location}"
-    avoid = f"\nDo NOT repeat any of these: {', '.join(known[:20])}." if known else ""
-    prompt = (f"List 8 concrete physical features of {where} that someone could use for exposure "
-              f"or bondage play. Real, specific, mundane: \"the coat hooks\", \"the mirror over the "
-              f"sink\". No abstractions, no room names, no furniture categories. One per line, no "
-              f"numbering.{avoid}")
+async def _probe_call(prompt, limit=8, minimum=4):
     for model in PROBE_MODELS:
         for attempt in range(2):
             try:
                 r = await asyncio.to_thread(
                     requests.post, f"{API}/chat/completions", headers=headers(),
                     json={"model": model, "messages": [{"role": "user", "content": prompt}],
-                          "temperature": 0.8, "max_tokens": 220}, timeout=25)
+                          "temperature": 0.8, "max_tokens": 260}, timeout=25)
             except Exception as e:
                 logger.warning(f"probe {model}: {e}")
                 break
@@ -284,7 +277,37 @@ async def generate_probes(location, rooms=None, known=None):
             if r.status_code != 200:
                 break
             items = parse_probe_lines(r.json()["choices"][0]["message"]["content"])
-            if len(items) >= 4:
-                return items[:8]
+            if len(items) >= minimum:
+                return items[:limit]
             break
     return []
+
+
+async def generate_probes(location, rooms=None, known=None):
+    """What the room can carry, not what it contains."""
+    known = known or []
+    where = f"a {location}, specifically the {', '.join(rooms)}" if rooms else f"a {location}"
+    avoid = f"\nDo NOT repeat any of these: {', '.join(known[:20])}." if known else ""
+    prompt = (f"List 8 things in {where} that a photo task could be built around. "
+              f"Think about what a task needs, not what the room contains: something to bend over, "
+              f"something to hold or tie to, something to kneel on, a mirror at a usable angle, "
+              f"a door that shuts, something overhead, a hard or cold surface. "
+              f"Name the object and where it is: \"towel rail by the shower\". "
+              f"Real and specific, one per line, no numbering.{avoid}")
+    return await _probe_call(prompt, 8, 4)
+
+
+async def generate_rooms(location):
+    prompt = (f"List up to 8 parts of a {location} that a photo task could be set in. "
+              f"Short labels, one to three words, the way someone who works there would name them: "
+              f"\"the lane\", \"the shoe counter\", \"the car park\". "
+              f"Only parts that actually exist in one. One per line, no numbering.")
+    return await _probe_call(prompt, 8, 3)
+
+
+async def generate_venue_typical(location):
+    prompt = (f"List 8 physical things a {location} definitely has. Mundane and specific: "
+              f"\"the ball return\", \"the scoring console\", \"the shoe rack\". "
+              f"No abstractions, no room names, no furniture categories. "
+              f"One per line, no numbering.")
+    return await _probe_call(prompt, 8, 3)

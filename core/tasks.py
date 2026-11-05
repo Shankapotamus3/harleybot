@@ -1,5 +1,5 @@
 # core/tasks.py
-import re, random, logging
+import re, os, random, logging
 from datetime import datetime, timezone
 from . import venue, venice
 from .state import LocationConstraint
@@ -111,19 +111,28 @@ def get_user_kinks(state, level=None):
     return out
 
 
-def reward_threshold(streak):
-    return max(3, random.randint(5, 10) - min(3, streak // 5))
+def reward_threshold(streak, exposure=0):
+    return max(3, random.randint(5, 10) - min(3, streak // 5) - min(2, exposure))
 
 
 def _features(state, location):
-    """A short candidate list, not the whole venue dump."""
-    notes = (state.get("location_notes") or "").strip()
-    if notes:
-        return ""
-    raw = venue.venue_baseline(state, location)
-    items = [i.strip() for i in raw.split(",") if i.strip()]
-    random.shuffle(items)
-    return ", ".join(items[:MAX_FEATURES])
+    """A short shuffled sample of what a place like this has. Never the full list."""
+    return venue.venue_typical_features(state, location)
+
+
+def _claim_exposure(response, effective, baseline):
+    """Let the model raise the exposure it wrote. Never lower it."""
+    claimed = None
+    for line in response.splitlines():
+        if line.strip().upper().startswith("EXPOSURE:"):
+            claimed = line.split(":", 1)[1].strip().lower().strip(" .")
+    final = effective
+    if claimed in venue.EXPOSURE_LADDER:
+        final = venue.EXPOSURE_LADDER[max(venue.exposure_rank(claimed),
+                                          venue.exposure_rank(effective))]
+    kept = "\n".join(l for l in response.splitlines()
+                     if not l.strip().upper().startswith("EXPOSURE:"))
+    return kept.strip(), final
 
 
 async def generate_task_text(state, session, *, voice, depth=0):
@@ -136,12 +145,29 @@ async def generate_task_text(state, session, *, voice, depth=0):
     actual_risk = weighted_risk(max_risk)
     outfit = state.get("outfit_detail") or state.get("current_outfit") or "clothing"
 
+    blockers = session.query(LocationConstraint).filter(
+        LocationConstraint.user_id == state.user_id,
+        LocationConstraint.location == location,
+        LocationConstraint.expires_at > datetime.now(timezone.utc)).all()
+    blockers_text = "\n".join(f"- {b.constraint}" for b in blockers) if blockers else "none"
+
+    baseline_privacy = privacy
+    move, delta = None, 0
+    if (venue.exposure_rank(baseline_privacy) < 2
+            and random.random() < float(os.getenv("EXPOSURE_CHANCE", "0.35"))):
+        move, delta = venue.pick_exposure(state, [b.constraint for b in blockers])
+
+    effective = venue.effective_privacy(baseline_privacy, delta)
+    actual_risk = min(5, actual_risk + delta)
+    if venue.exposure_rank(effective) >= 2:
+        actual_risk = max(actual_risk, 2)
+
     yes_kinks = get_user_kinks(state, "yes")
     okay_kinks = get_user_kinks(state, "okay")
     forbidden = [k.replace("kink_", "") for k in KINK_CATEGORIES
                  if (state.get(k) or "okay") == "no"]
     if not yes_kinks and not okay_kinks:
-        return FALLBACKS[actual_risk].format(loc=location), actual_risk
+        return (FALLBACKS[actual_risk].format(loc=location), actual_risk, delta, effective)
 
     selected = []
     if yes_kinks:
@@ -158,26 +184,30 @@ async def generate_task_text(state, session, *, voice, depth=0):
 
     recent = (state.get("recent_settings") or [])[-8:]
     recent_text = "\n".join(f"- {r}" for r in recent) if recent else "none yet"
-    blockers = session.query(LocationConstraint).filter(
-        LocationConstraint.user_id == state.user_id,
-        LocationConstraint.location == location,
-        LocationConstraint.expires_at > datetime.now(timezone.utc)).all()
-    blockers_text = "\n".join(f"- {b.constraint}" for b in blockers) if blockers else "none"
 
     guide = GENDER_GUIDELINES.get(gender, GENDER_GUIDELINES["nonbinary"])
     anatomy = ", ".join(guide["body_parts"])
     anatomy_note = f" ({guide['note']})" if guide["note"] else ""
-    notes = (state.get("location_notes") or "").strip()
+
+    notes = venue.notes_for_prompt(state, location)
     features = _features(state, location)
-    detail_block = f"\nWhere exactly: {notes}" if notes else ""
-    feature_block = f"\nFeatures in reach (choose ONE, do not list them): {features}" if features else ""
+    detail_block = (f"\nWhat she says is there - a sample of what is definitely available, "
+                    f"not a checklist: {notes}") if notes else ""
+    feature_block = (f"\nTypical of a place like this, some of which she has not mentioned: "
+                     f"{features}") if features else ""
     rooms_line = f"\nRooms in play: {', '.join(rooms)}" if rooms else ""
+    move_line = f"{move} (+{delta} exposure)" if move else "stays where it is"
+    ceiling = (" - past your usual ceiling, and worth it"
+               if delta and actual_risk > max_risk else "")
 
     prompt = f"""Write ONE task for a {gender} sub. Stay in voice, but obey the format exactly.
 
 Location: {location}{rooms_line}{detail_block}{feature_block}
 Context: {others}, {privacy} privacy
-Risk: {actual_risk}/5 - {RISK_LEVELS[actual_risk]['description']}
+Baseline privacy: {baseline_privacy}
+This one steps out: {move_line}
+Effective exposure if you use it: {effective}
+Risk: {actual_risk}/5 - {RISK_LEVELS[actual_risk]['description']}{ceiling}
 Wearing: {outfit}
 Anatomy - only these exist{anatomy_note}: {anatomy}
 DESIRED: {', '.join(yes_kinks) or 'none'}
@@ -190,9 +220,10 @@ RECENTLY USED HERE - prefer variety:
 {recent_text}
 
 Work in this order:
-1. Silently pick ONE setting from what is listed above.
+1. Silently list 8 settings. Draw on the sample, the typical features, and one or two things
+   a place like this would plausibly have that nobody mentioned.
 2. Cross off anything blocked.
-3. Check it fits risk {actual_risk}/5.
+3. Choose the setting that best supports risk {actual_risk}/5, preferring a room used least recently.
 4. Write the task around that single setting.
 
 Rules:
@@ -200,15 +231,21 @@ Rules:
 - No time durations
 - Never use: {', '.join(forbidden) or 'nothing'}
 - Name the chosen setting. Mention ONE supporting detail at most. Do not enumerate other features.
+- If the best setting is not in the sample, use it anyway as long as the venue supports it
+- Use a listed detail only if the task needs it. The sample is a guide, not a menu.
 - Never name a body part the sub does not have
 - Stay inside the rooms in play
+- If a way out is offered, the task happens at the threshold - one step past the door,
+  one foot on the balcony. Name the exit and what is on the other side of it.
+- Do not put the sub fully outside. One step is enough.
 - The sub photographs one-handed. If the action needs both hands, state how to prop the phone.
 - Trust the outfit description over the outfit label
 - Favour the specific over the generic
 
 Reply exactly:
 TASK: <the task, naming the setting>
-SETTING: <the setting, 2-5 words>"""
+SETTING: <the setting, 2-5 words>
+EXPOSURE: <private|semi|exposed|public>"""
 
     response = await venice.chat([{"role": "user", "content": prompt}], voice, temperature=0.95)
     if response:
@@ -220,6 +257,7 @@ SETTING: <the setting, 2-5 words>"""
         if depth < 3 and gender == "male" and "breast" in response.lower():
             logger.warning("male sub got 'breasts', retrying")
             return await generate_task_text(state, session, voice=voice, depth=depth + 1)
+        response, final = _claim_exposure(response, effective, baseline_privacy)
         setting, kept = None, []
         for line in response.splitlines():
             s = line.strip()
@@ -233,5 +271,7 @@ SETTING: <the setting, 2-5 words>"""
         if setting:
             state["recent_settings"] = (recent + [setting])[-8:]
         if response:
-            return response, actual_risk
-    return FALLBACKS[actual_risk].format(loc=location), actual_risk
+            return (response, actual_risk,
+                    max(0, venue.exposure_rank(final) - venue.exposure_rank(baseline_privacy)),
+                    final)
+    return (FALLBACKS[actual_risk].format(loc=location), actual_risk, delta, effective)

@@ -26,6 +26,7 @@ class UserState(Base):
     rooms = Column(Text, default=None)
     features = Column(Text, default=None)
     venue = Column(String(50), default=None)
+    venue_typical = Column(Text, default=None)
     pending = Column(String(50), default=None)
     reward_model = Column(String(50), default=None)
     task_model = Column(String(50), default=None)
@@ -98,6 +99,8 @@ class Task(Base):
     followup_target = Column(Text, nullable=True)
     blocked_count = Column(Integer, default=0)
     sharpness = Column(Integer, nullable=True)
+    exposure = Column(Integer, default=0)
+    exposure_label = Column(Text, nullable=True)
 
 
 class AvatarImage(Base):
@@ -171,7 +174,8 @@ def ensure_schema():
 _PERSIST = {
     "variant": "variant", "privacy": "context_privacy", "location": "location",
     "location_notes": "location_detail", "rooms": "rooms", "probes": "location_probes",
-    "features": "features", "venue": "venue", "pending": "pending",
+    "features": "features", "venue": "venue", "venue_typical": "venue_typical",
+    "pending": "pending",
     "reward_model": "reward_model", "task_model": "task_model",
     "recent_settings": "recent_settings", "last_kinks_used": "last_kinks_used",
     "outfit_detail": "outfit_detail", "current_outfit": "current_outfit",
