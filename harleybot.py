@@ -380,18 +380,24 @@ async def custom_input(update, context):
         state["rooms"] = []
         state["features"] = {}
         state["venue_typical"] = None
+        state["room_pool"] = []
         state["pending"] = None
-        notice = await msg.reply_text("Working out the layout...")
+        notice = await msg.reply_text(f"{place}. Which parts are in play?",
+                                      reply_markup=room_keyboard(place, [], []))
         try:
-            suggestions = await venice.generate_rooms(place)
-            typical = await venice.generate_venue_typical(place)
+            suggestions, typical = await asyncio.wait_for(
+                asyncio.gather(venice.generate_rooms(place),
+                               venice.generate_venue_typical(place)), timeout=20)
         except Exception:
-            logger.warning("layout lookup failed")
-            suggestions, typical = [], []
+            logger.warning("layout lookup failed or timed out")
+            return
         state["room_pool"] = suggestions
         state["venue_typical"] = ", ".join(typical)
-        await notice.edit_text(f"{place}. Which parts are in play?",
-                               reply_markup=room_keyboard(place, [], suggestions))
+        try:
+            await notice.edit_text(f"{place}. Which parts are in play?",
+                                   reply_markup=room_keyboard(place, [], suggestions))
+        except Exception:
+            pass
         return
     if pending == "custom_rooms":
         supplied = [p.strip() for p in msg.text.split(",") if p.strip()]
@@ -737,7 +743,7 @@ async def show_probes(q, user_id, v, rooms, chosen):
     known = [*rooms, *chosen, *baseline]
     await q.edit_message_text("Working out the details...")
     try:
-        ai = await venice.generate_probes(v, rooms, known)
+        ai = await asyncio.wait_for(venice.generate_probes(v, rooms, known), timeout=20)
     except Exception:
         ai = []
     pool = (baseline + ai)[:venue.MAX_PROBES]
@@ -936,14 +942,14 @@ async def issue_task(update, context, label="TASK"):
             await update.effective_message.reply_text("You already have one pending.")
             return
         await update.effective_message.reply_text("Writing...")
-        if random.random() < 0.3:
-            try:
-                png = await generate_render(state)
-                await storage.deliver(context.bot, user.id, user.id, png,
-                                      caption="This is what's waiting for you.", prefix="avatar")
-            except Exception:
-                logger.warning("pre-task avatar failed")
-        text, risk, delta, exposure = await tk.generate_task_text(state, session, voice=HARLEY_VOICE)
+        try:
+            text, risk, delta, exposure = await tk.generate_task_text(
+                state, session, voice=HARLEY_VOICE)
+        except Exception as exc:
+            logger.exception("task generation failed")
+            await update.effective_message.reply_text(
+                f"Couldn't write that one - {type(exc).__name__}: {exc}")
+            return
         now = datetime.now(timezone.utc)
         task = st.Task(user_id=user.id, task_text=text, risk_level=risk, created_at=now,
                        exposure=delta, exposure_label=exposure,
@@ -956,6 +962,13 @@ async def issue_task(update, context, label="TASK"):
                               state.get("risk_level") or 5)
         await update.effective_message.reply_text(
             f"{label}\n\n{note}{text}\n\n30 minutes.", reply_markup=task_keyboard(task.id, get_title()))
+        if random.random() < 0.3:
+            try:
+                png = await generate_render(state)
+                await storage.deliver(context.bot, user.id, user.id, png,
+                                      caption="This is what's waiting for you.", prefix="avatar")
+            except Exception:
+                logger.warning("pre-task avatar failed")
     finally:
         session.close()
 
@@ -1035,7 +1048,12 @@ async def blocker_input(update, context):
                                               expires_at=now + timedelta(hours=3)))
         session.commit()
         await update.effective_message.reply_text("Fine. Again.")
-        new, risk, delta, exposure = await tk.generate_task_text(state, session, voice=HARLEY_VOICE)
+        try:
+            new, risk, delta, exposure = await tk.generate_task_text(state, session, voice=HARLEY_VOICE)
+        except Exception as exc:
+            logger.exception("rework generation failed")
+            await update.effective_message.reply_text(f"Couldn't rework - {type(exc).__name__}: {exc}")
+            return
         task.task_text, task.risk_level = new, risk
         task.exposure, task.exposure_label = delta, exposure
         task.verification_attempts, task.followup_target = 0, None
@@ -1063,7 +1081,13 @@ async def mercy_callback(update, context):
             await q.edit_message_text("Nothing pending.")
             return
         await q.edit_message_text("Fine. Something else...")
-        new, risk, delta, exposure = await tk.generate_task_text(state, session, voice=HARLEY_VOICE)
+        try:
+            new, risk, delta, exposure = await tk.generate_task_text(state, session, voice=HARLEY_VOICE)
+        except Exception as exc:
+            logger.exception("mercy generation failed")
+            await context.bot.send_message(chat_id=user.id,
+                                           text=f"Couldn't write one - {type(exc).__name__}: {exc}")
+            return
         now = datetime.now(timezone.utc)
         task.task_text, task.risk_level = new, risk
         task.exposure, task.exposure_label = delta, exposure
@@ -1285,7 +1309,13 @@ async def scheduled_check(context):
             if not state.get("gender") or not state.get("location"):
                 state["next_task_time"] = now + timedelta(minutes=15)
                 continue
-            text, risk, delta, exposure = await tk.generate_task_text(state, session, voice=HARLEY_VOICE)
+            try:
+                text, risk, delta, exposure = await tk.generate_task_text(
+                    state, session, voice=HARLEY_VOICE)
+            except Exception:
+                logger.exception(f"auto task generation failed for {row.user_id}")
+                state["next_task_time"] = now + timedelta(minutes=15)
+                continue
             task = st.Task(user_id=row.user_id, task_text=text, risk_level=risk, created_at=now,
                            exposure=delta, exposure_label=exposure,
                            expires_at=now + timedelta(minutes=30))
