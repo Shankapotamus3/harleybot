@@ -16,98 +16,74 @@ NUDE_MODELS = [m.strip() for m in os.environ.get(
 FOLLOWUP = """The sub was asked for ONE specific thing after an earlier photo: {target}
 The original task was: {task}
 
-Judge ONLY whether {target} is clearly visible. Ignore everything else. Be lenient.
+Judge ONLY whether {target} is clearly visible. Ignore everything else about the task. Be lenient.
 
-Line 1 must be exactly: YES or NO
-Line 2: MISSING: <the single thing still not visible, or none>
-Line 3: REASON: <short phrase>"""
+Reply exactly:
+VERIFIED: yes/no
+MISSING: <the single thing still not visible, or "none">
+REASON: brief"""
 
 WHOLE = """Task: {task}
 
 Judge whether this photo shows the task was done. Be LENIENT:
-- The sub is holding the phone one hand, so full-body framing is often impossible.
+- The sub is holding the phone in one hand, so full-body framing is often impossible.
 - Selfies mean they cannot see their own framing; partial crops are normal.
 - Any equivalent item counts (any clamp = clothespin, any tie = rope).
 - Judge only the PRIMARY element. If the primary element is present, pass.
 
-Line 1 must be exactly: YES or NO
-Line 2: MISSING: <the single most important element not visible, or none>
-Line 3: REASON: <short phrase>"""
+Reply exactly:
+VERIFIED: yes/no
+MISSING: <the single most important element not visible, or "none">
+REASON: brief"""
 
-_VERIFIED = re.compile(r"VERIFIED\s*[:\-]\s*(yes|no)", re.IGNORECASE)
-_MISSING = re.compile(r"MISSING\s*[:\-]\s*(.+)", re.IGNORECASE)
-_REASON = re.compile(r"REASON\s*[:\-]\s*(.+)", re.IGNORECASE)
-_BARE = re.compile(r"^\W*(yes|no)\b", re.IGNORECASE)
+PUBLIC = """Task: {task}
+
+This was taken somewhere public, so the setting does not matter. Judge ONLY whether the exposure
+element is clear - the named body part, and how far the clothing moved. Ignore the background
+entirely: a walkway, a wall, a crowd or a wrong room all pass. Be lenient.
+
+Reply exactly:
+VERIFIED: yes/no
+MISSING: <the single exposure element not visible, or "none">
+REASON: brief"""
 
 
 def parse(response):
-    """(verified, missing, reason) or None if no verdict could be read."""
+    verified, missing, reason = "no", None, "No reason given"
     if not response:
-        return None
-    verified, missing, reason = None, None, ""
-    lines = response.splitlines()
-    for line in lines:
-        s = line.strip()
-        m = _VERIFIED.search(s)
+        return verified, missing, "Verifier returned nothing"
+    for line in response.splitlines():
+        line = line.strip()
+        m = re.match(r"VERIFIED:\s*(yes|no)", line, re.IGNORECASE)
         if m:
             verified = m.group(1).lower()
             continue
-        m = _MISSING.search(s)
+        m = re.match(r"MISSING:\s*(.+)", line, re.IGNORECASE)
         if m:
             val = m.group(1).strip().rstrip(".")
-            if val.lower() not in ("none", "n/a", "-", "nothing", "no"):
-                missing = val
+            missing = None if val.lower() in ("none", "n/a", "-", "nothing") else val
             continue
-        m = _REASON.search(s)
+        m = re.match(r"REASON:\s*(.+)", line, re.IGNORECASE)
         if m:
             reason = m.group(1).strip()
-    if verified is None:
-        for line in lines[:3]:
-            m = _BARE.search(line.strip())
-            if m:
-                verified = m.group(1).lower()
-                break
-    if verified is None:
-        return None
-    if not reason:
-        first = next((l.strip() for l in lines if l.strip()), "")
-        reason = first[:120] or "no reason given"
     return verified, missing, reason
 
 
-async def verify_photo(image_bytes, task_text, followup_target=None):
-    """Verdict tuple, or None if no model produced anything parseable."""
+async def verify_photo(image_bytes, task_text, followup_target=None, public=False):
+    """(verified, missing, reason) or None if the chain is unreachable."""
     thumb = await asyncio.to_thread(render.vision_thumb, image_bytes)
     mime = "image/png" if render.sniff_ext(thumb) == "png" else "image/jpeg"
     b64 = base64.b64encode(thumb).decode("ascii")
-    prompt = (FOLLOWUP.format(target=followup_target, task=task_text)
-              if followup_target else WHOLE.format(task=task_text))
-
-    for model in venice.VISION_CHAIN:
-        try:
-            data = await venice.post("/chat/completions", {
-                "model": model,
-                "messages": [{"role": "user", "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-                ]}],
-                "max_tokens": 200,
-                "temperature": 0.0,
-            }, timeout=30)
-            raw = (data["choices"][0]["message"]["content"] or "").strip()
-        except Exception as e:
-            logger.warning(f"verify {model} transport: {e}")
-            continue
-
-        parsed = parse(raw)
-        if parsed is None:
-            logger.warning(f"verify {model} unparseable: {raw[:160]!r}")
-            continue
-        logger.info(f"verify {model}: {parsed[0]} ({parsed[2][:60]})")
-        return parsed
-
-    logger.error("verify: no model returned a readable verdict")
-    return None
+    if followup_target:
+        prompt = FOLLOWUP.format(target=followup_target, task=task_text)
+    elif public:
+        prompt = PUBLIC.format(task=task_text)
+    else:
+        prompt = WHOLE.format(task=task_text)
+    raw = await venice.analyze_image(b64, mime, prompt)
+    if raw is None:
+        return None
+    return parse(raw)
 
 
 async def nude_check(png_bytes):

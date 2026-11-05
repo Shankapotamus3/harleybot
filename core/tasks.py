@@ -114,18 +114,19 @@ QUICK_MOVES = {
         "ease the waistband down to the top of the arse and hold it"],
     3: ["pull the hem up over one nipple and leave it there",
         "open the fly and ease the cage out through it"],
-    4: ["open the fly wide and bring the cage and balls fully out",
-        "turn your back and take the waistband down to the crease"],
-    5: ["open the fly, bring the cage fully out, and turn side on so the cage and arse both read",
-        "lift the hem over a nipple and open the fly in the same frame"],
+    4: ["open the fly wide, ease the waistband to mid-thigh, and bring the cage and balls out",
+        "turn your back, ease the waistband to mid-thigh, and let the arse read"],
+    5: ["open the fly, ease the waistband to mid-thigh, bring the cage out and turn side on so the "
+        "cage and a cheek of the arse both read",
+        "lift the hem over a nipple, ease the waistband to mid-thigh, and hold both"],
 }
 
 # What worn gear physically permits, including how it is reached.
 GEAR_PHYSICS = {
-    "cage": "worn on the cock - nothing shows until the trousers are open and pulled below it, "
-            "underwear with them. A shirt off reveals nothing. It can be lifted off, but then it "
-            "is an object in your hand and no longer worn - say which.",
-    "chastity": "same as a cage - trousers open and down past it, underwear pulled below. "
+    "cage": "worn on the cock - nothing shows until the fly is open and the trousers eased down to "
+            "mid-thigh at most, underwear with them. A shirt off reveals nothing. It can be lifted "
+            "off, but then it is an object in your hand and no longer worn - say which.",
+    "chastity": "same as a cage - fly open, trousers eased to mid-thigh, underwear with them. "
                 "Shirt is irrelevant to the shot.",
     "plug": "a plug is inside - it is invisible from the front. It needs either a rear view with "
             "the phone held low behind you, or your back turned to a mirror. It cannot share a "
@@ -156,9 +157,9 @@ COVER_BEATS = {
 }
 
 QUICK_COVER = {
-    "about": "angle away from the room and keep it brief - a shelf end, a corner, a pillar",
-    "watched": "put your back to the room and use the nearest dead ground - a shelf end, a corner, "
-               "a pillar. Brief and accepted beats hidden and impossible",
+    "about": "get out of the main flow - a dead corner, a wall you can face, the far end of the aisle",
+    "watched": "put your back to the main flow somewhere out of the way - a dead corner, a wall, the "
+               "far end of the aisle. Brief and accepted beats hidden and impossible",
 }
 
 
@@ -297,24 +298,28 @@ async def generate_task_text(state, session, *, voice, depth=0):
 
     if quick:
         chosen_move = random.choice(QUICK_MOVES[actual_risk])
-        detail_block = (f"\nBackdrop - name it in three words at most: {notes}" if notes else "")
+        detail_block = ""
         feature_block = ""
         skin_line = f"Move: {chosen_move}"
         phone_line = "in one hand, low and close, nothing put down"
         cover_beat = QUICK_COVER.get(effective, QUICK_COVER["about"])
         if no_cover:
-            cover_beat = ("nothing to hide behind - turn your back, keep it brief, accept being seen")
-        order = """1. Choose the nearest dead ground you can reach in a few steps. Do not go looking for a
-   better room.
+            cover_beat = "nowhere to hide - turn your back, keep it brief, accept being seen"
+        order = """1. Get out of the main flow. Anywhere will do - do not go looking for a particular fixture.
 2. Write the task around the Move line and nothing else."""
-        kind_rules = """- This is a quick reveal, not a staged scene. The setting is a backdrop - name it in a few
-  words and move on. Do not build the task around a feature.
+        kind_rules = """- This is a quick reveal, not a staged scene. Do not name a fixture of the place. The only
+  setting detail is how out of the way the spot is.
 - Three or four sentences. Shorter than usual.
 - Adapt the Move line to what is worn and what the gear allows. Nothing is added to it.
 - One hand, phone low and close. No props, no surfaces, nothing to balance on.
-- No mirror unless the Move needs the front of the body."""
+- No mirror unless the Move needs the front of the body.
+- Trousers go no lower than mid-thigh and nothing comes off. Undressing is what makes a quick
+  task feel like getting caught.
+- Do not add garments to the Move. If the Move says the fly, the trousers stay up.
+- Count the verbs. More than two actions means cut one.
+- One wait at most, and only if the Move needs it."""
+        setting_prompt = "SETTING: <how out of the way, 2-4 words>"
     else:
-        chosen_move = None
         detail_block = (f"\nWhat she says is there - a sample of what is definitely available, "
                         f"not a checklist: {notes}") if notes else ""
         features = _features(state, location)
@@ -332,7 +337,8 @@ async def generate_task_text(state, session, *, voice, depth=0):
 2. Cross off anything blocked.
 3. Choose the setting that best supports risk {actual_risk}/5, preferring a room used least recently.
 4. Write the task around that single setting."""
-        kind_rules = """- Build the task around the setting. The sample is a guide, not a menu."""
+        kind_rules = "- Build the task around the setting. The sample is a guide, not a menu."
+        setting_prompt = "SETTING: <the setting, 2-5 words>"
 
     cover_spot = venue.cover_hint(location) if not quick and venue.exposure_rank(effective) >= 2 else ""
 
@@ -421,7 +427,7 @@ Rules:
 
 Reply exactly:
 TASK: <the task>
-SETTING: <the setting, 2-5 words>
+{setting_prompt}
 EXPOSURE: <alone|caught|about|watched>"""
 
     response = await venice.chat([{"role": "user", "content": prompt}], voice, temperature=0.95)
