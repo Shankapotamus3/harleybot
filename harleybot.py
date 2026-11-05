@@ -39,6 +39,9 @@ HARLEY_VARIANTS = {
 DEFAULT_VARIANT = "vagina"
 USE_LOCATION = os.environ.get("IMAGE_USE_LOCATION", "0") == "1"
 
+PRIVACY_LABELS = {"private": "Private", "semi": "Semi-private",
+                  "exposed": "Exposed", "public": "Public"}
+
 HARLEY_VOICE = """You are Harley Quinn - Domme, chaotic, delighted by your own cruelty.
 You run your sub's training. You are the boss and you both know it.
 
@@ -143,9 +146,9 @@ def present_keyboard():
 
 
 def privacy_keyboard(selected=None):
-    levels = ["private", "semi", "exposed", "public"]
-    return InlineKeyboardMarkup([[InlineKeyboardButton(("Y " if lv == selected else "") + lv,
-                                                      callback_data=f"privacy_{lv}")] for lv in levels])
+    return InlineKeyboardMarkup([[InlineKeyboardButton(("Y " if lv == selected else "") + PRIVACY_LABELS[lv],
+                                                      callback_data=f"privacy_{lv}")]
+                                 for lv in ("private", "semi", "exposed", "public")])
 
 
 def kinks_keyboard(state):
@@ -171,10 +174,18 @@ def venue_keyboard():
     return InlineKeyboardMarkup(rows)
 
 
-def room_keyboard(venue_name, selected):
+def room_keyboard(venue_name, selected, extra=None):
+    known = venue.rooms_for_venue(venue_name)
     rows = [[InlineKeyboardButton(("Y " if r in selected else "") + r.title(),
                                   callback_data=f"room_{i}")]
-            for i, r in enumerate(venue.rooms_for_venue(venue_name))]
+            for i, r in enumerate(known)]
+    seen = {r.lower() for r in known}
+    for index, label in enumerate(extra or []):
+        if label.lower() in seen:
+            continue
+        seen.add(label.lower())
+        rows.append([InlineKeyboardButton(("Y " if label in selected else "") + label[:20],
+                                          callback_data=f"xroom_{index}")])
     rows.append([InlineKeyboardButton("Add a room", callback_data="room_custom"),
                  InlineKeyboardButton("That's the lot", callback_data="room_done")])
     return InlineKeyboardMarkup(rows)
@@ -230,8 +241,9 @@ def main_menu():
          InlineKeyboardButton("Location", callback_data="menu_location")],
         [InlineKeyboardButton("Avatar", callback_data="menu_avatar"),
          InlineKeyboardButton("Variant", callback_data="menu_variant")],
-        [InlineKeyboardButton("Risk", callback_data="menu_risk"),
-         InlineKeyboardButton("Kinks", callback_data="menu_kinks")],
+        [InlineKeyboardButton("Privacy", callback_data="menu_privacy"),
+         InlineKeyboardButton("Risk", callback_data="menu_risk")],
+        [InlineKeyboardButton("Kinks", callback_data="menu_kinks")],
         [InlineKeyboardButton("Schedule", callback_data="menu_schedule"),
          InlineKeyboardButton("Interval", callback_data="menu_interval")],
         [InlineKeyboardButton("Settings", callback_data="menu_settings"),
@@ -247,6 +259,14 @@ def _toggle(bucket, item):
     else:
         bucket.append(item)
     return bucket
+
+
+def _exposure_note(delta, label, baseline, risk, max_risk):
+    if not delta:
+        return ""
+    over = " - past your usual ceiling" if risk > max_risk else ""
+    return (f"Exposure: {label} - you set {baseline}, this one steps out\n"
+            f"Risk {risk}/5{over}\n\n")
 
 
 async def generate_render(state, *, nude=False, scene_extra=""):
@@ -355,11 +375,23 @@ async def custom_input(update, context):
             await msg.reply_text("Render failed.")
         return
     if pending == "custom_location":
-        state["venue"] = msg.text.strip()
+        place = msg.text.strip()[:60]
+        state["venue"] = place
         state["rooms"] = []
         state["features"] = {}
-        state["pending"] = "custom_rooms"
-        await msg.reply_text("Which rooms? Separate with commas.")
+        state["venue_typical"] = None
+        state["pending"] = None
+        notice = await msg.reply_text("Working out the layout...")
+        try:
+            suggestions = await venice.generate_rooms(place)
+            typical = await venice.generate_venue_typical(place)
+        except Exception:
+            logger.warning("layout lookup failed")
+            suggestions, typical = [], []
+        state["room_pool"] = suggestions
+        state["venue_typical"] = ", ".join(typical)
+        await notice.edit_text(f"{place}. Which parts are in play?",
+                               reply_markup=room_keyboard(place, [], suggestions))
         return
     if pending == "custom_rooms":
         supplied = [p.strip() for p in msg.text.split(",") if p.strip()]
@@ -367,13 +399,12 @@ async def custom_input(update, context):
             await msg.reply_text("Nothing usable. Try again.")
             return
         state["pending"] = None
+        state["rooms"] = (state.get("rooms") or []) + supplied
         if venue.rooms_for_venue(state.get("venue") or ""):
-            state["rooms"] = (state.get("rooms") or []) + supplied
             await msg.reply_text("Added.", reply_markup=room_keyboard(state.get("venue") or "", state["rooms"]))
         else:
-            state["rooms"] = supplied
             await msg.reply_text("Now the features inside those rooms.",
-                                 reply_markup=present_feature_keyboard(state.get("venue") or "", supplied, []))
+                                 reply_markup=present_feature_keyboard(state.get("venue") or "", state["rooms"], []))
         return
     if pending == "custom_features":
         state["pending"] = None
@@ -449,7 +480,8 @@ async def start_cmd(update, context):
         return
     await update.effective_message.reply_text(
         f"Harley here.\n\n{state.get('location') or 'No location set'} | "
-        f"risk {state.get('risk_level') or 5} | {state.get('points') or 0} pts",
+        f"risk {state.get('risk_level') or 5} | "
+        f"{PRIVACY_LABELS.get(state.get('privacy') or 'private')} | {state.get('points') or 0} pts",
         reply_markup=main_menu())
 
 
@@ -457,7 +489,7 @@ async def help_cmd(update, context):
     await update.effective_message.reply_text(
         "/task a challenge\n/location venue and rooms\n/outfit what you're wearing\n"
         "/avatar a photo\n/reward a reward render\n/autopics scheduled photos\n"
-        "/variant her anatomy\n/risk /kinks /schedule /interval\n"
+        "/variant her anatomy\n/privacy how exposed\n/risk /kinks /schedule /interval\n"
         "/settings /rewards /status\n/clear /reset",
         reply_markup=main_menu())
 
@@ -466,7 +498,7 @@ async def settings_cmd(update, context):
     state = st.get_state(update.effective_user.id)
     await update.effective_message.reply_text(
         f"variant: {state.get('variant') or DEFAULT_VARIANT}\n"
-        f"privacy: {state.get('privacy') or 'private'}\n"
+        f"privacy: {PRIVACY_LABELS.get(state.get('privacy') or 'private')}\n"
         f"outfit: {state.get('outfit_detail') or state.get('current_outfit') or 'unset'}\n"
         f"task model: {state.get('task_model') or venice.IMAGE_MODEL}\n"
         f"reward model: {state.get('reward_model') or venice.IMAGE_MODEL_REWARD}\n"
@@ -490,6 +522,8 @@ async def menu_callback(update, context):
         await avatar_cmd(update, context)
     elif route == "variant":
         await variant_cmd(update, context)
+    elif route == "privacy":
+        await privacy_cmd(update, context)
     elif route == "risk":
         await risk_cmd(update, context)
     elif route == "kinks":
@@ -528,15 +562,28 @@ async def variant_callback(update, context):
 
 
 async def privacy_cmd(update, context):
+    state = st.get_state(update.effective_user.id)
     await update.effective_message.reply_text(
-        "Outfit level:", reply_markup=privacy_keyboard(st.get_state(update.effective_user.id).get("privacy")))
+        f"Privacy (currently {PRIVACY_LABELS.get(state.get('privacy') or 'private')}):\n"
+        f"How exposed is the space?",
+        reply_markup=privacy_keyboard(state.get("privacy")))
 
 
 async def privacy_callback(update, context):
     q = update.callback_query
     await q.answer()
-    st.get_state(update.effective_user.id)["privacy"] = q.data.split("_", 1)[1]
-    await q.edit_message_text("Saved.")
+    user = update.effective_user
+    state = st.get_state(user.id)
+    level = q.data.split("_", 1)[1]
+    if level not in PRIVACY_LABELS:
+        await q.edit_message_text("Unknown level.")
+        return
+    state["privacy"] = level
+    if state.get("pending") == "wizard_privacy":
+        state["pending"] = None
+        await commit_location(q, user.id)
+        return
+    await q.edit_message_text(f"Privacy: {PRIVACY_LABELS[level]}.")
 
 
 async def setreward_cmd(update, context):
@@ -601,6 +648,7 @@ async def imgmodels_cmd(update, context):
 async def location_cmd(update, context):
     state = st.get_state(update.effective_user.id)
     state["venue"] = None
+    state["venue_typical"] = None
     state["rooms"] = []
     state["features"] = {}
     state["probes"] = []
@@ -618,6 +666,7 @@ async def venue_callback(update, context):
         return
     v = q.data.split("_", 1)[1]
     state["venue"] = v
+    state["venue_typical"] = None
     state["rooms"] = []
     state["features"] = {}
     if venue.rooms_for_venue(v):
@@ -642,6 +691,13 @@ async def room_callback(update, context):
     if q.data == "room_custom":
         state["pending"] = "custom_rooms"
         await q.edit_message_text("Add a room name.")
+        return
+    if q.data.startswith("xroom_"):
+        i = int(q.data.split("_", 1)[1])
+        pool = state.get("room_pool") or []
+        if 0 <= i < len(pool):
+            _toggle(state.setdefault("rooms", []), pool[i])
+        await q.edit_message_reply_markup(reply_markup=room_keyboard(v, state["rooms"], pool))
         return
     rooms = venue.rooms_for_venue(v)
     i = int(q.data.split("_", 1)[1])
@@ -687,7 +743,7 @@ async def show_probes(q, user_id, v, rooms, chosen):
     pool = (baseline + ai)[:venue.MAX_PROBES]
     state["probe_pool"] = pool
     state["probes"] = []
-    await q.edit_message_text("Anything else worth pinning down?",
+    await q.edit_message_text(venue.probe_question(rooms),
                               reply_markup=probe_keyboard(pool, []))
 
 
@@ -697,7 +753,11 @@ async def probe_callback(update, context):
     state = st.get_state(update.effective_user.id)
     pool = state.get("probe_pool") or []
     if q.data == "probe_done":
-        await commit_location(q, update.effective_user.id)
+        state["pending"] = "wizard_privacy"
+        await q.edit_message_text(
+            f"Last thing. How exposed is it?\n\n"
+            f"Currently {PRIVACY_LABELS.get(state.get('privacy') or 'private')}.",
+            reply_markup=privacy_keyboard(state.get("privacy")))
         return
     if q.data == "probe_custom":
         state["pending"] = "custom_probe"
@@ -725,15 +785,17 @@ async def commit_location(q, user_id):
     state["location"] = v
     state["location_notes"] = notes
     state["pending"] = None
-    await q.edit_message_text(f"Locked in.\n\n{notes}",
-                              reply_markup=InlineKeyboardMarkup(
-                                  [[InlineKeyboardButton("Clear", callback_data="loc_clear")]]))
+    await q.edit_message_text(
+        f"Locked in - {PRIVACY_LABELS.get(state.get('privacy') or 'private')}.\n\n{notes}",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Clear", callback_data="loc_clear")]]))
 
 
 async def clear_location(update, context):
     state = st.get_state(update.effective_user.id)
-    for k in ("location", "location_notes", "rooms", "probes", "venue", "features"):
-        state[k] = None if k in ("location", "location_notes", "venue") else []
+    for k in ("location", "location_notes", "rooms", "probes", "venue", "features", "venue_typical", "room_pool"):
+        state[k] = None if k in ("location", "location_notes", "venue", "venue_typical") else []
+    state["pending"] = None
     if update.callback_query:
         await update.callback_query.answer()
         await update.callback_query.edit_message_text("Cleared.")
@@ -881,16 +943,19 @@ async def issue_task(update, context, label="TASK"):
                                       caption="This is what's waiting for you.", prefix="avatar")
             except Exception:
                 logger.warning("pre-task avatar failed")
-        text, risk = await tk.generate_task_text(state, session, voice=HARLEY_VOICE)
+        text, risk, delta, exposure = await tk.generate_task_text(state, session, voice=HARLEY_VOICE)
         now = datetime.now(timezone.utc)
         task = st.Task(user_id=user.id, task_text=text, risk_level=risk, created_at=now,
+                       exposure=delta, exposure_label=exposure,
                        expires_at=now + timedelta(minutes=30))
         session.add(task)
         session.commit()
         context.job_queue.run_once(expire_task, when=timedelta(minutes=30),
                                    data={"user_id": user.id, "task_id": task.id})
+        note = _exposure_note(delta, exposure, state.get("privacy") or "private", risk,
+                              state.get("risk_level") or 5)
         await update.effective_message.reply_text(
-            f"{label}\n\n{text}\n\n30 minutes.", reply_markup=task_keyboard(task.id, get_title()))
+            f"{label}\n\n{note}{text}\n\n30 minutes.", reply_markup=task_keyboard(task.id, get_title()))
     finally:
         session.close()
 
@@ -909,8 +974,9 @@ async def status_cmd(update, context):
             return
         left = (active.expires_at - datetime.now(timezone.utc)).total_seconds() / 60
         extra = f"\n\nNeeds: {active.followup_target}" if active.followup_target else ""
+        exposure = f"\nExposure: {active.exposure_label}" if active.exposure else ""
         await update.effective_message.reply_text(
-            f"{max(0, left):.0f} min left\n\n{active.task_text[:200]}{extra}",
+            f"{max(0, left):.0f} min left{exposure}\n\n{active.task_text[:200]}{extra}",
             reply_markup=task_keyboard(active.id, get_title()))
     finally:
         session.close()
@@ -969,14 +1035,17 @@ async def blocker_input(update, context):
                                               expires_at=now + timedelta(hours=3)))
         session.commit()
         await update.effective_message.reply_text("Fine. Again.")
-        new, risk = await tk.generate_task_text(state, session, voice=HARLEY_VOICE)
+        new, risk, delta, exposure = await tk.generate_task_text(state, session, voice=HARLEY_VOICE)
         task.task_text, task.risk_level = new, risk
+        task.exposure, task.exposure_label = delta, exposure
         task.verification_attempts, task.followup_target = 0, None
         task.expires_at = now + timedelta(minutes=30)
         task.blocked_count += 1
         session.commit()
+        note = _exposure_note(delta, exposure, state.get("privacy") or "private", risk,
+                              state.get("risk_level") or 5)
         await update.effective_message.reply_text(
-            f"REWORKED\n\n{new}\n\n30 minutes.", reply_markup=task_keyboard(task.id, get_title()))
+            f"REWORKED\n\n{note}{new}\n\n30 minutes.", reply_markup=task_keyboard(task.id, get_title()))
     finally:
         session.close()
 
@@ -994,13 +1063,16 @@ async def mercy_callback(update, context):
             await q.edit_message_text("Nothing pending.")
             return
         await q.edit_message_text("Fine. Something else...")
-        new, risk = await tk.generate_task_text(state, session, voice=HARLEY_VOICE)
+        new, risk, delta, exposure = await tk.generate_task_text(state, session, voice=HARLEY_VOICE)
         now = datetime.now(timezone.utc)
         task.task_text, task.risk_level = new, risk
+        task.exposure, task.exposure_label = delta, exposure
         task.verification_attempts, task.followup_target = 0, None
         task.expires_at = now + timedelta(minutes=30)
         session.commit()
-        await context.bot.send_message(chat_id=user.id, text=f"NEW\n\n{new}\n\n30 minutes.",
+        note = _exposure_note(delta, exposure, state.get("privacy") or "private", risk,
+                              state.get("risk_level") or 5)
+        await context.bot.send_message(chat_id=user.id, text=f"NEW\n\n{note}{new}\n\n30 minutes.",
                                        reply_markup=task_keyboard(task.id, get_title()))
     finally:
         session.close()
@@ -1077,7 +1149,7 @@ async def handle_photo(update, context):
             state["challenges_since_reward"] = (state.get("challenges_since_reward") or 0) + 1
             session.commit()
             gain = 10 * task.risk_level
-            need = tk.reward_threshold(state["streak"])
+            need = tk.reward_threshold(state["streak"], task.exposure or 0)
             if state["challenges_since_reward"] >= need:
                 state["challenges_since_reward"] = 0
                 await update.message.reply_text(f"+{gain}. Streak {state['streak']}.")
@@ -1191,6 +1263,7 @@ async def reset_cmd(update, context):
     state["privacy"] = "private"
     state["location"] = None
     state["location_notes"] = None
+    state["venue_typical"] = None
     state["rooms"] = []
     state["probes"] = []
     st.drop_state(uid)
@@ -1212,8 +1285,9 @@ async def scheduled_check(context):
             if not state.get("gender") or not state.get("location"):
                 state["next_task_time"] = now + timedelta(minutes=15)
                 continue
-            text, risk = await tk.generate_task_text(state, session, voice=HARLEY_VOICE)
+            text, risk, delta, exposure = await tk.generate_task_text(state, session, voice=HARLEY_VOICE)
             task = st.Task(user_id=row.user_id, task_text=text, risk_level=risk, created_at=now,
+                           exposure=delta, exposure_label=exposure,
                            expires_at=now + timedelta(minutes=30))
             session.add(task)
             state["next_task_time"] = now + timedelta(
@@ -1221,8 +1295,9 @@ async def scheduled_check(context):
             session.commit()
             context.job_queue.run_once(expire_task, when=timedelta(minutes=30),
                                        data={"user_id": row.user_id, "task_id": task.id})
+            note = f"Exposure: {exposure}\n" if delta else ""
             await context.bot.send_message(chat_id=row.user_id,
-                                           text=f"AUTO\n\n{text}\n\n30 minutes.",
+                                           text=f"AUTO\n\n{note}{text}\n\n30 minutes.",
                                            reply_markup=task_keyboard(task.id, get_title()))
             await asyncio.sleep(1)
         for row in session.query(st.UserState).filter(st.UserState.avatar_enabled == True).all():
@@ -1292,7 +1367,7 @@ def main():
     app.add_handler(CallbackQueryHandler(wish_skip_callback, pattern="^wish_skip$"))
     app.add_handler(CallbackQueryHandler(autopics_callback, pattern="^autopics_toggle$"))
     app.add_handler(CallbackQueryHandler(venue_callback, pattern="^venue_"))
-    app.add_handler(CallbackQueryHandler(room_callback, pattern="^room_"))
+    app.add_handler(CallbackQueryHandler(room_callback, pattern="^room_|^xroom_"))
     app.add_handler(CallbackQueryHandler(present_feature_callback, pattern="^pf_"))
     app.add_handler(CallbackQueryHandler(probe_callback, pattern="^probe_"))
     app.add_handler(CallbackQueryHandler(clear_location, pattern="^loc_clear$"))
