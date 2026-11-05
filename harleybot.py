@@ -119,10 +119,12 @@ def task_keyboard(task_id, title):
     ])
 
 
-def risk_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton(f"{i}. {tk.RISK_LEVELS[i]['name']}",
-                                                      callback_data=f"risk_{i}")]
-                                 for i in range(1, 6)])
+def intensity_keyboard(selected=None):
+    rows = []
+    for key, label in (("gentle", "Gentle"), ("standard", "Standard"), ("harsh", "Harsh")):
+        mark = "Y " if key == selected else ""
+        rows.append([InlineKeyboardButton(f"{mark}{label}", callback_data=f"intensity_{key}")])
+    return InlineKeyboardMarkup(rows)
 
 
 def outfit_keyboard():
@@ -241,7 +243,7 @@ def main_menu():
         [InlineKeyboardButton("Avatar", callback_data="menu_avatar"),
          InlineKeyboardButton("Variant", callback_data="menu_variant")],
         [InlineKeyboardButton("Privacy", callback_data="menu_privacy"),
-         InlineKeyboardButton("Risk", callback_data="menu_risk")],
+         InlineKeyboardButton("Intensity", callback_data="menu_intensity")],
         [InlineKeyboardButton("Kinks", callback_data="menu_kinks")],
         [InlineKeyboardButton("Schedule", callback_data="menu_schedule"),
          InlineKeyboardButton("Interval", callback_data="menu_interval")],
@@ -260,12 +262,12 @@ def _toggle(bucket, item):
     return bucket
 
 
-def _exposure_note(delta, label, baseline, risk, max_risk):
-    if not delta:
-        return ""
-    over = " - past your usual ceiling" if risk > max_risk else ""
-    return (f"Exposure: {venue.PRIVACY_LABELS[label]} - was "
-            f"{venue.PRIVACY_LABELS[baseline]}\nRisk {risk}/5{over}\n\n")
+def _task_header(delta, label, baseline, risk, intensity):
+    bits = [f"Risk {risk}/5 ({intensity})"]
+    if delta:
+        bits.append(f"Exposure: {venue.PRIVACY_LABELS[label]} - was "
+                    f"{venue.PRIVACY_LABELS[baseline]}")
+    return "\n".join(bits) + "\n\n"
 
 
 async def generate_render(state, *, nude=False, scene_extra=""):
@@ -487,7 +489,7 @@ async def start_cmd(update, context):
         state.get("location") or "")
     await update.effective_message.reply_text(
         f"Harley here.\n\n{state.get('location') or 'No location set'} | "
-        f"risk {state.get('risk_level') or 5} | cover: {venue.PRIVACY_LABELS[cover]} | "
+        f"{state.get('intensity') or 'standard'} | cover: {venue.PRIVACY_LABELS[cover]} | "
         f"{state.get('points') or 0} pts",
         reply_markup=main_menu())
 
@@ -496,8 +498,8 @@ async def help_cmd(update, context):
     await update.effective_message.reply_text(
         "/task a challenge\n/location venue and rooms\n/outfit what you're wearing\n"
         "/avatar a photo\n/reward a reward render\n/autopics scheduled photos\n"
-        "/variant her anatomy\n/privacy how much cover\n/risk /kinks /schedule /interval\n"
-        "/settings /rewards /status\n/clear /reset",
+        "/variant her anatomy\n/privacy how much cover\n/intensity how hard\n"
+        "/kinks /schedule /interval /settings /rewards /status\n/clear /reset",
         reply_markup=main_menu())
 
 
@@ -508,6 +510,7 @@ async def settings_cmd(update, context):
     await update.effective_message.reply_text(
         f"variant: {state.get('variant') or DEFAULT_VARIANT}\n"
         f"cover: {venue.PRIVACY_LABELS[cover]}\n"
+        f"intensity: {state.get('intensity') or 'standard'}\n"
         f"outfit: {state.get('outfit_detail') or state.get('current_outfit') or 'unset'}\n"
         f"task model: {state.get('task_model') or venice.IMAGE_MODEL}\n"
         f"reward model: {state.get('reward_model') or venice.IMAGE_MODEL_REWARD}\n"
@@ -533,8 +536,8 @@ async def menu_callback(update, context):
         await variant_cmd(update, context)
     elif route == "privacy":
         await privacy_cmd(update, context)
-    elif route == "risk":
-        await risk_cmd(update, context)
+    elif route == "intensity":
+        await intensity_cmd(update, context)
     elif route == "kinks":
         await kinks_cmd(update, context)
     elif route == "schedule":
@@ -598,6 +601,25 @@ async def privacy_callback(update, context):
         return
     await q.edit_message_text(
         f"{venue.PRIVACY_LABELS[level]}.\n{venue.PRIVACY_DESC[level]}")
+
+
+async def intensity_cmd(update, context):
+    state = st.get_state(update.effective_user.id)
+    await update.effective_message.reply_text(
+        f"How hard should these be? (currently {state.get('intensity') or 'standard'})\n\n"
+        f"Gentle drops it a notch, harsh lifts it a notch. The place sets the baseline, not this.",
+        reply_markup=intensity_keyboard(state.get("intensity")))
+
+
+async def intensity_callback(update, context):
+    q = update.callback_query
+    await q.answer()
+    key = q.data.split("_", 1)[1]
+    if key not in ("gentle", "standard", "harsh"):
+        await q.edit_message_text("Unknown.")
+        return
+    st.get_state(update.effective_user.id)["intensity"] = key
+    await q.edit_message_text(f"Intensity: {key}.")
 
 
 async def setreward_cmd(update, context):
@@ -769,7 +791,7 @@ async def probe_callback(update, context):
     if q.data == "probe_done":
         state["pending"] = "wizard_privacy"
         current = venue.normalise_privacy(state.get("privacy")) or venue.privacy_default(
-            state.get("location") or state.get("venue") or "")
+            state.get("venue") or "")
         await q.edit_message_text(
             f"Last thing. How much cover have you got?\n\n1 is safest, 4 is most exposed.\n\n"
             f"Currently: {venue.PRIVACY_LABELS[current]}",
@@ -849,18 +871,6 @@ async def outfit_callback(update, context):
     state["outfit_items"] = opt.get(f"{state.get('gender') or 'female'}_items", opt["female_items"])
     state["pending"] = "outfit_detail"
     await q.edit_message_text(f"{opt['name']}, roughly. What are you actually in? Type it or /skip.")
-
-
-async def risk_cmd(update, context):
-    await update.effective_message.reply_text("Risk:", reply_markup=risk_keyboard())
-
-
-async def risk_callback(update, context):
-    q = update.callback_query
-    await q.answer()
-    r = int(q.data.split("_", 1)[1])
-    st.get_state(update.effective_user.id)["risk_level"] = r
-    await q.edit_message_text(f"Risk: {tk.RISK_LEVELS[r]['name']}")
 
 
 async def kinks_cmd(update, context):
@@ -971,7 +981,7 @@ async def issue_task(update, context, label="TASK"):
                                    data={"user_id": user.id, "task_id": task.id})
         base = venue.normalise_privacy(state.get("privacy")) or venue.privacy_default(
             state.get("location") or "")
-        note = _exposure_note(delta, exposure, base, risk, state.get("risk_level") or 5)
+        note = _task_header(delta, exposure, base, risk, state.get("intensity") or "standard")
         await update.effective_message.reply_text(
             f"{label}\n\n{note}{text}\n\n30 minutes.", reply_markup=task_keyboard(task.id, get_title()))
         if random.random() < 0.3:
@@ -1059,7 +1069,10 @@ async def blocker_input(update, context):
             session.add(st.LocationConstraint(user_id=user.id, location=loc, constraint=text,
                                               expires_at=now + timedelta(hours=3)))
         session.commit()
-        await update.effective_message.reply_text("Fine. Again.")
+        if venue.is_no_cover(text):
+            await update.effective_message.reply_text("No cover. Dropping it down.")
+        else:
+            await update.effective_message.reply_text("Fine. Again.")
         try:
             new, risk, delta, exposure = await tk.generate_task_text(state, session, voice=HARLEY_VOICE)
         except Exception as exc:
@@ -1073,7 +1086,7 @@ async def blocker_input(update, context):
         task.blocked_count += 1
         session.commit()
         base = venue.normalise_privacy(state.get("privacy")) or venue.privacy_default(loc)
-        note = _exposure_note(delta, exposure, base, risk, state.get("risk_level") or 5)
+        note = _task_header(delta, exposure, base, risk, state.get("intensity") or "standard")
         await update.effective_message.reply_text(
             f"REWORKED\n\n{note}{new}\n\n30 minutes.", reply_markup=task_keyboard(task.id, get_title()))
     finally:
@@ -1108,7 +1121,7 @@ async def mercy_callback(update, context):
         session.commit()
         base = venue.normalise_privacy(state.get("privacy")) or venue.privacy_default(
             state.get("location") or "")
-        note = _exposure_note(delta, exposure, base, risk, state.get("risk_level") or 5)
+        note = _task_header(delta, exposure, base, risk, state.get("intensity") or "standard")
         await context.bot.send_message(chat_id=user.id, text=f"NEW\n\n{note}{new}\n\n30 minutes.",
                                        reply_markup=task_keyboard(task.id, get_title()))
     finally:
@@ -1298,6 +1311,7 @@ async def reset_cmd(update, context):
     state = st.get_state(uid)
     state["variant"] = DEFAULT_VARIANT
     state["privacy"] = "alone"
+    state["intensity"] = "standard"
     state["location"] = None
     state["location_notes"] = None
     state["venue_typical"] = None
@@ -1338,9 +1352,9 @@ async def scheduled_check(context):
             session.commit()
             context.job_queue.run_once(expire_task, when=timedelta(minutes=30),
                                        data={"user_id": row.user_id, "task_id": task.id})
-            note = f"Exposure: {exposure}\n" if delta else ""
+            note = f"Risk {risk}/5\n" + (f"Exposure: {exposure}\n" if delta else "")
             await context.bot.send_message(chat_id=row.user_id,
-                                           text=f"AUTO\n\n{note}{text}\n\n30 minutes.",
+                                           text=f"AUTO\n\n{note}\n{text}\n\n30 minutes.",
                                            reply_markup=task_keyboard(task.id, get_title()))
             await asyncio.sleep(1)
         for row in session.query(st.UserState).filter(st.UserState.avatar_enabled == True).all():
@@ -1382,6 +1396,8 @@ def main():
     app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CommandHandler("variant", variant_cmd))
     app.add_handler(CommandHandler("privacy", privacy_cmd))
+    app.add_handler(CommandHandler("intensity", intensity_cmd))
+    app.add_handler(CommandHandler("risk", intensity_cmd))
     app.add_handler(CommandHandler("setreward", setreward_cmd))
     app.add_handler(CommandHandler("model", model_cmd))
     app.add_handler(CommandHandler("payload", payload_cmd))
@@ -1398,7 +1414,6 @@ def main():
     app.add_handler(CommandHandler("skip", skip_cmd))
     app.add_handler(CommandHandler("gender", gender_cmd))
     app.add_handler(CommandHandler("outfit", outfit_cmd))
-    app.add_handler(CommandHandler("risk", risk_cmd))
     app.add_handler(CommandHandler("kinks", kinks_cmd))
     app.add_handler(CommandHandler("task", task_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
@@ -1416,11 +1431,11 @@ def main():
     app.add_handler(CallbackQueryHandler(clear_location, pattern="^loc_clear$"))
     app.add_handler(CallbackQueryHandler(variant_callback, pattern="^variant_"))
     app.add_handler(CallbackQueryHandler(privacy_callback, pattern="^privacy_"))
+    app.add_handler(CallbackQueryHandler(intensity_callback, pattern="^intensity_"))
     app.add_handler(CallbackQueryHandler(setreward_callback, pattern="^setreward_"))
     app.add_handler(CallbackQueryHandler(model_callback, pattern="^model_"))
     app.add_handler(CallbackQueryHandler(gender_callback, pattern="^gender_"))
     app.add_handler(CallbackQueryHandler(outfit_callback, pattern="^outfit_"))
-    app.add_handler(CallbackQueryHandler(risk_callback, pattern="^risk_"))
     app.add_handler(CallbackQueryHandler(kink_menu_callback, pattern="^kinkmenu_"))
     app.add_handler(CallbackQueryHandler(kink_set_callback, pattern="^kinkset_"))
     app.add_handler(CallbackQueryHandler(kinks_back_callback, pattern="^kinks_back$"))
