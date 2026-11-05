@@ -98,6 +98,10 @@ FALLBACKS = {
 
 MAX_FEATURES = 6
 
+# Lines the model sometimes writes as headings. They are dropped from the body.
+BODY_LABELS = ("TASK:", "SETTING:", "EXPOSURE:", "PEOPLE:", "CONTEXT:", "COVER:",
+               "RISK:", "PRIVACY:", "LOCATION:", "SKIN:")
+
 # What worn gear physically permits, including how it is reached.
 GEAR_PHYSICS = {
     "cage": "worn on the cock - nothing shows until the trousers are open and pulled below it, "
@@ -163,7 +167,7 @@ def _gear_notes(outfit):
     return " / ".join(hits[:3])
 
 
-def _claim_exposure(response, effective, baseline):
+def _claim_exposure(response, effective):
     """Let the model raise the exposure it wrote. Never lower it."""
     claimed = None
     for line in response.splitlines():
@@ -174,13 +178,14 @@ def _claim_exposure(response, effective, baseline):
     if claimed:
         final = venue.EXPOSURE_LADDER[max(venue.exposure_rank(claimed),
                                           venue.exposure_rank(effective))]
-    kept = "\n".join(l for l in response.splitlines()
-                     if not l.strip().upper().startswith("EXPOSURE:"))
-    return kept.strip(), final
+    return final
 
 
 def _tidy(text):
-    """Strip the template artefacts the model leaves behind."""
+    """Drop heading lines and the template artefacts the model leaves behind."""
+    kept = [l for l in text.splitlines()
+            if not any(l.strip().upper().startswith(p) for p in BODY_LABELS)]
+    text = "\n".join(kept)
     text = re.sub(r"_+", "", text)
     text = re.sub(r"[ \t]*\([ \t]*\)", "", text)
     text = re.sub(r"[ \t]*\)[ \t]*(?=[;,.])", "", text)
@@ -359,6 +364,8 @@ Rules:
 - If you name a surface, name a real material: "the tiled floor", "the lane boards".
 - Never leave a blank, underscore, bracket or dangling punctuation. If a detail is unknown, invent
   a plausible one and name it.
+- Write prose only. No headings, no labels, no bullet points in the body - fold who is there and
+  what the cover is into the sentences.
 - Say "the photo", never "photos"
 - Trust the outfit description over the outfit label
 - Favour the specific over the generic
@@ -378,7 +385,7 @@ EXPOSURE: <alone|caught|about|watched>"""
         if depth < 3 and gender == "male" and "breast" in response.lower():
             logger.warning("male sub got 'breasts', retrying")
             return await generate_task_text(state, session, voice=voice, depth=depth + 1)
-        response, final = _claim_exposure(response, effective, baseline_privacy)
+        final = _claim_exposure(response, effective)
         setting, kept = None, []
         for line in response.splitlines():
             s = line.strip()
