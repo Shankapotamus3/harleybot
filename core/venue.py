@@ -44,6 +44,8 @@ VENUE_ALIASES = {
     "Retail Store": ["store", "shop", "retail"],
     "Studio": ["studio"],
     "Rooftop": ["rooftop", "roof terrace"],
+    "Restroom": ["restroom", "toilet", "toilets", "washroom", "loo", "public convenience",
+                 "men's room", "gents", "ladies"],
 }
 
 _ORDER = [(alias, key) for key, aliases in VENUE_ALIASES.items() for alias in aliases]
@@ -73,6 +75,7 @@ VENUE_BASELINE = {
     "Retail Store": "changing room, shop floor rail, mirror, stockroom, trolley, till counter",
     "Studio": "backdrop roll, stool, light stand, seamless paper, floor mark",
     "Rooftop": "parapet, vent housing, aerial mast, stair hut, gravel",
+    "Restroom": "cubicle, cubicle door, coat hook, cistern, mirror, sink, hand dryer, tiled floor, partition",
     "Generic": "door, doorway, mirror, window, chair, table, floor, wall, corner, counter edge, sink",
 }
 
@@ -112,6 +115,10 @@ ROOM_OPTIONS = {
         "kitchen": "counter, kettle, fridge door, sink",
         "stairwell": "landing, handrail, fire door",
         "toilets": "cubicle, mirror, sink, hand dryer",
+    },
+    "Restroom": {
+        "cubicle": "cubicle door, hook, cistern, tiled floor",
+        "basins": "mirror, sink, hand dryer, bin",
     },
 }
 
@@ -238,7 +245,7 @@ VENUE_PRIVACY = {
     "Arcade": "about", "Beach": "about", "Park": "about",
     "Supermarket": "watched", "Retail Store": "watched", "Library": "watched",
     "Museum": "watched", "Airport": "watched", "Launderette": "watched",
-    "Church": "watched",
+    "Church": "watched", "Restroom": "watched",
 }
 
 # What a setting does to your cover, mid-task. The number is the FLOOR that
@@ -261,6 +268,8 @@ EXPOSURE_MOVES = {
     "Launderette": [("someone comes in with a basket", 2),
                     ("out to the pavement", 2)],
     "Vehicle": [("someone parks alongside", 2)],
+    "Restroom": [("the door left on the latch with footsteps in the corridor", 1),
+                 ("out into the corridor", 2)],
     "Generic": [("footsteps in the corridor", 1), ("just outside the door", 2)],
 }
 
@@ -284,6 +293,7 @@ COVER_SPOTS = {
     "Beach": ["the dunes", "behind the breakwater", "the beach hut"],
     "Church": ["a side aisle", "behind a pillar", "the porch"],
     "Rooftop": ["behind the stair hut", "the far parapet", "behind the vent housing"],
+    "Restroom": ["a closed cubicle", "the end cubicle", "the far basin against the wall"],
     "Generic": ["a corner", "the corridor", "just outside"],
 }
 
