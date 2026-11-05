@@ -16,36 +16,54 @@ NUDE_MODELS = [m.strip() for m in os.environ.get(
 FOLLOWUP = """The sub was asked for ONE specific thing after an earlier photo: {target}
 The original task was: {task}
 
-Judge ONLY whether {target} is clearly visible. Ignore everything else about the task. Be lenient.
+Judge ONLY whether {target} is clearly visible. Ignore everything else about the task.
+
+- Pass only if you can point at {target} in the frame.
+- Cropped out, hidden by a hand, or too dark fails.
 
 Reply exactly:
 VERIFIED: yes/no
-MISSING: <the single thing still not visible, or "none">
-REASON: brief"""
+MISSING: <the single thing still absent, or "none">
+REASON: <what you can actually see, five words>"""
 
 WHOLE = """Task: {task}
 
-Judge whether this photo shows the task was done. Be LENIENT:
-- The sub is holding the phone in one hand, so full-body framing is often impossible.
-- Selfies mean they cannot see their own framing; partial crops are normal.
-- Any equivalent item counts (any clamp = clothespin, any tie = rope).
-- Judge only the PRIMARY element. If the primary element is present, pass.
+Decide whether this photo proves the task was done. The task usually ends by saying what the
+photo must show - that sentence is the standard.
+
+Judge two things only:
+1. The exposure - is the named body part actually visible, and is the clothing moved as far as
+   the task says?
+2. The action - is the sub doing the thing, or has it been done?
+
+Fail if any of these are true:
+- The named body part is cropped out, hidden by a hand, or in shadow
+- The sub is clothed where the task says bare
+- The clothing has not moved as far as the task says
+- The right room is shown but nothing is exposed
+
+Pass only if you can point at the evidence in the frame. If you have to assume it, fail. Being in
+the right place is not evidence - the exposure is the evidence. Holding the phone one-handed and
+partial crops are normal, so do not fail for framing alone.
 
 Reply exactly:
 VERIFIED: yes/no
-MISSING: <the single most important element not visible, or "none">
-REASON: brief"""
+MISSING: <the single element that is absent, or "none">
+REASON: <what you can actually see, five words>"""
 
 PUBLIC = """Task: {task}
 
-This was taken somewhere public, so the setting does not matter. Judge ONLY whether the exposure
-element is clear - the named body part, and how far the clothing moved. Ignore the background
-entirely: a walkway, a wall, a crowd or a wrong room all pass. Be lenient.
+This was taken somewhere public, so the setting does not matter. Judge only the exposure.
+
+- Pass only if the named body part is unmistakably visible and the clothing is moved as far as the
+  task says.
+- Ignore the background completely. A corridor, a wall or a crowd never fails a photo on its own.
+- Cropped out, hidden by a hand, or clothed where the task says bare fails.
 
 Reply exactly:
 VERIFIED: yes/no
-MISSING: <the single exposure element not visible, or "none">
-REASON: brief"""
+MISSING: <the single element that is absent, or "none">
+REASON: <what you can actually see, five words>"""
 
 
 def parse(response):
