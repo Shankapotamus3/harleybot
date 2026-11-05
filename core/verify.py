@@ -11,7 +11,7 @@ NUDE_SYSTEM = ("You are a strict image classifier. Reply with exactly one word. 
                "impossible to tell.")
 
 NUDE_MODELS = [m.strip() for m in os.environ.get(
-    "NUDE_MODELS", "e2ee-qwen3-vl-30b-a3b-instruct,qwen3-vl-235b-a22b-instruct").split(",") if m.strip()]
+    "NUDE_MODELS", "mistral-small-3-2-24b-instruct").split(",") if m.strip()]
 
 FOLLOWUP = """The sub was asked for ONE specific thing after an earlier photo: {target}
 The original task was: {task}
