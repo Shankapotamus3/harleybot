@@ -1173,6 +1173,9 @@ async def handle_photo(update, context):
             await update.message.reply_text("Verifier down - resend, no attempt used.")
             return
         verified, missing, reason = verdict
+        if reason == "Verifier returned nothing":
+            await update.message.reply_text("Verifier came back empty, doll - send it again, that one didn't count.")
+            return
         task.verification_attempts += 1
         task.sharpness = int(await asyncio.to_thread(render.sharpness_score, data))
         if up:
