@@ -50,7 +50,7 @@ REASON: brief"""
 
 def parse(response):
     verified, missing, reason = "no", None, "No reason given"
-    if not response:
+    if not response or not response.strip():
         return verified, missing, "Verifier returned nothing"
     for line in response.splitlines():
         line = line.strip()
@@ -80,10 +80,11 @@ async def verify_photo(image_bytes, task_text, followup_target=None, public=Fals
         prompt = PUBLIC.format(task=task_text)
     else:
         prompt = WHOLE.format(task=task_text)
-    raw = await venice.analyze_image(b64, mime, prompt)
-    if raw is None:
-        return None
-    return parse(raw)
+    for _ in range(2):
+        raw = await venice.analyze_image(b64, mime, prompt)
+        if raw and raw.strip():
+            return parse(raw)
+    return None
 
 
 async def nude_check(png_bytes):
