@@ -13,7 +13,7 @@ RISK_LEVELS = {
     2: {"name": "Mild", "description": "A hem or waistband moved, one quick moment"},
     3: {"name": "Committed", "description": "Whatever is over the subject, opened properly"},
     4: {"name": "Bold", "description": "That, taken far enough that nothing is in the way of the shot"},
-    5: {"name": "Brazen", "description": "Off entirely, or stripped right down - only if the cover carries it"},
+    5: {"name": "Brazen", "description": "Everything that needs to be out is out, and held there"},
 }
 
 RISK_WEIGHTS = {1: 5, 2: 5, 3: 20, 4: 30, 5: 40}
@@ -100,24 +100,44 @@ MAX_FEATURES = 6
 
 # Lines the model sometimes writes as headings. They are dropped from the body.
 BODY_LABELS = ("TASK:", "SETTING:", "EXPOSURE:", "PEOPLE:", "CONTEXT:", "COVER:",
-               "RISK:", "PRIVACY:", "LOCATION:", "SKIN:")
+               "RISK:", "PRIVACY:", "LOCATION:", "SKIN:", "MOVE:", "BACKDROP:")
+
+# From this exposure up, the place stops being a scene and becomes a backdrop.
+QUICK_AT = 2
+
+# Portable reveals. Above "caught" the task is built from one of these instead of
+# from the venue, so nothing has to be found, reached or leaned on.
+QUICK_MOVES = {
+    1: ["hook a thumb in the waistband and ease it down an inch",
+        "lift the hem to the navel and hold it there"],
+    2: ["lift the hem to just under the nipple and hold it",
+        "ease the waistband down to the top of the arse and hold it"],
+    3: ["pull the hem up over one nipple and leave it there",
+        "open the fly and ease the cage out through it"],
+    4: ["open the fly wide and bring the cage and balls fully out",
+        "turn your back and take the waistband down to the crease"],
+    5: ["open the fly, bring the cage fully out, and turn side on so the cage and arse both read",
+        "lift the hem over a nipple and open the fly in the same frame"],
+}
 
 # What worn gear physically permits, including how it is reached.
 GEAR_PHYSICS = {
     "cage": "worn on the cock - nothing shows until the trousers are open and pulled below it, "
-            "underwear with them. A shirt off reveals nothing.",
+            "underwear with them. A shirt off reveals nothing. It can be lifted off, but then it "
+            "is an object in your hand and no longer worn - say which.",
     "chastity": "same as a cage - trousers open and down past it, underwear pulled below. "
                 "Shirt is irrelevant to the shot.",
+    "plug": "a plug is inside - it is invisible from the front. It needs either a rear view with "
+            "the phone held low behind you, or your back turned to a mirror. It cannot share a "
+            "frame with something held out in front.",
     "blindfold": "a blindfolded sub cannot see the phone - give a timer, a count, or a mirror",
     "rope": "roped arms cannot hold the phone",
     "cuffs": "cuffed wrists mean the phone is propped or on a timer",
-    "plug": "sitting means the weight is on the plug",
     "collar": "a collar means a leash is available",
     "heels": "heels change the stance and the balance",
 }
 
-# How much comes off, by risk. Above "caught" this is only legal if the cover in
-# the task can carry it.
+# Only used for staged tasks now. Above "caught" the move sets the skin.
 SKIN_BY_RISK = {
     1: "the item over the subject shifted aside, nothing off",
     2: "the item over the subject opened, one quick moment",
@@ -133,6 +153,12 @@ COVER_BEATS = {
     "about": "turn away from the room or put something solid between you and them - name it",
     "watched": "cover is compulsory: behind something solid, in an alcove, facing the wall, or wait "
                "for the sightline to clear. Name it, and say what you are waiting for",
+}
+
+QUICK_COVER = {
+    "about": "angle away from the room and keep it brief - a shelf end, a corner, a pillar",
+    "watched": "put your back to the room and use the nearest dead ground - a shelf end, a corner, "
+               "a pillar. Brief and accepted beats hidden and impossible",
 }
 
 
@@ -191,6 +217,7 @@ def _tidy(text):
     text = re.sub(r"[ \t]*\)[ \t]*(?=[;,.])", "", text)
     text = re.sub(r"[ \t]+([;,.])", r"\1", text)
     text = re.sub(r";[ \t]*$", ".", text)
+    text = re.sub(r"\.(?=[A-Za-z])", ". ", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text.strip()
 
@@ -229,15 +256,13 @@ async def generate_task_text(state, session, *, voice, depth=0):
     effective = venue.effective_privacy(baseline_privacy, target)
     delta = max(0, venue.exposure_rank(effective) - venue.exposure_rank(baseline_privacy))
 
+    # One band per level, so the top of the ladder is only reached at the top of the ladder.
     actual_risk = venue.exposure_rank(effective) + 1 + INTENSITY_SHIFT.get(intensity, 0)
-    if venue.exposure_rank(effective) >= 2:
-        actual_risk += 1
     if no_cover:
         actual_risk -= 1
     actual_risk = max(1, min(5, actual_risk))
-    if no_cover:
-        actual_risk = min(4, actual_risk)
 
+    quick = venue.exposure_rank(effective) >= QUICK_AT
     needs_prop = random.random() < PROP_CHANCE
 
     yes_kinks = get_user_kinks(state, "yes")
@@ -268,18 +293,48 @@ async def generate_task_text(state, session, *, voice, depth=0):
     anatomy_note = f" ({guide['note']})" if guide["note"] else ""
 
     notes = venue.notes_for_prompt(state, location)
-    features = _features(state, location)
-    detail_block = (f"\nWhat she says is there - a sample of what is definitely available, "
-                    f"not a checklist: {notes}") if notes else ""
-    feature_block = (f"\nTypical of a place like this, some of which she has not mentioned: "
-                     f"{features}") if features else ""
     rooms_line = f"\nRooms in play: {', '.join(rooms)}" if rooms else ""
 
-    cover_beat = COVER_BEATS[effective]
-    cover_spot = venue.cover_hint(location) if venue.exposure_rank(effective) >= 2 else ""
-    if no_cover:
-        cover_beat = ("no cover here - keep it to one item, shoot close to the body, and use a wall "
-                      "you can face. Brief and accepted beats hidden and impossible.")
+    if quick:
+        chosen_move = random.choice(QUICK_MOVES[actual_risk])
+        detail_block = (f"\nBackdrop - name it in three words at most: {notes}" if notes else "")
+        feature_block = ""
+        skin_line = f"Move: {chosen_move}"
+        phone_line = "in one hand, low and close, nothing put down"
+        cover_beat = QUICK_COVER.get(effective, QUICK_COVER["about"])
+        if no_cover:
+            cover_beat = ("nothing to hide behind - turn your back, keep it brief, accept being seen")
+        order = """1. Choose the nearest dead ground you can reach in a few steps. Do not go looking for a
+   better room.
+2. Write the task around the Move line and nothing else."""
+        kind_rules = """- This is a quick reveal, not a staged scene. The setting is a backdrop - name it in a few
+  words and move on. Do not build the task around a feature.
+- Three or four sentences. Shorter than usual.
+- Adapt the Move line to what is worn and what the gear allows. Nothing is added to it.
+- One hand, phone low and close. No props, no surfaces, nothing to balance on.
+- No mirror unless the Move needs the front of the body."""
+    else:
+        chosen_move = None
+        detail_block = (f"\nWhat she says is there - a sample of what is definitely available, "
+                        f"not a checklist: {notes}") if notes else ""
+        features = _features(state, location)
+        feature_block = (f"\nTypical of a place like this, some of which she has not mentioned: "
+                         f"{features}") if features else ""
+        skin_line = f"Skin for risk {actual_risk}: {SKIN_BY_RISK[actual_risk]}"
+        phone_line = ("down and propped - both hands free, say what in three words" if needs_prop
+                      else "in one hand, nothing put down, the other hand free")
+        cover_beat = COVER_BEATS[effective]
+        if no_cover:
+            cover_beat = ("no cover here - keep it to one item, shoot close to the body, and use a "
+                          "wall you can face. Brief and accepted beats hidden and impossible.")
+        order = """1. Silently list 8 settings. Draw on the sample, the typical features, and one or two things
+   a place like this would plausibly have that nobody mentioned.
+2. Cross off anything blocked.
+3. Choose the setting that best supports risk {actual_risk}/5, preferring a room used least recently.
+4. Write the task around that single setting."""
+        kind_rules = """- Build the task around the setting. The sample is a guide, not a menu."""
+
+    cover_spot = venue.cover_hint(location) if not quick and venue.exposure_rank(effective) >= 2 else ""
 
     move_line = (f"{move} - you are now {effective} "
                  f"({venue.PRIVACY_DESC[effective].lower()})" if move else "stays where it is")
@@ -294,21 +349,16 @@ async def generate_task_text(state, session, *, voice, depth=0):
                          f"normally {venue.PRIVACY_LABELS[default].lower()}. Have the task say why "
                          f"it is quiet - time of day, closed, empty lane - or let someone appear.\n")
 
-    no_cover_line = ("No cover at this location. Write so nobody sees, or let it be brief and seen.\n"
-                     if no_cover else "")
-    phone_line = ("propped, timed, or on a mirror - say what, in three words" if needs_prop
-                  else "in one hand, nothing put down")
-
     prompt = f"""Write ONE task for a {gender} sub. Stay in voice, but obey the format exactly.
 
 Location: {location}{rooms_line}{detail_block}{feature_block}
 Context: {present}
 Privacy: {baseline_privacy} - {venue.PRIVACY_DESC[baseline_privacy]}
-{reconcile}{no_cover_line}This setting changes that: {move_line}
+{reconcile}This setting changes that: {move_line}
 Cover during the task: {effective}
 Cover (required): {cover_beat}{f" - available here: {cover_spot}" if cover_spot else ""}
 Risk: {actual_risk}/5 - {RISK_LEVELS[actual_risk]['description']}
-Skin for risk {actual_risk}: {SKIN_BY_RISK[actual_risk]}
+{skin_line}
 Phone: {phone_line}
 Wearing: {outfit}
 Gear physics - obey these: {gear or "nothing special"}
@@ -323,24 +373,20 @@ RECENTLY USED HERE - prefer variety:
 {recent_text}
 
 Work in this order:
-1. Silently list 8 settings. Draw on the sample, the typical features, and one or two things
-   a place like this would plausibly have that nobody mentioned.
-2. Cross off anything blocked.
-3. Choose the setting that best supports risk {actual_risk}/5, preferring a room used least recently.
-4. Write the task around that single setting.
+{order}
 
 Rules:
-- Single action, one photo, photo proof required
+- One action, one photo, photo proof required. At most two things for the sub to physically do,
+  counting undressing as one. If you have three, cut one.
 - No time durations
 - Never use: {', '.join(forbidden) or 'nothing'}
-- Name the chosen setting. Mention ONE supporting detail at most. Do not enumerate other features.
-- If the best setting is not in the sample, use it anyway as long as the venue supports it
-- Use a listed detail only if the task needs it. The sample is a guide, not a menu.
+{kind_rules}
 - Never name a body part the sub does not have
 - Obey the gear physics. Never claim an erection in a cage, never ask a blindfolded sub to frame a shot.
 - The task must expose what it photographs. If the subject is under clothing, say what moves and
   how far - never pair "shirt off" with something the shirt does not reveal.
 - Underwear is not a separate layer to count. It moves with the garment above it.
+- If gear comes off the body, say so, and stop describing it as worn.
 - Only hedge about gear that is not already in Wearing. If it is listed, treat it as fact.
 - Stay inside the rooms in play
 - Open with one clause grounding the privacy claim: "the place is dead", "it is early", "the door is locked"
@@ -348,17 +394,20 @@ Rules:
   deserted at "a few people around" or "people are looking at you" - name who is about instead.
 - When people are looking, someone must actually be looking, listening or talking to the sub. Name
   them and what they are doing.
-- Above "caught", the task must name its cover: what is between you and them, or what you are
-  waiting for. "Turned away" alone is not cover for a strip.
-- Cover must match the skin. If it cannot, reduce the skin by one band rather than dropping the cover.
-- If the person is stripped, the cover has to sit between them and every approach, not just the
-  one you can see.
+- Above "caught", nothing is stripped. Reveal, do not undress.
+- At "about" and above, the task must name its cover: what is between you and them, or what you are
+  angling away from. "Turned away" alone is not cover for a reveal.
+- Cover must match the skin. If it cannot, reduce by one band rather than dropping the cover.
 - Do not put the sub fully outside. One step is enough.
 - Waiting is described as an event, not a duration: "until the group at the counter turns away".
 - The phone is in one hand by default. Undress FIRST, then take the photo - do not try to do both.
+- If the Phone line says propped, both hands are free - do not also tell them to hold something.
 - Only use a prop when the thing being photographed is in both hands, or the shot needs distance.
 - If you use a prop, say what it is in three words or fewer. No elaborate rigs.
-- A mirror counts as a prop. Do not reach for one unless the shot needs the front of the body.
+- A mirror is a place, not a prop. A mirror shot is taken standing at the basin, body facing the
+  glass. If the shot is in a mirror there is no stall and no closed door.
+- If the privacy needs a door between them and people, drop the mirror and shoot in the stall. Never
+  write both a mirror and a stall in one task.
 - Say what the photo must show, concretely - the thing, and how much of the body is in frame
 - Direction must be physically true. Kneeling means looking down at yourself.
 - If you name a surface, name a real material: "the tiled floor", "the lane boards".
@@ -371,7 +420,7 @@ Rules:
 - Favour the specific over the generic
 
 Reply exactly:
-TASK: <the task, naming the setting>
+TASK: <the task>
 SETTING: <the setting, 2-5 words>
 EXPOSURE: <alone|caught|about|watched>"""
 
