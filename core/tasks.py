@@ -226,7 +226,6 @@ def _tidy(text):
 async def generate_task_text(state, session, *, voice, depth=0):
     gender = state.get("gender") or "nonbinary"
     location = state.get("location") or "Unknown"
-    rooms = state.get("rooms") or []
     others = state.get("context_others") or "alone"
     privacy = state.get("privacy") or ""
     intensity = state.get("intensity") or "standard"
@@ -257,13 +256,17 @@ async def generate_task_text(state, session, *, voice, depth=0):
     effective = venue.effective_privacy(baseline_privacy, target)
     delta = max(0, venue.exposure_rank(effective) - venue.exposure_rank(baseline_privacy))
 
-    # One band per level, so the top of the ladder is only reached at the top of the ladder.
+    quick = venue.exposure_rank(effective) >= QUICK_AT
+
+    # One band per level. Staged tasks get two bands on top because nothing has to
+    # stay quick: alone at home, a full strip is the obvious task.
     actual_risk = venue.exposure_rank(effective) + 1 + INTENSITY_SHIFT.get(intensity, 0)
+    if not quick:
+        actual_risk += 2
     if no_cover:
         actual_risk -= 1
     actual_risk = max(1, min(5, actual_risk))
 
-    quick = venue.exposure_rank(effective) >= QUICK_AT
     needs_prop = random.random() < PROP_CHANCE
 
     yes_kinks = get_user_kinks(state, "yes")
@@ -293,13 +296,8 @@ async def generate_task_text(state, session, *, voice, depth=0):
     anatomy = ", ".join(guide["body_parts"])
     anatomy_note = f" ({guide['note']})" if guide["note"] else ""
 
-    notes = venue.notes_for_prompt(state, location)
-    rooms_line = f"\nRooms in play: {', '.join(rooms)}" if rooms else ""
-
     if quick:
         chosen_move = random.choice(QUICK_MOVES[actual_risk])
-        detail_block = ""
-        feature_block = ""
         skin_line = f"Move: {chosen_move}"
         phone_line = "in one hand, low and close, nothing put down"
         cover_beat = QUICK_COVER.get(effective, QUICK_COVER["about"])
@@ -320,11 +318,6 @@ async def generate_task_text(state, session, *, voice, depth=0):
 - One wait at most, and only if the Move needs it."""
         setting_prompt = "SETTING: <how out of the way, 2-4 words>"
     else:
-        detail_block = (f"\nWhat she says is there - a sample of what is definitely available, "
-                        f"not a checklist: {notes}") if notes else ""
-        features = _features(state, location)
-        feature_block = (f"\nTypical of a place like this, some of which she has not mentioned: "
-                         f"{features}") if features else ""
         skin_line = f"Skin for risk {actual_risk}: {SKIN_BY_RISK[actual_risk]}"
         phone_line = ("down and propped - both hands free, say what in three words" if needs_prop
                       else "in one hand, nothing put down, the other hand free")
@@ -332,15 +325,15 @@ async def generate_task_text(state, session, *, voice, depth=0):
         if no_cover:
             cover_beat = ("no cover here - keep it to one item, shoot close to the body, and use a "
                           "wall you can face. Brief and accepted beats hidden and impossible.")
-        order = """1. Silently list 8 settings. Draw on the sample, the typical features, and one or two things
-   a place like this would plausibly have that nobody mentioned.
-2. Cross off anything blocked.
-3. Choose the setting that best supports risk {actual_risk}/5, preferring a room used least recently.
-4. Write the task around that single setting."""
-        kind_rules = "- Build the task around the setting. The sample is a guide, not a menu."
+        order = """1. Silently choose one setting inside this place. Nothing is listed for you - pick what a
+   place like this would plausibly have and what best supports risk {actual_risk}/5.
+2. Avoid anything blocked.
+3. Write the task around that one setting."""
+        kind_rules = """- You have the run of the place and nobody to dodge. Use two or three of its ordinary
+  fittings if the task needs them - a surface, a mirror, a door - and write it as a set piece.
+- Assume a place like this has the fittings its kind normally has. You do not need to be told.
+- If they do not have the room or the thing, they will say so and you rewrite."""
         setting_prompt = "SETTING: <the setting, 2-5 words>"
-
-    cover_spot = venue.cover_hint(location) if not quick and venue.exposure_rank(effective) >= 2 else ""
 
     move_line = (f"{move} - you are now {effective} "
                  f"({venue.PRIVACY_DESC[effective].lower()})" if move else "stays where it is")
@@ -357,12 +350,12 @@ async def generate_task_text(state, session, *, voice, depth=0):
 
     prompt = f"""Write ONE task for a {gender} sub. Stay in voice, but obey the format exactly.
 
-Location: {location}{rooms_line}{detail_block}{feature_block}
+Location: {location}
 Context: {present}
 Privacy: {baseline_privacy} - {venue.PRIVACY_DESC[baseline_privacy]}
 {reconcile}This setting changes that: {move_line}
 Cover during the task: {effective}
-Cover (required): {cover_beat}{f" - available here: {cover_spot}" if cover_spot else ""}
+Cover (required): {cover_beat}
 Risk: {actual_risk}/5 - {RISK_LEVELS[actual_risk]['description']}
 {skin_line}
 Phone: {phone_line}
@@ -394,8 +387,15 @@ Rules:
 - Underwear is not a separate layer to count. It moves with the garment above it.
 - If gear comes off the body, say so, and stop describing it as worn.
 - Only hedge about gear that is not already in Wearing. If it is listed, treat it as fact.
-- Stay inside the rooms in play
-- Open with one clause grounding the privacy claim: "the place is dead", "it is early", "the door is locked"
+- Only garments named in Wearing exist. Do not add a garment, a piece of jewellery or a kind of
+  underwear that is not listed. If you need underwear and none is named, say "your underwear".
+- The Skin line is a hard cap, not a suggestion. At 1-2 one garment moves and nothing comes off.
+  "Strip to nothing but" is only legal at 4-5.
+- English only, all of it. Do not drift into another language.
+- Open with one short clause about who is there, not about the place being quiet. At "nobody around"
+  just start. At the other levels say why you are not being seen.
+- At "nobody around", do not invent people. A group, a passer-by or a staff member only belongs if
+  they are in the venue description.
 - The Context line is the truth about who is there. Never call the place empty, dead, quiet or
   deserted at "a few people around" or "people are looking at you" - name who is about instead.
 - When people are looking, someone must actually be looking, listening or talking to the sub. Name
