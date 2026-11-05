@@ -254,11 +254,6 @@ async def generate_render(state, *, nude=False, scene_extra=""):
 async def deliver_reward(bot, user_id, *, caption, wish=""):
     state = st.get_state(user_id)
     png = await generate_render(state, nude=True, scene_extra=wish)
-    verdict = await verify.nude_check(png)
-    if verdict == "COVERED":
-        retry = await generate_render(state, nude=True, scene_extra=wish)
-        if await verify.nude_check(retry) != "COVERED":
-            png = retry
     await storage.deliver(bot, user_id, user_id, png, caption=caption, prefix="reward")
 
 
@@ -1082,9 +1077,8 @@ async def testreward_cmd(update, context):
     except Exception as exc:
         await update.effective_message.reply_text(f"Failed: {exc}")
         return
-    gate = await verify.nude_check(png)
     await render.debug_send(context.bot, png, label="testreward", chat_id=user.id,
-                            upscale_pass=True, gate=gate)
+                            upscale_pass=True)
 
 
 async def reset_cmd(update, context):
