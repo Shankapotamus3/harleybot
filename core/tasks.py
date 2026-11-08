@@ -1,4 +1,3 @@
-# core/tasks.py
 import re, os, random, logging
 from datetime import datetime, timezone
 from . import venue, venice
@@ -194,20 +193,6 @@ def _gear_notes(outfit):
     return " / ".join(hits[:3])
 
 
-def _claim_exposure(response, effective):
-    """Let the model raise the exposure it wrote. Never lower it."""
-    claimed = None
-    for line in response.splitlines():
-        if line.strip().upper().startswith("EXPOSURE:"):
-            claimed = line.split(":", 1)[1].strip().lower().strip(" .")
-    final = effective
-    claimed = venue.normalise_privacy(claimed)
-    if claimed:
-        final = venue.EXPOSURE_LADDER[max(venue.exposure_rank(claimed),
-                                          venue.exposure_rank(effective))]
-    return final
-
-
 def _tidy(text):
     """Drop heading lines and the template artefacts the model leaves behind."""
     kept = [l for l in text.splitlines()
@@ -299,7 +284,7 @@ async def generate_task_text(state, session, *, voice, depth=0):
     if quick:
         chosen_move = random.choice(QUICK_MOVES[actual_risk])
         skin_line = f"Move: {chosen_move}"
-        phone_line = "in one hand, low and close, nothing put down"
+        phone_line = "in your hand, out of shot - do not mention it"
         cover_beat = QUICK_COVER.get(effective, QUICK_COVER["about"])
         if no_cover:
             cover_beat = "nowhere to hide - turn your back, keep it brief, accept being seen"
@@ -319,8 +304,8 @@ async def generate_task_text(state, session, *, voice, depth=0):
         setting_prompt = "SETTING: <how out of the way, 2-4 words>"
     else:
         skin_line = f"Skin for risk {actual_risk}: {SKIN_BY_RISK[actual_risk]}"
-        phone_line = ("down and propped - both hands free, say what in three words" if needs_prop
-                      else "in one hand, nothing put down, the other hand free")
+        phone_line = ("propped - both hands free, say what in three words" if needs_prop
+                      else "in your hand, out of shot - do not mention it")
         cover_beat = COVER_BEATS[effective]
         if no_cover:
             cover_beat = ("no cover here - keep it to one item, shoot close to the body, and use a "
@@ -406,7 +391,12 @@ Rules:
 - Cover must match the skin. If it cannot, reduce by one band rather than dropping the cover.
 - Do not put the sub fully outside. One step is enough.
 - Waiting is described as an event, not a duration: "until the group at the counter turns away".
-- The phone is in one hand by default. Undress FIRST, then take the photo - do not try to do both.
+- The phone is the camera, not a prop. Never write it into the task text. It is never in the shot
+  unless the task is a mirror, and then the mirror is what gets named.
+- If the task is a mirror shot, name the mirror in the first sentence. The phone is in the frame,
+  aimed at the glass.
+- Never say "both hands". One hand holds the camera; say "your free hand".
+- Undress FIRST, then take the photo. Never both at once.
 - If the Phone line says propped, both hands are free - do not also tell them to hold something.
 - Only use a prop when the thing being photographed is in both hands, or the shot needs distance.
 - If you use a prop, say what it is in three words or fewer. No elaborate rigs.
@@ -440,7 +430,7 @@ EXPOSURE: <alone|caught|about|watched>"""
         if depth < 3 and gender == "male" and "breast" in response.lower():
             logger.warning("male sub got 'breasts', retrying")
             return await generate_task_text(state, session, voice=voice, depth=depth + 1)
-        final = _claim_exposure(response, effective)
+        final = effective
         setting, kept = None, []
         for line in response.splitlines():
             s = line.strip()

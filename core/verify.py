@@ -1,11 +1,17 @@
-# core/verify.py
 import re, base64, logging, asyncio
 from . import venice, render
 
 logger = logging.getLogger(__name__)
 
+FRAMING = """FRAMING: the sub shoots one-handed on the phone's front camera with no mirror unless the
+task names one. The phone is the camera, so it is not in its own shot. One-handed holds, partial
+crops and an out-of-frame second hand are normal."""
+
 FOLLOWUP = """The sub was asked for ONE specific thing after an earlier photo: {target}
 The original task was: {task}
+
+The phone is the camera and is not in the shot unless the task names a mirror. If the list is
+only the phone and there is no mirror, it is satisfied.
 
 Judge ONLY whether every item in that list is clearly visible. Ignore everything else about the task.
 
@@ -21,16 +27,19 @@ WHOLE = """Task: {task}
 
 Decide whether this photo proves the task was done.
 
+{FRAMING}
+
 Work in three steps, in order:
 
 1. ELEMENTS: list every element the task requires to be visible - the named body part, the state
    of the clothing, and anything the final sentence says the photo must show. Comma separated.
+   Do not list the phone. It is the camera.
 2. Check each one against the photo. Partly visible but unclear counts as absent.
 3. All of them or it fails. Two of three elements is a no.
 
 Fail if any element is absent, cropped out, hidden by a hand, in shadow, or still covered.
-Being in the right place is not evidence - the exposure is the evidence. Holding the phone
-one-handed and partial crops are normal, so do not fail for framing alone.
+Being in the right place is not evidence - the exposure is the evidence. Do not fail for framing
+alone.
 
 Reply exactly:
 ELEMENTS: <the list you made>
@@ -40,12 +49,15 @@ REASON: <what you can actually see, five words>"""
 
 PUBLIC = """Task: {task}
 
+{FRAMING}
+
 This was taken somewhere public, so the setting does not matter. Judge only the exposure.
 
 Work in three steps, in order:
 
 1. ELEMENTS: list every element the task requires to be visible - the named body part, the state
    of the clothing, and anything the final sentence says the photo must show. Comma separated.
+   Do not list the phone. It is the camera.
 2. Check each one against the photo. Partly visible but unclear counts as absent.
 3. All of them or it fails.
 
@@ -89,9 +101,9 @@ async def verify_photo(image_bytes, task_text, followup_target=None, public=Fals
     if followup_target:
         prompt = FOLLOWUP.format(target=followup_target, task=task_text)
     elif public:
-        prompt = PUBLIC.format(task=task_text)
+        prompt = PUBLIC.format(task=task_text, FRAMING=FRAMING)
     else:
-        prompt = WHOLE.format(task=task_text)
+        prompt = WHOLE.format(task=task_text, FRAMING=FRAMING)
     for _ in range(2):
         raw = await venice.analyze_image(b64, mime, prompt)
         if raw and raw.strip():
