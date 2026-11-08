@@ -1,4 +1,3 @@
-# harleybot.py
 import os
 os.environ.setdefault("IMAGE_MODEL", "chroma")
 os.environ.setdefault("IMAGE_FALLBACKS", "lustify-v8")
@@ -12,7 +11,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
                           MessageHandler, ContextTypes, filters)
 
-from core import state as st, venice, render, verify, venue, tasks as tk, prompts, storage
+from core import state as st, venice, render, verify, venue, tasks as tk, prompts, storage, framing
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -216,12 +215,8 @@ def main_menu():
     ])
 
 
-def _task_header(delta, label, baseline, risk, intensity):
-    bits = [f"Risk {risk}/5 ({intensity})"]
-    if delta:
-        bits.append(f"Exposure: {venue.PRIVACY_LABELS[label]} - was "
-                    f"{venue.PRIVACY_LABELS[baseline]}")
-    return "\n".join(bits) + "\n\n"
+def _task_header(risk, intensity):
+    return f"Risk {risk}/5 ({intensity})\n\n"
 
 
 async def generate_render(state, *, nude=False, scene_extra=""):
@@ -749,9 +744,7 @@ async def issue_task(update, context, label="TASK"):
         session.commit()
         context.job_queue.run_once(expire_task, when=timedelta(minutes=30),
                                    data={"user_id": user.id, "task_id": task.id})
-        base = venue.normalise_privacy(state.get("privacy")) or venue.privacy_default(
-            state.get("location") or "")
-        note = _task_header(delta, exposure, base, risk, state.get("intensity") or "standard")
+        note = _task_header(risk, state.get("intensity") or "standard")
         await update.effective_message.reply_text(
             f"{label}\n\n{note}{text}\n\n30 minutes.", reply_markup=task_keyboard(task.id, get_title()))
         if random.random() < TASK_PIC_CHANCE:
@@ -779,9 +772,8 @@ async def status_cmd(update, context):
             return
         left = (active.expires_at - datetime.now(timezone.utc)).total_seconds() / 60
         extra = f"\n\nNeeds: {active.followup_target}" if active.followup_target else ""
-        exposure = f"\nExposure: {active.exposure_label}" if active.exposure else ""
         await update.effective_message.reply_text(
-            f"{max(0, left):.0f} min left{exposure}\n\n{active.task_text[:200]}{extra}",
+            f"{max(0, left):.0f} min left\n\n{active.task_text[:200]}{extra}",
             reply_markup=task_keyboard(active.id, get_title()))
     finally:
         session.close()
@@ -857,8 +849,7 @@ async def blocker_input(update, context):
         task.expires_at = now + timedelta(minutes=30)
         task.blocked_count += 1
         session.commit()
-        base = venue.normalise_privacy(state.get("privacy")) or venue.privacy_default(loc)
-        note = _task_header(delta, exposure, base, risk, state.get("intensity") or "standard")
+        note = _task_header(risk, state.get("intensity") or "standard")
         await update.effective_message.reply_text(
             f"REWORKED\n\n{note}{new}\n\n30 minutes.", reply_markup=task_keyboard(task.id, get_title()))
     finally:
@@ -891,9 +882,7 @@ async def mercy_callback(update, context):
         task.verification_attempts, task.followup_target = 0, None
         task.expires_at = now + timedelta(minutes=30)
         session.commit()
-        base = venue.normalise_privacy(state.get("privacy")) or venue.privacy_default(
-            state.get("location") or "")
-        note = _task_header(delta, exposure, base, risk, state.get("intensity") or "standard")
+        note = _task_header(risk, state.get("intensity") or "standard")
         await context.bot.send_message(chat_id=user.id, text=f"NEW\n\n{note}{new}\n\n30 minutes.",
                                        reply_markup=task_keyboard(task.id, get_title()))
     finally:
@@ -958,11 +947,18 @@ async def handle_photo(update, context):
             await update.message.reply_text("Verifier down - resend, no attempt used.")
             return
         verified, missing, reason = verdict
+        if missing and verified != "yes":
+            real = framing.usable_missing(missing, task.task_text)
+            if not real:
+                verified = "yes"
+            else:
+                missing = ", ".join(real)
         if reason == "Verifier returned nothing":
             await update.message.reply_text("Verifier came back empty, doll - send it again, that one didn't count.")
             return
         task.verification_attempts += 1
-        task.sharpness = int(await asyncio.to_thread(render.sharpness_score, data))
+        score = await asyncio.to_thread(render.sharpness_score, data)
+        task.sharpness = int(score) if score is not None else None
         if up:
             task.cloudinary_url, task.cloudinary_public_id = up["url"], up["public_id"]
 
@@ -999,9 +995,16 @@ async def handle_photo(update, context):
         if missing:
             task.followup_target = missing
             session.commit()
+            parts = framing.split_missing(missing)
+            phone_miss = any(p.lower() in framing.SELFIE_INVISIBLE for p in parts)
+            if phone_miss and framing.needs_mirror(task.task_text):
+                body = "Can't see the phone. Shoot it in the mirror - phone in frame, aimed at the glass."
+            elif phone_miss:
+                body = f"Can't see {missing}."
+            else:
+                body = f"Can't see {missing}. One photo of just {missing} - close in, nothing else in frame."
             await update.message.reply_text(
-                f"Can't see {missing}. One photo of just {missing} - close in, nothing else in frame.\n\n"
-                f"{left} {'try' if left == 1 else 'tries'} left.", reply_markup=keyboard)
+                f"{body}\n\n{left} {'try' if left == 1 else 'tries'} left.", reply_markup=keyboard)
         else:
             task.followup_target = None
             session.commit()
@@ -1125,9 +1128,7 @@ async def scheduled_check(context):
             session.commit()
             context.job_queue.run_once(expire_task, when=timedelta(minutes=30),
                                        data={"user_id": row.user_id, "task_id": task.id})
-            base = venue.normalise_privacy(state.get("privacy")) or venue.privacy_default(
-                state.get("location") or "")
-            note = _task_header(delta, exposure, base, risk, state.get("intensity") or "standard")
+            note = _task_header(risk, state.get("intensity") or "standard")
             await context.bot.send_message(chat_id=row.user_id,
                                            text=f"AUTO\n\n{note}{text}\n\n30 minutes.",
                                            reply_markup=task_keyboard(task.id, get_title()))
