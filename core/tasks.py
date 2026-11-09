@@ -104,6 +104,18 @@ BODY_LABELS = ("TASK:", "SETTING:", "EXPOSURE:", "PEOPLE:", "CONTEXT:", "COVER:"
 # From this exposure up, the place stops being a scene and becomes a backdrop.
 QUICK_AT = 2
 
+# Garments that hang below the hip. If none are worn there is no fly and nothing
+# to push down, whatever the gear physics say.
+LEGWEAR_WORDS = ("trouser", "jean", "short", "jogger", "sweatpant", "legging",
+                 "skirt", "kilt", "cargo", "chino", "tights")
+
+# Trousers, fly, zip and pocket are the model's reflex when the outfit is bare.
+LEGWEAR_TELLS = ("trouser", "fly", "zip", "pocket", "waistband of your trousers")
+
+# Moves that put the sub somewhere other than where they already are.
+OUT_WORDS = ("lobby", "out into", "out onto", "outside", "car park", "pavement",
+             "steps", "street", "concourse", "foyer", "reception", "stairwell")
+
 # Portable reveals. Above "caught" the task is built from one of these instead of
 # from the venue, so nothing has to be found, reached or leaned on.
 QUICK_MOVES = {
@@ -112,20 +124,21 @@ QUICK_MOVES = {
     2: ["lift the hem to just under the nipple and hold it",
         "ease the waistband down to the top of the arse and hold it"],
     3: ["pull the hem up over one nipple and leave it there",
-        "open the fly and ease the cage out through it"],
-    4: ["open the fly wide, ease the waistband to mid-thigh, and bring the cage and balls out",
+        "ease the waistband down and bring the cage out over it"],
+    4: ["ease the waistband down to mid-thigh and bring the cage and balls out",
         "turn your back, ease the waistband to mid-thigh, and let the arse read"],
-    5: ["open the fly, ease the waistband to mid-thigh, bring the cage out and turn side on so the "
+    5: ["ease the waistband to mid-thigh, bring the cage out and turn side on so the "
         "cage and a cheek of the arse both read",
         "lift the hem over a nipple, ease the waistband to mid-thigh, and hold both"],
 }
 
 # What worn gear physically permits, including how it is reached.
 GEAR_PHYSICS = {
-    "cage": "worn on the cock - nothing shows until the fly is open and the trousers eased down to "
-            "mid-thigh at most, underwear with them. A shirt off reveals nothing. It can be lifted "
-            "off, but then it is an object in your hand and no longer worn - say which.",
-    "chastity": "same as a cage - fly open, trousers eased to mid-thigh, underwear with them. "
+    "cage": "worn on the cock and invisible until whatever is over it moves. Over trousers: fly "
+            "open, waistband to mid-thigh, underwear with it. Over a thong or nothing: the waistband "
+            "down or aside is the whole job. A shirt off reveals nothing. It can be lifted off, but "
+            "then it is an object in your hand and no longer worn - say which.",
+    "chastity": "same as a cage - whatever is over it moves, waistband to mid-thigh at most. "
                 "Shirt is irrelevant to the shot.",
     "plug": "a plug is inside - it is invisible from the front. It needs either a rear view with "
             "the phone held low behind you, or your back turned to a mirror. It cannot share a "
@@ -141,8 +154,8 @@ GEAR_PHYSICS = {
 SKIN_BY_RISK = {
     1: "the item over the subject shifted aside, nothing off",
     2: "the item over the subject opened, one quick moment",
-    3: "the item over the subject opened properly and pulled clear - shirt hem up, or trousers "
-       "and underwear down past the hip",
+    3: "the item over the subject opened properly and pulled clear - hem up, or waistband down "
+       "past the hip",
     4: "as above, and taken far enough that there is nothing in the way of the shot",
     5: "that item off entirely, or stripped right down - only if the cover allows it",
 }
@@ -193,6 +206,15 @@ def _gear_notes(outfit):
     return " / ".join(hits[:3])
 
 
+def _has_legwear(outfit):
+    low = (outfit or "").lower()
+    return any(w in low for w in LEGWEAR_WORDS)
+
+
+def _relocates(move):
+    return bool(move) and any(w in move.lower() for w in OUT_WORDS)
+
+
 def _tidy(text):
     """Drop heading lines and the template artefacts the model leaves behind."""
     kept = [l for l in text.splitlines()
@@ -216,6 +238,7 @@ async def generate_task_text(state, session, *, voice, depth=0):
     intensity = state.get("intensity") or "standard"
     outfit = state.get("outfit_detail") or state.get("current_outfit") or "clothing"
     gear = _gear_notes(outfit)
+    legwear = _has_legwear(outfit)
 
     blockers = session.query(LocationConstraint).filter(
         LocationConstraint.user_id == state.user_id,
@@ -281,6 +304,15 @@ async def generate_task_text(state, session, *, voice, depth=0):
     anatomy = ", ".join(guide["body_parts"])
     anatomy_note = f" ({guide['note']})" if guide["note"] else ""
 
+    lower = "" if legwear else ("No legwear is worn - no fly, no zip, no pocket, nothing to push "
+                                "down. The waistband alone is what moves.\n")
+    travel = ""
+    if not legwear and _relocates(move):
+        travel = (f"They are in {outfit} and cannot walk out like that. They may pull on ONE minimal "
+                  f"item for the walk and take it off at the spot - name the item, say it comes off. "
+                  f"Do not dress them fully.")
+    travel_line = f"Travel: {travel}\n" if travel else ""
+
     if quick:
         chosen_move = random.choice(QUICK_MOVES[actual_risk])
         skin_line = f"Move: {chosen_move}"
@@ -296,9 +328,9 @@ async def generate_task_text(state, session, *, voice, depth=0):
 - Adapt the Move line to what is worn and what the gear allows. Nothing is added to it.
 - One hand, phone low and close. No props, no surfaces, nothing to balance on.
 - No mirror unless the Move needs the front of the body.
-- Trousers go no lower than mid-thigh and nothing comes off. Undressing is what makes a quick
-  task feel like getting caught.
-- Do not add garments to the Move. If the Move says the fly, the trousers stay up.
+- One item may come off, not a full strip. If the Move works with everything still on, leave it on.
+- A travel garment put on for the walk comes off again at the spot.
+- Do not add garments to the Move, beyond a travel garment.
 - Count the verbs. More than two actions means cut one.
 - One wait at most, and only if the Move needs it."""
         setting_prompt = "SETTING: <how out of the way, 2-4 words>"
@@ -345,7 +377,7 @@ Risk: {actual_risk}/5 - {RISK_LEVELS[actual_risk]['description']}
 {skin_line}
 Phone: {phone_line}
 Wearing: {outfit}
-Gear physics - obey these: {gear or "nothing special"}
+{lower}{travel_line}Gear physics - obey these: {gear or "nothing special"}
 Anatomy - only these exist{anatomy_note}: {anatomy}
 DESIRED: {', '.join(yes_kinks) or 'none'}
 USE: {', '.join(selected)}
@@ -374,8 +406,12 @@ Rules:
 - Only hedge about gear that is not already in Wearing. If it is listed, treat it as fact.
 - Only garments named in Wearing exist. Do not add a garment, a piece of jewellery or a kind of
   underwear that is not listed. If you need underwear and none is named, say "your underwear".
+- If the Wearing line names no legwear, never write trousers, fly, zip or pocket.
+- A garment goes to mid-thigh or to the ankles. Pick one, never both.
+- Never require the front and the back of the body in the same frame unless the stance says how.
+  If both must read, say "side on", or "bent forward, looking back at the mirror".
 - The Skin line is a hard cap, not a suggestion. At 1-2 one garment moves and nothing comes off.
-  "Strip to nothing but" is only legal at 4-5.
+  "Strip to nothing but" is only legal at 4-5. On a quick task the Move line is the cap instead.
 - English only, all of it. Do not drift into another language.
 - Open with one short clause about who is there, not about the place being quiet. At "nobody around"
   just start. At the other levels say why you are not being seen.
@@ -385,23 +421,25 @@ Rules:
   deserted at "a few people around" or "people are looking at you" - name who is about instead.
 - When people are looking, someone must actually be looking, listening or talking to the sub. Name
   them and what they are doing.
-- Above "caught", nothing is stripped. Reveal, do not undress.
+- Above "caught", reveal first. One item may then come off if the Move needs it - never a full strip.
 - At "about" and above, the task must name its cover: what is between you and them, or what you are
   angling away from. "Turned away" alone is not cover for a reveal.
 - Cover must match the skin. If it cannot, reduce by one band rather than dropping the cover.
 - Do not put the sub fully outside. One step is enough.
+- Transit is not the task. If the Travel line says they need to cover up, they put one thing on for
+  the walk and it comes off at the spot. Name both, briefly.
 - Waiting is described as an event, not a duration: "until the group at the counter turns away".
 - The phone is the camera, not a prop. Never write it into the task text. It is never in the shot
   unless the task is a mirror, and then the mirror is what gets named.
 - If the task is a mirror shot, name the mirror in the first sentence. The phone is in the frame,
-  aimed at the glass.
+  aimed at the glass, and the other hand is the free one.
 - Never say "both hands". One hand holds the camera; say "your free hand".
 - Undress FIRST, then take the photo. Never both at once.
 - If the Phone line says propped, both hands are free - do not also tell them to hold something.
 - Only use a prop when the thing being photographed is in both hands, or the shot needs distance.
 - If you use a prop, say what it is in three words or fewer. No elaborate rigs.
-- A mirror is a place, not a prop. A mirror shot is taken standing at the basin, body facing the
-  glass. If the shot is in a mirror there is no stall and no closed door.
+- A mirror is a place, not a prop. A mirror shot is taken standing at the basin or in front of the
+  glass, body facing it. If the shot is in a mirror there is no stall and no closed door.
 - If the privacy needs a door between them and people, drop the mirror and shoot in the stall. Never
   write both a mirror and a stall in one task.
 - Say what the photo must show, concretely - the thing, and how much of the body is in frame
@@ -429,6 +467,9 @@ EXPOSURE: <alone|caught|about|watched>"""
                 return await generate_task_text(state, session, voice=voice, depth=depth + 1)
         if depth < 3 and gender == "male" and "breast" in response.lower():
             logger.warning("male sub got 'breasts', retrying")
+            return await generate_task_text(state, session, voice=voice, depth=depth + 1)
+        if depth < 3 and not legwear and not travel and any(w in response.lower() for w in LEGWEAR_TELLS):
+            logger.warning("no legwear but legwear named, retrying")
             return await generate_task_text(state, session, voice=voice, depth=depth + 1)
         final = effective
         setting, kept = None, []
