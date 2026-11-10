@@ -1,6 +1,6 @@
 import re, os, random, logging
 from datetime import datetime, timezone
-from . import venue, venice
+from . import venue, venice, venue_ai
 from .state import LocationConstraint
 
 logger = logging.getLogger(__name__)
@@ -97,27 +97,25 @@ FALLBACKS = {
 
 MAX_FEATURES = 6
 
-# Lines the model sometimes writes as headings. They are dropped from the body.
 BODY_LABELS = ("TASK:", "SETTING:", "EXPOSURE:", "PEOPLE:", "CONTEXT:", "COVER:",
-               "RISK:", "PRIVACY:", "LOCATION:", "SKIN:", "MOVE:", "BACKDROP:")
+               "RISK:", "PRIVACY:", "LOCATION:", "SKIN:", "MOVE:", "BACKDROP:",
+               "ONLY:", "NOTE:", "STEP:", "RULES:")
 
-# From this exposure up, the place stops being a scene and becomes a backdrop.
 QUICK_AT = 2
 
-# Garments that hang below the hip. If none are worn there is no fly and nothing
-# to push down, whatever the gear physics say.
 LEGWEAR_WORDS = ("trouser", "jean", "short", "jogger", "sweatpant", "legging",
                  "skirt", "kilt", "cargo", "chino", "tights")
 
-# Trousers, fly, zip and pocket are the model's reflex when the outfit is bare.
 LEGWEAR_TELLS = ("trouser", "fly", "zip", "pocket", "waistband of your trousers")
 
-# Moves that put the sub somewhere other than where they already are.
 OUT_WORDS = ("lobby", "out into", "out onto", "outside", "car park", "pavement",
              "steps", "street", "concourse", "foyer", "reception", "stairwell")
 
-# Portable reveals. Above "caught" the task is built from one of these instead of
-# from the venue, so nothing has to be found, reached or leaned on.
+NON_ENGLISH = ("continuar", "continuar", "verdader", "falso", "eikä", "sittemmin",
+               "jätti", "perillisi", "apartamentuak", "och", "att", "med", "för",
+               "är", "nous", "vous", "avec", "pour", "dans", "pero", "porque",
+               "este", "esta", "muy", "mucho")
+
 QUICK_MOVES = {
     1: ["hook a thumb in the waistband and ease it down an inch",
         "lift the hem to the navel and hold it there"],
@@ -132,7 +130,6 @@ QUICK_MOVES = {
         "lift the hem over a nipple, ease the waistband to mid-thigh, and hold both"],
 }
 
-# What worn gear physically permits, including how it is reached.
 GEAR_PHYSICS = {
     "cage": "worn on the cock and invisible until whatever is over it moves. Over trousers: fly "
             "open, waistband to mid-thigh, underwear with it. Over a thong or nothing: the waistband "
@@ -150,7 +147,6 @@ GEAR_PHYSICS = {
     "heels": "heels change the stance and the balance",
 }
 
-# Only used for staged tasks now. Above "caught" the move sets the skin.
 SKIN_BY_RISK = {
     1: "the item over the subject shifted aside, nothing off",
     2: "the item over the subject opened, one quick moment",
@@ -162,16 +158,14 @@ SKIN_BY_RISK = {
 
 COVER_BEATS = {
     "alone": "no cover needed - take your time",
-    "caught": "keep it quick and low, phone close to the body, have something to hand",
-    "about": "turn away from the room or put something solid between you and them - name it",
-    "watched": "cover is compulsory: behind something solid, in an alcove, facing the wall, or wait "
-               "for the sightline to clear. Name it, and say what you are waiting for",
+    "caught": "keep it low and finish before anyone comes",
+    "about": "people are around and not looking - get behind {spot} and name it",
+    "watched": "people are looking - get out of the eyeline, behind {spot}, and name it",
 }
 
 QUICK_COVER = {
-    "about": "get out of the main flow - a dead corner, a wall you can face, the far end of the aisle",
-    "watched": "put your back to the main flow somewhere out of the way - a dead corner, a wall, the "
-               "far end of the aisle. Brief and accepted beats hidden and impossible",
+    "about": "get out of the flow - {spot}",
+    "watched": "put your back to the flow with {spot} behind you. Unnoticed beats seen and accepted",
 }
 
 
@@ -195,14 +189,15 @@ def reward_threshold(streak, exposure=0):
     return max(3, random.randint(5, 10) - min(3, streak // 5) - min(2, exposure))
 
 
-def _features(state, location):
-    """A short shuffled sample of what a place like this has. Never the full list."""
-    return venue.venue_typical_features(state, location)
-
-
 def _gear_notes(outfit):
     low = (outfit or "").lower()
-    hits = [v for k, v in GEAR_PHYSICS.items() if k in low]
+    hits = []
+    for k, v in GEAR_PHYSICS.items():
+        if k not in low:
+            continue
+        if re.search(rf"\b(no|without|not wearing|off)\s+(the\s+|a\s+|my\s+)?{k}\b", low):
+            continue
+        hits.append(v)
     return " / ".join(hits[:3])
 
 
@@ -215,8 +210,28 @@ def _relocates(move):
     return bool(move) and any(w in move.lower() for w in OUT_WORDS)
 
 
+def worn_line(state):
+    return (state.get("outfit_detail")
+            or ", ".join(state.get("outfit_items") or [])
+            or state.get("current_outfit") or "clothing")
+
+
+def privacy_default(state):
+    prof = state.get("venue_profile") or {}
+    return (venue.normalise_privacy(prof.get("privacy"))
+            or venue.privacy_default(state.get("location") or ""))
+
+
+async def venue_profile(state, location):
+    cached = state.get("venue_profile")
+    if cached and cached.get("location") == location:
+        return cached
+    prof = await venue_ai.profile(location)
+    state["venue_profile"] = prof
+    return prof
+
+
 def _tidy(text):
-    """Drop heading lines and the template artefacts the model leaves behind."""
     kept = [l for l in text.splitlines()
             if not any(l.strip().upper().startswith(p) for p in BODY_LABELS)]
     text = "\n".join(kept)
@@ -236,9 +251,13 @@ async def generate_task_text(state, session, *, voice, depth=0):
     others = state.get("context_others") or "alone"
     privacy = state.get("privacy") or ""
     intensity = state.get("intensity") or "standard"
-    outfit = state.get("outfit_detail") or state.get("current_outfit") or "clothing"
+    outfit = worn_line(state)
     gear = _gear_notes(outfit)
     legwear = _has_legwear(outfit)
+
+    prof = await venue_profile(state, location)
+    default = privacy_default(state)
+    spot = (state.get("hide_spot") or "").strip() or random.choice(prof["cover"])
 
     blockers = session.query(LocationConstraint).filter(
         LocationConstraint.user_id == state.user_id,
@@ -248,17 +267,15 @@ async def generate_task_text(state, session, *, voice, depth=0):
     no_cover = any(venue.is_no_cover(b.constraint) for b in blockers)
 
     stated = venue.normalise_privacy(privacy)
-    default = venue.privacy_default(location)
     baseline_privacy = stated or default
 
-    # Occupancy comes from the privacy level. context_others only adds children.
     present = venue.PRIVACY_DESC[baseline_privacy]
     if others == "kids":
         present = f"{present}, and children may be about"
 
     move, target = None, 0
     if random.random() < float(os.getenv("EXPOSURE_CHANCE", "0.35")):
-        move, target = venue.pick_exposure(state, baseline_privacy,
+        move, target = venue.pick_exposure(baseline_privacy, prof["moves"],
                                            [b.constraint for b in blockers])
 
     effective = venue.effective_privacy(baseline_privacy, target)
@@ -266,8 +283,6 @@ async def generate_task_text(state, session, *, voice, depth=0):
 
     quick = venue.exposure_rank(effective) >= QUICK_AT
 
-    # One band per level. Staged tasks get two bands on top because nothing has to
-    # stay quick: alone at home, a full strip is the obvious task.
     actual_risk = venue.exposure_rank(effective) + 1 + INTENSITY_SHIFT.get(intensity, 0)
     if not quick:
         actual_risk += 2
@@ -291,11 +306,11 @@ async def generate_task_text(state, session, *, voice, depth=0):
             rest = [k for k in yes_kinks if k not in selected]
             if rest:
                 selected.append(random.choice(rest))
-    slots = random.randint(1, 3) - len(selected)
-    if slots > 0 and okay_kinks:
+    slots_n = random.randint(1, 3) - len(selected)
+    if slots_n > 0 and okay_kinks:
         avail = [k for k in okay_kinks if k not in selected]
         if avail:
-            selected.extend(random.sample(avail, min(slots, len(avail))))
+            selected.extend(random.sample(avail, min(slots_n, len(avail))))
 
     recent = (state.get("recent_settings") or [])[-8:]
     recent_text = "\n".join(f"- {r}" for r in recent) if recent else "none yet"
@@ -312,12 +327,17 @@ async def generate_task_text(state, session, *, voice, depth=0):
                   f"item for the walk and take it off at the spot - name the item, say it comes off. "
                   f"Do not dress them fully.")
     travel_line = f"Travel: {travel}\n" if travel else ""
+    underdressed = ""
+    if not legwear and venue.exposure_rank(default) >= 2:
+        underdressed = (f"They are in {outfit} in a {location} - wildly underdressed for it. Say so "
+                        f"once, then make the concealment the point: nobody expects this here, so the "
+                        f"only way it works is not being spotted.\n")
 
     if quick:
         chosen_move = random.choice(QUICK_MOVES[actual_risk])
         skin_line = f"Move: {chosen_move}"
         phone_line = "in your hand, out of shot - do not mention it"
-        cover_beat = QUICK_COVER.get(effective, QUICK_COVER["about"])
+        cover_beat = QUICK_COVER.get(effective, QUICK_COVER["about"]).format(spot=spot)
         if no_cover:
             cover_beat = "nowhere to hide - turn your back, keep it brief, accept being seen"
         order = """1. Get out of the main flow. Anywhere will do - do not go looking for a particular fixture.
@@ -338,7 +358,7 @@ async def generate_task_text(state, session, *, voice, depth=0):
         skin_line = f"Skin for risk {actual_risk}: {SKIN_BY_RISK[actual_risk]}"
         phone_line = ("propped - both hands free, say what in three words" if needs_prop
                       else "in your hand, out of shot - do not mention it")
-        cover_beat = COVER_BEATS[effective]
+        cover_beat = COVER_BEATS[effective].format(spot=spot)
         if no_cover:
             cover_beat = ("no cover here - keep it to one item, shoot close to the body, and use a "
                           "wall you can face. Brief and accepted beats hidden and impossible.")
@@ -368,6 +388,7 @@ async def generate_task_text(state, session, *, voice, depth=0):
     prompt = f"""Write ONE task for a {gender} sub. Stay in voice, but obey the format exactly.
 
 Location: {location}
+Fittings here: {', '.join(prof['fittings'])}
 Context: {present}
 Privacy: {baseline_privacy} - {venue.PRIVACY_DESC[baseline_privacy]}
 {reconcile}This setting changes that: {move_line}
@@ -377,7 +398,7 @@ Risk: {actual_risk}/5 - {RISK_LEVELS[actual_risk]['description']}
 {skin_line}
 Phone: {phone_line}
 Wearing: {outfit}
-{lower}{travel_line}Gear physics - obey these: {gear or "nothing special"}
+{lower}{travel_line}{underdressed}Gear physics - obey these: {gear or "nothing special"}
 Anatomy - only these exist{anatomy_note}: {anatomy}
 DESIRED: {', '.join(yes_kinks) or 'none'}
 USE: {', '.join(selected)}
@@ -391,7 +412,16 @@ RECENTLY USED HERE - prefer variety:
 Work in this order:
 {order}
 
+WHAT THIS IS:
+- Nobody here agreed to any of it. The sub cannot explain themselves to a stranger, so the task must
+  work without one. Never ask a passer-by to hold the phone, take the photo, or watch.
+- The aim is that nobody notices. Exposure is the thrill; being spotted is the failure state.
+- Concealment is the point of the task, not a safety note. Build it so a bystander would have to
+  look twice.
+- Name what is between them and the nearest sightline, and why nobody will turn round.
+
 Rules:
+- Two steps maximum. A conditional ("if X, do Y") counts as two on its own.
 - One action, one photo, photo proof required. At most two things for the sub to physically do,
   counting undressing as one. If you have three, cut one.
 - No time durations
@@ -412,7 +442,7 @@ Rules:
   If both must read, say "side on", or "bent forward, looking back at the mirror".
 - The Skin line is a hard cap, not a suggestion. At 1-2 one garment moves and nothing comes off.
   "Strip to nothing but" is only legal at 4-5. On a quick task the Move line is the cap instead.
-- English only, all of it. Do not drift into another language.
+- English only, all of it. No foreign words, no foreign headings, no "ONLY:" or "NOTE:".
 - Open with one short clause about who is there, not about the place being quiet. At "nobody around"
   just start. At the other levels say why you are not being seen.
 - At "nobody around", do not invent people. A group, a passer-by or a staff member only belongs if
@@ -428,6 +458,10 @@ Rules:
 - Do not put the sub fully outside. One step is enough.
 - Transit is not the task. If the Travel line says they need to cover up, they put one thing on for
   the walk and it comes off at the spot. Name both, briefly.
+- Do not write a task that only works if somebody sees.
+- Never involve a stranger. No asking, no holding, no counting for them.
+- If what they are wearing is far barer than the place expects, say so once and make the
+  concealment the point.
 - Waiting is described as an event, not a duration: "until the group at the counter turns away".
 - The phone is the camera, not a prop. Never write it into the task text. It is never in the shot
   unless the task is a mirror, and then the mirror is what gets named.
@@ -442,8 +476,10 @@ Rules:
   glass, body facing it. If the shot is in a mirror there is no stall and no closed door.
 - If the privacy needs a door between them and people, drop the mirror and shoot in the stall. Never
   write both a mirror and a stall in one task.
-- Say what the photo must show, concretely - the thing, and how much of the body is in frame
+- Say what the photo must show, concretely - the thing, and how much of the body is in frame. The
+  last sentence says what is bare and where it is in the frame.
 - Direction must be physically true. Kneeling means looking down at yourself.
+- If a word means two things in this place, qualify it - "bowling balls", not "balls".
 - If you name a surface, name a real material: "the tiled floor", "the lane boards".
 - Never leave a blank, underscore, bracket or dangling punctuation. If a detail is unknown, invent
   a plausible one and name it.
@@ -470,6 +506,9 @@ EXPOSURE: <alone|caught|about|watched>"""
             return await generate_task_text(state, session, voice=voice, depth=depth + 1)
         if depth < 3 and not legwear and not travel and any(w in response.lower() for w in LEGWEAR_TELLS):
             logger.warning("no legwear but legwear named, retrying")
+            return await generate_task_text(state, session, voice=voice, depth=depth + 1)
+        if depth < 3 and any(f" {w} " in f" {response.lower()} " for w in NON_ENGLISH):
+            logger.warning("language drift, retrying")
             return await generate_task_text(state, session, voice=voice, depth=depth + 1)
         final = effective
         setting, kept = None, []
