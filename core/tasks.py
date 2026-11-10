@@ -5,7 +5,7 @@ from .state import LocationConstraint
 
 logger = logging.getLogger(__name__)
 
-PROP_CHANCE = float(os.getenv("PROP_CHANCE", "0.15"))
+PROP_CHANCE = float(os.getenv("PROP_CHANCE", "0.10"))
 
 RISK_LEVELS = {
     1: {"name": "Comfortable", "description": "Nothing comes off, clothing shifted aside"},
@@ -55,6 +55,32 @@ KINK_CATEGORIES = {
     "kink_social_media": ("Social Media", "Online exposure"),
 }
 
+# How each kink shows up in prose. Used to prove the task actually expresses one.
+KINK_TELLS = {
+    "exposure": ("seen", "watching", "looking", "audience", "spotted", "noticed"),
+    "humiliation": ("embarrass", "humiliat", "ashamed", "silly", "fool", "ridiculous"),
+    "degradation": ("degrad", "cheap", "slut", "whore", "object", "beg", "lesser"),
+    "bondage": ("tie", "rope", "bind", "cuff", "restrain", "knot"),
+    "pain": ("ache", "sting", "bite", "throb", "hurt", "burn"),
+    "service": ("serve", "fetch", "carry", "chore", "hold it for", "wait on"),
+    "edging": ("edge", "don't come", "denial", "stop before", "hold it back"),
+    "watersports": ("piss", "pee", "wet yourself"),
+    "exhibitionism": ("exposed", "out in the open", "anyone could", "in public"),
+    "roleplay": ("pretend", "imagine you're", "play the part", "act like"),
+    "petplay": ("pet", "puppy", "kitten", "collar", "on all fours", "paw"),
+    "feminization": ("panties", "skirt", "feminine", "sissy", "bra", "stockings"),
+    "cbt": ("squeeze", "pull", "weight", "slap your balls", "balls"),
+    "breathplay": ("breath", "choke", "hold your breath"),
+    "sensory": ("blindfold", "can't see", "in the dark"),
+    "temperature": ("cold", "ice", "wax", "heat", "chilled"),
+    "marking": ("write", "marker", "written on", "scribble"),
+    "spanking": ("slap", "spank", "smack", "strike"),
+    "nipple": ("nipple", "pinch", "clamp"),
+    "anal": ("plug", "inside you", "arse", "ass"),
+    "gags": ("gag", "mouth full", "can't speak", "muffled"),
+    "social_media": ("post", "upload", "share online", "caption"),
+}
+
 KINK_LEVELS = {
     "no": {"emoji": "X", "name": "No", "desc": "Hard limit"},
     "okay": {"emoji": "O", "name": "Okay", "desc": "Allowed"},
@@ -88,11 +114,12 @@ FORBIDDEN_KEYWORDS = {
 }
 
 FALLBACKS = {
-    1: "Strip completely at {loc} and photograph your reflection",
-    2: "Strip at {loc} near the unlocked door and take a photo",
-    3: "Expose yourself at {loc} near a window and photograph the view",
-    4: "Step just outside the {loc} doorway, expose yourself, and take a photo",
-    5: "Walk to the end of the {loc} hallway, expose yourself briefly, photograph the empty hall behind you",
+    1: "Lift your shirt and hold it under your chest so the underside shows, hip cocked, and say what "
+       "you want done to you",
+    2: "Ease the waistband down and hold it there, and describe the one thing you'd beg for",
+    3: "Get it out and hold it clear, and say out loud what you'd let someone do to it",
+    4: "Out and held, turned enough to read, and name the thing you'd let them do without asking",
+    5: "Everything out and held up to the lens, and a line about what you'd do if someone walked in",
 }
 
 MAX_FEATURES = 6
@@ -111,23 +138,32 @@ LEGWEAR_TELLS = ("trouser", "fly", "zip", "pocket", "waistband of your trousers"
 OUT_WORDS = ("lobby", "out into", "out onto", "outside", "car park", "pavement",
              "steps", "street", "concourse", "foyer", "reception", "stairwell")
 
-NON_ENGLISH = ("continuar", "continuar", "verdader", "falso", "eikä", "sittemmin",
+NON_ENGLISH = ("continuar", "continuer", "verdader", "falso", "eikä", "sittemmin",
                "jätti", "perillisi", "apartamentuak", "och", "att", "med", "för",
                "är", "nous", "vous", "avec", "pour", "dans", "pero", "porque",
                "este", "esta", "muy", "mucho")
 
-QUICK_MOVES = {
+ANATOMY_WORDS = ("cock", "balls", "arse", "ass", "chest", "breast", "nipple", "pussy",
+                 "genitals", "thigh", "hip", "bare", "naked", "nude", "strip")
+
+# The body action, fixed per risk band. Both task kinds build on this.
+MOVES = {
     1: ["hook a thumb in the waistband and ease it down an inch",
-        "lift the hem to the navel and hold it there"],
+        "lift the hem to the navel and hold it there",
+        "drag a fingertip down your own sternum and leave it low"],
     2: ["lift the hem to just under the nipple and hold it",
-        "ease the waistband down to the top of the arse and hold it"],
+        "ease the waistband down to the top of the arse and hold it",
+        "cup yourself through the fabric and squeeze once"],
     3: ["pull the hem up over one nipple and leave it there",
-        "ease the waistband down and bring the cage out over it"],
+        "ease the waistband down and bring the cage out over it",
+        "get a hand inside and work yourself slowly"],
     4: ["ease the waistband down to mid-thigh and bring the cage and balls out",
-        "turn your back, ease the waistband to mid-thigh, and let the arse read"],
+        "turn your back, ease the waistband to mid-thigh, and let the arse read",
+        "get it out and work it, stopping just short"],
     5: ["ease the waistband to mid-thigh, bring the cage out and turn side on so the "
         "cage and a cheek of the arse both read",
-        "lift the hem over a nipple, ease the waistband to mid-thigh, and hold both"],
+        "lift the hem over a nipple, ease the waistband to mid-thigh, and hold both",
+        "everything out, working yourself with the other hand, held at the edge"],
 }
 
 GEAR_PHYSICS = {
@@ -187,6 +223,14 @@ def get_user_kinks(state, level=None):
 
 def reward_threshold(streak, exposure=0):
     return max(3, random.randint(5, 10) - min(3, streak // 5) - min(2, exposure))
+
+
+def _pick_move(risk, state):
+    recent = state.get("recent_moves") or []
+    pool = [m for m in MOVES[risk] if m not in recent]
+    move = random.choice(pool or MOVES[risk])
+    state["recent_moves"] = (recent + [move])[-6:]
+    return move
 
 
 def _gear_notes(outfit):
@@ -290,7 +334,7 @@ async def generate_task_text(state, session, *, voice, depth=0):
         actual_risk -= 1
     actual_risk = max(1, min(5, actual_risk))
 
-    needs_prop = random.random() < PROP_CHANCE
+    needs_prop = (not quick) and random.random() < PROP_CHANCE
 
     yes_kinks = get_user_kinks(state, "yes")
     okay_kinks = get_user_kinks(state, "okay")
@@ -311,6 +355,8 @@ async def generate_task_text(state, session, *, voice, depth=0):
         avail = [k for k in okay_kinks if k not in selected]
         if avail:
             selected.extend(random.sample(avail, min(slots_n, len(avail))))
+
+    tells = [w for k in selected for w in KINK_TELLS.get(k, ())]
 
     recent = (state.get("recent_settings") or [])[-8:]
     recent_text = "\n".join(f"- {r}" for r in recent) if recent else "none yet"
@@ -333,8 +379,9 @@ async def generate_task_text(state, session, *, voice, depth=0):
                         f"once, then make the concealment the point: nobody expects this here, so the "
                         f"only way it works is not being spotted.\n")
 
+    chosen_move = _pick_move(actual_risk, state)
+
     if quick:
-        chosen_move = random.choice(QUICK_MOVES[actual_risk])
         skin_line = f"Move: {chosen_move}"
         phone_line = "in your hand, out of shot - do not mention it"
         cover_beat = QUICK_COVER.get(effective, QUICK_COVER["about"]).format(spot=spot)
@@ -355,19 +402,21 @@ async def generate_task_text(state, session, *, voice, depth=0):
 - One wait at most, and only if the Move needs it."""
         setting_prompt = "SETTING: <how out of the way, 2-4 words>"
     else:
-        skin_line = f"Skin for risk {actual_risk}: {SKIN_BY_RISK[actual_risk]}"
+        skin_line = (f"Move: {chosen_move}\n"
+                     f"Skin cap for risk {actual_risk}: {SKIN_BY_RISK[actual_risk]}")
         phone_line = ("propped - both hands free, say what in three words" if needs_prop
                       else "in your hand, out of shot - do not mention it")
         cover_beat = COVER_BEATS[effective].format(spot=spot)
         if no_cover:
             cover_beat = ("no cover here - keep it to one item, shoot close to the body, and use a "
                           "wall you can face. Brief and accepted beats hidden and impossible.")
-        order = """1. Silently choose one setting inside this place. Nothing is listed for you - pick what a
-   place like this would plausibly have and what best supports risk {actual_risk}/5.
+        order = """1. Pick one fitting inside this place that the Move can be done against.
 2. Avoid anything blocked.
-3. Write the task around that one setting."""
-        kind_rules = """- You have the run of the place and nobody to dodge. Use two or three of its ordinary
-  fittings if the task needs them - a surface, a mirror, a door - and write it as a set piece.
+3. Write the set piece around the Move."""
+        kind_rules = """- Build the set piece around the Move line. The Move is the body action; the setting is only
+  where it happens. Do not invent a different action.
+- You have the run of the place for the setting and nobody to dodge. Name one fitting the Move can be
+  done against and write it as a scene.
 - Assume a place like this has the fittings its kind normally has. You do not need to be told.
 - If they do not have the room or the thing, they will say so and you rewrite."""
         setting_prompt = "SETTING: <the setting, 2-5 words>"
@@ -387,6 +436,9 @@ async def generate_task_text(state, session, *, voice, depth=0):
 
     prompt = f"""Write ONE task for a {gender} sub. Stay in voice, but obey the format exactly.
 
+This is a sexual task. It is not a wardrobe check and not a puzzle. The body is the subject; the
+place is only where it happens.
+
 Location: {location}
 Fittings here: {', '.join(prof['fittings'])}
 Context: {present}
@@ -401,7 +453,7 @@ Wearing: {outfit}
 {lower}{travel_line}{underdressed}Gear physics - obey these: {gear or "nothing special"}
 Anatomy - only these exist{anatomy_note}: {anatomy}
 DESIRED: {', '.join(yes_kinks) or 'none'}
-USE: {', '.join(selected)}
+USE - at least one must actually be expressed: {', '.join(selected)}
 
 KNOWN BLOCKERS HERE - do not build around these:
 {blockers_text}
@@ -421,12 +473,17 @@ WHAT THIS IS:
 - Name what is between them and the nearest sightline, and why nobody will turn round.
 
 Rules:
+- The task must be sexual and must express at least one USE kink. Say the thing that makes it sexual,
+  not just that something is visible.
+- If the Move is only a reveal, carry the kink in how it is done - held, ordered, timed, described.
 - Two steps maximum. A conditional ("if X, do Y") counts as two on its own.
 - One action, one photo, photo proof required. At most two things for the sub to physically do,
   counting undressing as one. If you have three, cut one.
 - No time durations
 - Never use: {', '.join(forbidden) or 'nothing'}
 {kind_rules}
+- The Move line is fixed content. Adapt it to what is worn and what the gear allows; never replace it
+  with something of your own.
 - Never name a body part the sub does not have
 - Obey the gear physics. Never claim an erection in a cage, never ask a blindfolded sub to frame a shot.
 - The task must expose what it photographs. If the subject is under clothing, say what moves and
@@ -440,8 +497,8 @@ Rules:
 - A garment goes to mid-thigh or to the ankles. Pick one, never both.
 - Never require the front and the back of the body in the same frame unless the stance says how.
   If both must read, say "side on", or "bent forward, looking back at the mirror".
-- The Skin line is a hard cap, not a suggestion. At 1-2 one garment moves and nothing comes off.
-  "Strip to nothing but" is only legal at 4-5. On a quick task the Move line is the cap instead.
+- The Skin cap is hard. At 1-2 one garment moves and nothing comes off. "Strip to nothing but" is
+  only legal at 4-5.
 - English only, all of it. No foreign words, no foreign headings, no "ONLY:" or "NOTE:".
 - Open with one short clause about who is there, not about the place being quiet. At "nobody around"
   just start. At the other levels say why you are not being seen.
@@ -471,61 +528,16 @@ Rules:
 - Undress FIRST, then take the photo. Never both at once.
 - If the Phone line says propped, both hands are free - do not also tell them to hold something.
 - Only use a prop when the thing being photographed is in both hands, or the shot needs distance.
-- If you use a prop, say what it is in three words or fewer. No elaborate rigs.
+  One prop maximum, and it is seasoning - if the task still makes sense without it, cut it.
+- Prep comes first. If the prop needs sizing, cutting, filling or arranging, that happens before the
+  action, not as an afterthought.
+- Be accurate about what a prop physically does. A green bean snaps, it does not split and drip.
+- If a fitting has a part that may not exist on theirs, say what to look for.
 - A mirror is a place, not a prop. A mirror shot is taken standing at the basin or in front of the
   glass, body facing it. If the shot is in a mirror there is no stall and no closed door.
 - If the privacy needs a door between them and people, drop the mirror and shoot in the stall. Never
   write both a mirror and a stall in one task.
-- Say what the photo must show, concretely - the thing, and how much of the body is in frame. The
-  last sentence says what is bare and where it is in the frame.
-- Direction must be physically true. Kneeling means looking down at yourself.
-- If a word means two things in this place, qualify it - "bowling balls", not "balls".
-- If you name a surface, name a real material: "the tiled floor", "the lane boards".
-- Never leave a blank, underscore, bracket or dangling punctuation. If a detail is unknown, invent
-  a plausible one and name it.
-- Write prose only. No headings, no labels, no bullet points in the body - fold who is there and
-  what the cover is into the sentences.
-- Say "the photo", never "photos"
-- Trust the outfit description over the outfit label
-- Favour the specific over the generic
-
-Reply exactly:
-TASK: <the task>
-{setting_prompt}
-EXPOSURE: <alone|caught|about|watched>"""
-
-    response = await venice.chat([{"role": "user", "content": prompt}], voice, temperature=0.95)
-    if response:
-        response = response.strip()
-        for kink, words in FORBIDDEN_KEYWORDS.items():
-            if depth < 3 and kink in forbidden and any(w in response.lower() for w in words):
-                logger.warning(f"forbidden kink '{kink}' leaked, retrying")
-                return await generate_task_text(state, session, voice=voice, depth=depth + 1)
-        if depth < 3 and gender == "male" and "breast" in response.lower():
-            logger.warning("male sub got 'breasts', retrying")
-            return await generate_task_text(state, session, voice=voice, depth=depth + 1)
-        if depth < 3 and not legwear and not travel and any(w in response.lower() for w in LEGWEAR_TELLS):
-            logger.warning("no legwear but legwear named, retrying")
-            return await generate_task_text(state, session, voice=voice, depth=depth + 1)
-        if depth < 3 and any(f" {w} " in f" {response.lower()} " for w in NON_ENGLISH):
-            logger.warning("language drift, retrying")
-            return await generate_task_text(state, session, voice=voice, depth=depth + 1)
-        final = effective
-        setting, kept = None, []
-        for line in response.splitlines():
-            s = line.strip()
-            m = re.match(r"SETTING:\s*(.+)", s, re.IGNORECASE)
-            if m:
-                setting = m.group(1).strip()
-                continue
-            m = re.match(r"TASK:\s*(.+)", s, re.IGNORECASE)
-            kept.append(m.group(1).strip() if m else line)
-        response = "\n".join(l for l in kept if l.strip()).strip()
-        response = _tidy(response)
-        if setting:
-            state["recent_settings"] = (recent + [setting])[-8:]
-        if response:
-            return (response, actual_risk,
-                    max(0, venue.exposure_rank(final) - venue.exposure_rank(baseline_privacy)),
-                    final)
-    return (FALLBACKS[actual_risk].format(loc=location), actual_risk, delta, effective)
+- Say what the photo must show, concretely - the thing, and how much of the body is in frame.
+- The last sentence states what is bare and what the photo shows. Both, every time. At risk 3 and
+  above an anatomy word appears somewhere in the task, or the task is wrong.
+- Direction must
