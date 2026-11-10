@@ -1,8 +1,31 @@
+import json
 from datetime import datetime, timezone, timedelta
 from . import venue, tasks as tk
 
 STALE = {"outfit": timedelta(hours=8), "location": timedelta(hours=6)}
 ORDER = ["gender", "location", "outfit", "privacy", "hide_spot"]
+
+
+def _asked(state):
+    raw = state.get("asked")
+    if isinstance(raw, dict):
+        return raw
+    try:
+        val = json.loads(raw or "{}")
+        return val if isinstance(val, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def _skipped(state):
+    raw = state.get("slot_skipped")
+    if isinstance(raw, list):
+        return raw
+    try:
+        val = json.loads(raw or "[]")
+        return val if isinstance(val, list) else []
+    except (TypeError, ValueError):
+        return []
 
 
 def _filled(state, key):
@@ -23,7 +46,7 @@ def _stale(state, key, now):
     window = STALE.get(key)
     if not window:
         return False
-    asked = (state.get("asked") or {}).get(key)
+    asked = _asked(state).get(key)
     if not asked:
         return False
     try:
@@ -34,7 +57,7 @@ def _stale(state, key, now):
 
 def next_gap(state, now=None):
     now = now or datetime.now(timezone.utc)
-    skipped = state.get("slot_skipped") or []
+    skipped = _skipped(state)
     for key in ORDER:
         stale = _stale(state, key, now)
         if _filled(state, key) and not stale:
@@ -46,10 +69,13 @@ def next_gap(state, now=None):
 
 
 def mark_asked(state, key):
-    state.setdefault("asked", {})[key] = datetime.now(timezone.utc).isoformat()
+    asked = dict(_asked(state))
+    asked[key] = datetime.now(timezone.utc).isoformat()
+    state["asked"] = asked
 
 
 def mark_skipped(state, key):
-    skipped = state.setdefault("slot_skipped", [])
+    skipped = list(_skipped(state))
     if key not in skipped:
         skipped.append(key)
+    state["slot_skipped"] = skipped
