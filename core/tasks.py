@@ -434,26 +434,34 @@ async def generate_task_text(state, session, *, voice, depth=0):
                          f"normally {venue.PRIVACY_LABELS[default].lower()}. Have the task say why "
                          f"it is quiet - time of day, closed, empty lane - or let someone appear.\n")
 
+    fittings_text = ", ".join(prof["fittings"])
+    desired_text = ", ".join(yes_kinks) or "none"
+    use_text = ", ".join(selected)
+    forbidden_text = ", ".join(forbidden) or "nothing"
+    risk_desc = RISK_LEVELS[actual_risk]["description"]
+    gear_text = gear or "nothing special"
+    privacy_desc = venue.PRIVACY_DESC[baseline_privacy]
+
     prompt = f"""Write ONE task for a {gender} sub. Stay in voice, but obey the format exactly.
 
 This is a sexual task. It is not a wardrobe check and not a puzzle. The body is the subject; the
 place is only where it happens.
 
 Location: {location}
-Fittings here: {', '.join(prof['fittings'])}
+Fittings here: {fittings_text}
 Context: {present}
-Privacy: {baseline_privacy} - {venue.PRIVACY_DESC[baseline_privacy]}
+Privacy: {baseline_privacy} - {privacy_desc}
 {reconcile}This setting changes that: {move_line}
 Cover during the task: {effective}
 Cover (required): {cover_beat}
-Risk: {actual_risk}/5 - {RISK_LEVELS[actual_risk]['description']}
+Risk: {actual_risk}/5 - {risk_desc}
 {skin_line}
 Phone: {phone_line}
 Wearing: {outfit}
-{lower}{travel_line}{underdressed}Gear physics - obey these: {gear or "nothing special"}
+{lower}{travel_line}{underdressed}Gear physics - obey these: {gear_text}
 Anatomy - only these exist{anatomy_note}: {anatomy}
-DESIRED: {', '.join(yes_kinks) or 'none'}
-USE - at least one must actually be expressed: {', '.join(selected)}
+DESIRED: {desired_text}
+USE - at least one must actually be expressed: {use_text}
 
 KNOWN BLOCKERS HERE - do not build around these:
 {blockers_text}
@@ -480,7 +488,7 @@ Rules:
 - One action, one photo, photo proof required. At most two things for the sub to physically do,
   counting undressing as one. If you have three, cut one.
 - No time durations
-- Never use: {', '.join(forbidden) or 'nothing'}
+- Never use: {forbidden_text}
 {kind_rules}
 - The Move line is fixed content. Adapt it to what is worn and what the gear allows; never replace it
   with something of your own.
@@ -540,4 +548,61 @@ Rules:
 - Say what the photo must show, concretely - the thing, and how much of the body is in frame.
 - The last sentence states what is bare and what the photo shows. Both, every time. At risk 3 and
   above an anatomy word appears somewhere in the task, or the task is wrong.
-- Direction must
+- Direction must be physically true. Kneeling means looking down at yourself.
+- If a word means two things in this place, qualify it - "bowling balls", not "balls".
+- If you name a surface, name a real material: "the tiled floor", "the lane boards".
+- Never leave a blank, underscore, bracket or dangling punctuation. If a detail is unknown, invent
+  a plausible one and name it.
+- Write prose only. No headings, no labels, no bullet points in the body - fold who is there and
+  what the cover is into the sentences.
+- Say "the photo", never "photos"
+- Trust the outfit description over the outfit label
+- Favour the specific over the generic
+
+Reply exactly:
+TASK: <the task>
+{setting_prompt}
+EXPOSURE: <alone|caught|about|watched>"""
+
+    response = await venice.chat([{"role": "user", "content": prompt}], voice, temperature=0.95)
+    if response:
+        response = response.strip()
+        low = response.lower()
+        for kink, words in FORBIDDEN_KEYWORDS.items():
+            if depth < 3 and kink in forbidden and any(w in low for w in words):
+                logger.warning(f"forbidden kink '{kink}' leaked, retrying")
+                return await generate_task_text(state, session, voice=voice, depth=depth + 1)
+        if depth < 3 and gender == "male" and "breast" in low:
+            logger.warning("male sub got 'breasts', retrying")
+            return await generate_task_text(state, session, voice=voice, depth=depth + 1)
+        if depth < 3 and not legwear and not travel and any(w in low for w in LEGWEAR_TELLS):
+            logger.warning("no legwear but legwear named, retrying")
+            return await generate_task_text(state, session, voice=voice, depth=depth + 1)
+        if depth < 3 and any(f" {w} " in f" {low} " for w in NON_ENGLISH):
+            logger.warning("language drift, retrying")
+            return await generate_task_text(state, session, voice=voice, depth=depth + 1)
+        if depth < 3 and actual_risk >= 3 and not any(w in low for w in ANATOMY_WORDS):
+            logger.warning("no anatomy at risk %s, retrying", actual_risk)
+            return await generate_task_text(state, session, voice=voice, depth=depth + 1)
+        if depth < 3 and tells and not any(w in low for w in tells):
+            logger.warning("no kink expressed, retrying")
+            return await generate_task_text(state, session, voice=voice, depth=depth + 1)
+        final = effective
+        setting, kept = None, []
+        for line in response.splitlines():
+            s = line.strip()
+            m = re.match(r"SETTING:\s*(.+)", s, re.IGNORECASE)
+            if m:
+                setting = m.group(1).strip()
+                continue
+            m = re.match(r"TASK:\s*(.+)", s, re.IGNORECASE)
+            kept.append(m.group(1).strip() if m else line)
+        response = "\n".join(l for l in kept if l.strip()).strip()
+        response = _tidy(response)
+        if setting:
+            state["recent_settings"] = (recent + [setting])[-8:]
+        if response:
+            return (response, actual_risk,
+                    max(0, venue.exposure_rank(final) - venue.exposure_rank(baseline_privacy)),
+                    final)
+    return (FALLBACKS[actual_risk].format(loc=location), actual_risk, delta, effective)
