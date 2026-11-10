@@ -135,7 +135,7 @@ def task_keyboard(task_id, title):
 def intensity_keyboard(selected=None):
     rows = []
     for key, label in (("gentle", "Gentle"), ("standard", "Standard"), ("harsh", "Harsh")):
-        mark = "Y " if key == selected else ""
+        mark = "\u2713 " if key == selected else ""
         rows.append([InlineKeyboardButton(f"{mark}{label}", callback_data=f"intensity_{key}")])
     return InlineKeyboardMarkup(rows)
 
@@ -160,7 +160,7 @@ def present_keyboard():
 def privacy_keyboard(selected=None):
     rows = []
     for index, (key, short, _) in enumerate(venue.PRIVACY_LEVELS, start=1):
-        mark = "Y " if key == selected else ""
+        mark = "\u2713 " if key == selected else ""
         rows.append([InlineKeyboardButton(f"{mark}{index}. {short}", callback_data=f"privacy_{key}")])
     return InlineKeyboardMarkup(rows)
 
@@ -197,13 +197,13 @@ def venue_keyboard():
 
 
 def variant_keyboard(selected):
-    return InlineKeyboardMarkup([[InlineKeyboardButton(("Y " if k == selected else "") + v["label"],
+    return InlineKeyboardMarkup([[InlineKeyboardButton(("\u2713 " if k == selected else "") + v["label"],
                                                       callback_data=f"variant_{k}")]
                                  for k, v in HARLEY_VARIANTS.items()])
 
 
 def model_keyboard(selected, prefix="model"):
-    return InlineKeyboardMarkup([[InlineKeyboardButton(("Y " if m == selected else "") + m,
+    return InlineKeyboardMarkup([[InlineKeyboardButton(("\u2713 " if m == selected else "") + m,
                                                       callback_data=f"{prefix}_{m}")]
                                  for m in TASK_MODELS])
 
@@ -634,10 +634,12 @@ async def present_callback(update, context):
 
 async def intensity_cmd(update, context):
     state = st.get_state(update.effective_user.id)
+    current = state.get("intensity") or "standard"
     await update.effective_message.reply_text(
-        f"How hard should these be? (currently {state.get('intensity') or 'standard'})\n\n"
-        f"Gentle drops it a notch, harsh lifts it a notch. The place sets the baseline, not this.",
-        reply_markup=intensity_keyboard(state.get("intensity")))
+        f"How hard should these be? (currently {current})\n\n"
+        f"Gentle takes two bands off the risk and usually leaves the place alone. "
+        f"Harsh adds one. The place still sets the baseline.",
+        reply_markup=intensity_keyboard(current))
 
 
 async def intensity_callback(update, context):
@@ -648,7 +650,7 @@ async def intensity_callback(update, context):
         await q.edit_message_text("Unknown.")
         return
     st.get_state(update.effective_user.id)["intensity"] = key
-    await q.edit_message_text(f"Intensity: {key}.")
+    await q.edit_message_text(f"Intensity: {key}.", reply_markup=intensity_keyboard(key))
 
 
 async def setreward_cmd(update, context):
@@ -805,7 +807,7 @@ async def kink_menu_callback(update, context):
     key = q.data.split("_", 1)[1]
     state = st.get_state(update.effective_user.id)
     cur = state.get(key) or "okay"
-    rows = [[InlineKeyboardButton(("Y " if cur == lv else "") + f"{tk.KINK_LEVELS[lv]['emoji']} {tk.KINK_LEVELS[lv]['name']}",
+    rows = [[InlineKeyboardButton(("\u2713 " if cur == lv else "") + f"{tk.KINK_LEVELS[lv]['emoji']} {tk.KINK_LEVELS[lv]['name']}",
                                   callback_data=f"kinkset_{key}_{lv}")] for lv in ("no", "okay", "yes")]
     rows.append([InlineKeyboardButton("Back", callback_data="kinks_back")])
     await q.edit_message_text(f"{tk.KINK_CATEGORIES[key][0]}\n\n{tk.KINK_CATEGORIES[key][1]}\n\nCurrent: {cur}",

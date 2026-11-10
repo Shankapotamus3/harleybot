@@ -16,11 +16,11 @@ RISK_LEVELS = {
 
 RISK_WEIGHTS = {1: 5, 2: 5, 3: 20, 4: 30, 5: 40}
 
-INTENSITY_SHIFT = {"gentle": -1, "standard": 0, "harsh": 1}
+INTENSITY_SHIFT = {"gentle": -2, "standard": 0, "harsh": 1}
 
 GENDER_GUIDELINES = {
     "male": {"body_parts": ["flat chest", "abs", "cock", "balls", "ass"],
-             "note": "male — say chest, never breasts"},
+             "note": "male — say chest, never breasts, and never cunt or pussy"},
     "female": {"body_parts": ["cleavage", "breasts", "nipples", "pussy", "ass"],
                "note": "female — no cock"},
     "trans": {"body_parts": ["chest", "breasts", "cock", "pussy", "ass"],
@@ -139,11 +139,12 @@ OUT_WORDS = ("lobby", "out into", "out onto", "outside", "car park", "pavement",
 NON_ENGLISH = ("continuar", "continuer", "verdader", "falso", "eikä", "sittemmin",
                "jätti", "perillisi", "apartamentuak", "och", "att", "med", "för",
                "är", "nous", "vous", "avec", "pour", "dans", "pero", "porque",
-               "este", "esta", "muy", "mucho", "gebehen")
+               "este", "esta", "muy", "mucho", "gebehen", "rubes", "rube")
 
 ANATOMY_WORDS = ("cock", "balls", "arse", "ass", "chest", "breast", "nipple", "pussy",
-                 "genitals", "thigh", "hip", "bare", "naked", "nude", "strip")
+                 "genitals", "thigh", "hip", "bare", "naked", "nude", "strip", "cage")
 
+# {X} is the subject noun, filled from what is actually worn.
 MOVES = {
     1: ["hook a thumb in the waistband and ease it down an inch",
         "lift the hem to the navel and hold it there",
@@ -152,13 +153,13 @@ MOVES = {
         "ease the waistband down to the top of the arse and hold it",
         "cup yourself through the fabric and squeeze once"],
     3: ["pull the hem up over one nipple and leave it there",
-        "ease the waistband down and bring the cage out over it",
+        "ease the waistband down and bring the {X} out over it",
         "get a hand inside and work yourself slowly"],
-    4: ["ease the waistband down to mid-thigh and bring the cage and balls out",
+    4: ["ease the waistband down to mid-thigh and bring the {X} and balls out",
         "turn your back, ease the waistband to mid-thigh, and let the arse read",
-        "get it out and work it, stopping just short"],
-    5: ["ease the waistband to mid-thigh, bring the cage out and turn side on so the "
-        "cage and a cheek of the arse both read",
+        "get the {X} out and work it, stopping just short"],
+    5: ["ease the waistband to mid-thigh, bring the {X} out and turn side on so the {X} and a "
+        "cheek of the arse both read",
         "lift the hem over a nipple, ease the waistband to mid-thigh, and hold both",
         "everything out, working yourself with the other hand, held at the edge"],
 }
@@ -222,10 +223,24 @@ def reward_threshold(streak, exposure=0):
     return max(3, random.randint(5, 10) - min(3, streak // 5) - min(2, exposure))
 
 
-def _pick_move(risk, state):
+def subject_noun(state, outfit):
+    """What the shot is of, from what is actually worn."""
+    low = (outfit or "").lower()
+    if "cage" in low or "chastity" in low:
+        return "cage"
+    gender = state.get("gender")
+    if gender in ("male", "trans"):
+        return "cock"
+    if gender == "female":
+        return "pussy"
+    return "it"
+
+
+def _pick_move(risk, state, subject):
+    pool_all = [m.format(X=subject) for m in MOVES[risk]]
     recent = state.get("recent_moves") or []
-    pool = [m for m in MOVES[risk] if m not in recent]
-    move = random.choice(pool or MOVES[risk])
+    pool = [m for m in pool_all if m not in recent]
+    move = random.choice(pool or pool_all)
     state["recent_moves"] = (recent + [move])[-6:]
     return move
 
@@ -276,6 +291,8 @@ def _tidy(text):
     kept = [l for l in text.splitlines()
             if not any(l.strip().upper().startswith(p) for p in BODY_LABELS)]
     text = "\n".join(kept)
+    text = text.replace("**", "").replace("__", "")
+    text = re.sub(r"(?<![\w*])\*(?!\s)([^*\n]+)\*", r"\1", text)
     text = re.sub(r"_+", "", text)
     text = re.sub(r"[ \t]*\([ \t]*\)", "", text)
     text = re.sub(r"[ \t]*\)[ \t]*(?=[;,.])", "", text)
@@ -284,6 +301,34 @@ def _tidy(text):
     text = re.sub(r"\.(?=[A-Za-z])", ". ", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text.strip()
+
+
+def _parse(response):
+    """One task out of the reply, plus the setting. Tolerates bold, repeats and label noise."""
+    blocks, current, setting = [], [], None
+    for line in response.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        m = re.match(r"^[*_#\s]*TASK[*_]*\s*:\s*(.+)", s, re.IGNORECASE)
+        if m:
+            if current:
+                blocks.append(" ".join(current))
+            current = [m.group(1).strip()]
+            continue
+        m = re.match(r"^[*_#\s]*SETTING[*_]*\s*:\s*(.+)", s, re.IGNORECASE)
+        if m:
+            setting = m.group(1).strip()
+            continue
+        m = re.match(r"^[*_#\s]*(EXPOSURE|PEOPLE|CONTEXT|COVER|RISK|PRIVACY|LOCATION)"
+                     r"[*_]*\s*:", s, re.IGNORECASE)
+        if m:
+            continue
+        current.append(s)
+    if current:
+        blocks.append(" ".join(current))
+    body = max(blocks, key=lambda b: len(b.split())) if blocks else ""
+    return _tidy(body), setting
 
 
 async def generate_task_text(state, session, *, voice, depth=0, model=None):
@@ -297,6 +342,7 @@ async def generate_task_text(state, session, *, voice, depth=0, model=None):
     outfit = worn_line(state)
     gear = _gear_notes(outfit)
     legwear = _has_legwear(outfit)
+    subject = subject_noun(state, outfit)
 
     prof = await venue_profile(state, location)
     default = privacy_default(state)
@@ -321,6 +367,9 @@ async def generate_task_text(state, session, *, voice, depth=0, model=None):
     if random.random() < float(os.getenv("EXPOSURE_CHANCE", "0.35")):
         move, target = venue.pick_exposure(baseline_privacy, prof["moves"],
                                            [b.constraint for b in blockers])
+
+    if intensity == "gentle" and move and random.random() < 0.5:
+        move, target = None, 0
 
     effective = venue.effective_privacy(baseline_privacy, target)
     delta = max(0, venue.exposure_rank(effective) - venue.exposure_rank(baseline_privacy))
@@ -380,7 +429,7 @@ async def generate_task_text(state, session, *, voice, depth=0, model=None):
                         f"once, then make the concealment the point: nobody expects this here, so the "
                         f"only way it works is not being spotted.\n")
 
-    chosen_move = _pick_move(actual_risk, state)
+    chosen_move = _pick_move(actual_risk, state, subject)
 
     if quick:
         skin_line = f"Move: {chosen_move}"
@@ -485,6 +534,7 @@ WHAT THIS IS:
 - Name what is between them and the nearest sightline, and why nobody will turn round.
 
 Rules:
+- ONE task only. One TASK line, one SETTING line, one EXPOSURE line. Never a second draft.
 - The task must be sexual and must express at least one USE kink. Say the thing that makes it sexual,
   not just that something is visible.
 - If the Move is only a reveal, carry the kink in how it is done - held, ordered, timed, described.
@@ -495,7 +545,7 @@ Rules:
 - Never use: {forbidden_text}
 {kind_rules}
 - The Move line is fixed content. Adapt it to what is worn and what the gear allows; never replace it
-  with something of your own.
+  with something of your own. It already names the body part correctly - keep that noun.
 - Never name a body part the sub does not have
 - Obey the gear physics. Never claim an erection in a cage, never ask a blindfolded sub to frame a shot.
 - The task must expose what it photographs. If the subject is under clothing, say what moves and
@@ -560,12 +610,12 @@ Rules:
 - Never leave a blank, underscore, bracket or dangling punctuation. If a detail is unknown, invent
   a plausible one and name it.
 - Write prose only. No headings, no labels, no bullet points in the body - fold who is there and
-  what the cover is into the sentences.
+  what the cover is into the sentences. No bold, no asterisks.
 - Say "the photo", never "photos"
 - Trust the outfit description over the outfit label
 - Favour the specific over the generic
 
-Reply exactly:
+Reply exactly, once:
 TASK: <the task>
 {setting_prompt}
 EXPOSURE: <alone|caught|about|watched>"""
@@ -579,8 +629,12 @@ EXPOSURE: <alone|caught|about|watched>"""
             if depth < 3 and kink in forbidden and any(w in low for w in words):
                 logger.warning(f"forbidden kink '{kink}' leaked, retrying")
                 return await generate_task_text(state, session, voice=voice, depth=depth + 1, model=model)
-        if depth < 3 and gender == "male" and "breast" in low:
-            logger.warning("male sub got 'breasts', retrying")
+        if depth < 3 and gender == "male" and any(w in low for w in ("breast", "cunt", "pussy")):
+            logger.warning("male sub got a female part, retrying")
+            return await generate_task_text(state, session, voice=voice, depth=depth + 1, model=model)
+        if depth < 3 and "cage" in low and "cage" not in outfit.lower() \
+                and "chastity" not in outfit.lower():
+            logger.warning("cage named but not worn, retrying")
             return await generate_task_text(state, session, voice=voice, depth=depth + 1, model=model)
         if depth < 3 and not legwear and not travel and any(w in low for w in LEGWEAR_TELLS):
             logger.warning("no legwear but legwear named, retrying")
@@ -613,17 +667,7 @@ EXPOSURE: <alone|caught|about|watched>"""
                 logger.warning("contract guard: %s, retrying", broke)
                 return await generate_task_text(state, session, voice=voice, depth=depth + 1, model=model)
         final = effective
-        setting, kept = None, []
-        for line in response.splitlines():
-            s = line.strip()
-            m = re.match(r"SETTING:\s*(.+)", s, re.IGNORECASE)
-            if m:
-                setting = m.group(1).strip()
-                continue
-            m = re.match(r"TASK:\s*(.+)", s, re.IGNORECASE)
-            kept.append(m.group(1).strip() if m else line)
-        response = "\n".join(l for l in kept if l.strip()).strip()
-        response = _tidy(response)
+        response, setting = _parse(response)
         if setting:
             state["recent_settings"] = (recent + [setting])[-8:]
         if response:
