@@ -8,6 +8,7 @@ import json, random, logging, asyncio
 from datetime import datetime, timezone, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import Forbidden
 from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
                           MessageHandler, ContextTypes, filters)
 
@@ -101,6 +102,8 @@ REWARD_GEAR = ["nothing but a leather collar", "a leather collar and wrist cuffs
                "a black leather collar", "a chest harness and nothing else"]
 
 TASK_MODELS = ["chroma", "lustify-v8", "wai-illu"]
+TEST_MODELS = ["venice-uncensored-role-play", "venice-uncensored", "qwen3-235b",
+               "mistral-31-24b", "llama-3.3-70b", "hermes-3-llama-3.1-405b"]
 
 
 def get_title(_=None):
@@ -339,6 +342,47 @@ async def wish_skip_callback(update, context):
 
 async def reward_cmd(update, context):
     await ask_reward(update, context, update.effective_user.id)
+
+
+async def textmodels_cmd(update, context):
+    try:
+        data = await venice.get("/models?type=text")
+    except Exception as exc:
+        await update.effective_message.reply_text(f"Failed: {exc}")
+        return
+    rows = []
+    for m in data.get("data", []):
+        traits = ",".join((m.get("model_spec") or {}).get("traits") or []) or "-"
+        rows.append(f"{m.get('id', '?')}  [{traits}]")
+    await update.effective_message.reply_text(("\n".join(rows) or "empty")[:4000])
+
+
+async def modeltest_cmd(update, context):
+    user = update.effective_user
+    state = st.get_state(user.id)
+    models = [a.strip() for a in (context.args or []) if a.strip()] or TEST_MODELS
+    gap = slots.next_gap(state)
+    if gap:
+        await update.effective_message.reply_text(f"Fill '{gap}' first - the prompt is thin without it.")
+        return
+    if state.get("pending"):
+        await update.effective_message.reply_text("Answer that first.")
+        return
+    await update.effective_message.reply_text(f"Sampling {len(models[:4])} models...")
+    session = st.get_session()
+    try:
+        for m in models[:4]:
+            random.seed(1234)
+            try:
+                text, risk, _, _ = await tk.generate_task_text(
+                    state, session, voice=HARLEY_VOICE, model=m)
+            except Exception as exc:
+                await update.effective_message.reply_text(f"{m}: {type(exc).__name__} {exc}")
+                continue
+            await update.effective_message.reply_text(f"[{m}] risk {risk}\n\n{text}"[:4000])
+            await asyncio.sleep(1)
+    finally:
+        session.close()
 
 
 async def custom_input(update, context):
@@ -1157,7 +1201,10 @@ async def expire_task(context):
         state["streak"] = 0
         state["consecutive_failures"] = (state.get("consecutive_failures") or 0) + 1
         session.commit()
-        await context.bot.send_message(chat_id=user_id, text="Time's up. -10.")
+        try:
+            await context.bot.send_message(chat_id=user_id, text="Time's up. -10.")
+        except Exception:
+            logger.warning(f"expiry notice failed for {user_id}")
     except Exception:
         logger.exception("expire failed")
     finally:
@@ -1236,35 +1283,44 @@ async def scheduled_check(context):
         due = session.query(st.UserState).filter(st.UserState.scheduling_enabled == True,
                                                  st.UserState.next_task_time <= now).all()
         for row in due:
-            if session.query(st.Task).filter_by(user_id=row.user_id, status="pending").first():
-                continue
-            state = st.get_state(row.user_id)
-            gap = slots.next_gap(state)
-            if gap:
-                await ask_slot(context.bot, row.user_id, state, gap)
-                state["next_task_time"] = now + timedelta(minutes=30)
-                continue
             try:
-                text, risk, delta, exposure = await tk.generate_task_text(
-                    state, session, voice=HARLEY_VOICE)
+                if session.query(st.Task).filter_by(user_id=row.user_id, status="pending").first():
+                    continue
+                state = st.get_state(row.user_id)
+                gap = slots.next_gap(state)
+                if gap:
+                    await ask_slot(context.bot, row.user_id, state, gap)
+                    state["next_task_time"] = now + timedelta(minutes=30)
+                    continue
+                try:
+                    text, risk, delta, exposure = await tk.generate_task_text(
+                        state, session, voice=HARLEY_VOICE)
+                except Exception:
+                    logger.exception(f"auto task generation failed for {row.user_id}")
+                    state["next_task_time"] = now + timedelta(minutes=15)
+                    continue
+                task = st.Task(user_id=row.user_id, task_text=text, risk_level=risk, created_at=now,
+                               exposure=delta, exposure_label=exposure,
+                               expires_at=now + timedelta(minutes=30))
+                session.add(task)
+                state["next_task_time"] = now + timedelta(
+                    minutes=random.randint(state.get("min_interval") or 30,
+                                           state.get("max_interval") or 180))
+                session.commit()
+                context.job_queue.run_once(expire_task, when=timedelta(minutes=30),
+                                           data={"user_id": row.user_id, "task_id": task.id})
+                note = _task_header(risk, state.get("intensity") or "standard")
+                await context.bot.send_message(chat_id=row.user_id,
+                                               text=f"AUTO\n\n{note}{text}\n\n30 minutes.",
+                                               reply_markup=task_keyboard(task.id, get_title()))
+                await asyncio.sleep(1)
+            except Forbidden:
+                row.scheduling_enabled = False
+                session.commit()
+                logger.warning(f"user {row.user_id} blocked the bot - scheduling off")
             except Exception:
-                logger.exception(f"auto task generation failed for {row.user_id}")
-                state["next_task_time"] = now + timedelta(minutes=15)
-                continue
-            task = st.Task(user_id=row.user_id, task_text=text, risk_level=risk, created_at=now,
-                           exposure=delta, exposure_label=exposure,
-                           expires_at=now + timedelta(minutes=30))
-            session.add(task)
-            state["next_task_time"] = now + timedelta(
-                minutes=random.randint(state.get("min_interval") or 30, state.get("max_interval") or 180))
-            session.commit()
-            context.job_queue.run_once(expire_task, when=timedelta(minutes=30),
-                                       data={"user_id": row.user_id, "task_id": task.id})
-            note = _task_header(risk, state.get("intensity") or "standard")
-            await context.bot.send_message(chat_id=row.user_id,
-                                           text=f"AUTO\n\n{note}{text}\n\n30 minutes.",
-                                           reply_markup=task_keyboard(task.id, get_title()))
-            await asyncio.sleep(1)
+                session.rollback()
+                logger.exception(f"scheduled task failed for {row.user_id}")
     except Exception:
         logger.exception("scheduled check failed")
     finally:
@@ -1298,6 +1354,8 @@ def main():
     app.add_handler(CommandHandler("model", model_cmd))
     app.add_handler(CommandHandler("payload", payload_cmd))
     app.add_handler(CommandHandler("imgmodels", imgmodels_cmd))
+    app.add_handler(CommandHandler("textmodels", textmodels_cmd))
+    app.add_handler(CommandHandler("modeltest", modeltest_cmd))
     app.add_handler(CommandHandler("location", location_cmd))
     app.add_handler(CommandHandler("clear", clear_location))
     app.add_handler(CommandHandler("reset", reset_cmd))
