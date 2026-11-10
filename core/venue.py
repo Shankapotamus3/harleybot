@@ -1,11 +1,8 @@
-# core/venue.py
 import random
 
 MAX_PROBES = 10
 TYPICAL_SAMPLE = 4
 
-# Task needs, not furniture. True of most spaces regardless of venue, which is
-# what keeps an unlisted place like a bowling alley workable.
 TASK_PROBES = {
     "bend": "something to bend over",
     "anchor": "something to hold or tie to",
@@ -44,6 +41,7 @@ VENUE_ALIASES = {
     "Retail Store": ["store", "shop", "retail"],
     "Studio": ["studio"],
     "Rooftop": ["rooftop", "roof terrace"],
+    "Casino": ["casino", "gaming floor", "slots", "poker room", "betting shop"],
     "Restroom": ["restroom", "toilet", "toilets", "washroom", "loo", "public convenience",
                  "men's room", "gents", "ladies"],
 }
@@ -75,11 +73,11 @@ VENUE_BASELINE = {
     "Retail Store": "changing room, shop floor rail, mirror, stockroom, trolley, till counter",
     "Studio": "backdrop roll, stool, light stand, seamless paper, floor mark",
     "Rooftop": "parapet, vent housing, aerial mast, stair hut, gravel",
+    "Casino": "slot machine bank, card table edge, chair, pillar, aisle end, cashier counter, bar rail, carpet",
     "Restroom": "cubicle, cubicle door, coat hook, cistern, mirror, sink, hand dryer, tiled floor, partition",
     "Generic": "door, doorway, mirror, window, chair, table, floor, wall, corner, counter edge, sink",
 }
 
-# Venues with rooms get a picker; anything absent gets AI suggestions instead.
 ROOM_OPTIONS = {
     "Home": {
         "kitchen": "counter edge, table, sink, dishwasher door, chair back, drawer handle",
@@ -120,6 +118,13 @@ ROOM_OPTIONS = {
         "cubicle": "cubicle door, hook, cistern, tiled floor",
         "basins": "mirror, sink, hand dryer, bin",
     },
+    "Casino": {
+        "floor": "slot bank, aisle, chair, pillar, carpet",
+        "tables": "card table edge, chair back, rail, dealer gap",
+        "bar": "bar rail, stool, pillar",
+        "toilets": "cubicle, mirror, sink, hand dryer",
+        "foyer": "pillar, cashier counter, doorway, plant",
+    },
 }
 
 
@@ -150,7 +155,6 @@ def present_features(venue, room):
 
 
 def task_probe_options(venue, rooms, limit=MAX_PROBES):
-    """Capability chips first, grounded with a few real features from the rooms."""
     caps = list(TASK_PROBES.values())
     random.shuffle(caps)
 
@@ -199,7 +203,6 @@ def venue_baseline(state, location):
 
 
 def venue_typical_features(state, location, limit=TYPICAL_SAMPLE):
-    """A short shuffled sample of what a place like this has. Never the full list."""
     raw = (state.get("venue_typical") or "").strip()
     if not raw:
         raw = venue_baseline(state, location)
@@ -209,7 +212,6 @@ def venue_typical_features(state, location, limit=TYPICAL_SAMPLE):
 
 
 def notes_for_prompt(state, location, limit=8):
-    """The committed notes are a sample, so sample them again per task."""
     raw = (state.get("location_notes") or "").replace("\n", ", ")
     items = [i.strip() for i in raw.split(",") if i.strip()]
     if len(items) > limit:
@@ -219,8 +221,6 @@ def notes_for_prompt(state, location, limit=8):
 
 
 # ============ PRIVACY ============
-# Ordered by how observed you are, not by venue class. Each level is a claim
-# about right now, so the sub's answer wins over the venue.
 PRIVACY_LEVELS = [
     ("alone", "Nobody around", "Nobody can see you and nobody can walk in."),
     ("caught", "Could be caught", "You're alone for now, but someone could appear at any moment."),
@@ -231,11 +231,10 @@ EXPOSURE_LADDER = [k for k, _, _ in PRIVACY_LEVELS]
 PRIVACY_LABELS = {k: short for k, short, _ in PRIVACY_LEVELS}
 PRIVACY_DESC = {k: desc for k, _, desc in PRIVACY_LEVELS}
 
-# Rows written before this existed.
 LEGACY_PRIVACY = {"private": "alone", "semi": "caught",
                   "exposed": "about", "public": "watched"}
 
-# Only a default now, used when nothing is set. Never overrides a choice.
+# Fallback only. The live default comes from the derived venue profile.
 VENUE_PRIVACY = {
     "Home": "alone", "Hotel": "alone", "Studio": "alone",
     "Vehicle": "caught", "Work": "caught", "Sauna": "caught",
@@ -245,12 +244,10 @@ VENUE_PRIVACY = {
     "Arcade": "about", "Beach": "about", "Park": "about",
     "Supermarket": "watched", "Retail Store": "watched", "Library": "watched",
     "Museum": "watched", "Airport": "watched", "Launderette": "watched",
-    "Church": "watched", "Restroom": "watched",
+    "Church": "watched", "Restroom": "watched", "Casino": "watched",
 }
 
-# What a setting does to your cover, mid-task. The number is the FLOOR that
-# setting implies, not an amount to add: a balcony is level 2 whether you
-# started at 0 or 1.
+# Fallback only.
 EXPOSURE_MOVES = {
     "Home": [("the door left on the latch", 1),
              ("step onto the balcony the street can see", 2),
@@ -270,10 +267,11 @@ EXPOSURE_MOVES = {
     "Vehicle": [("someone parks alongside", 2)],
     "Restroom": [("the door left on the latch with footsteps in the corridor", 1),
                  ("out into the corridor", 2)],
+    "Casino": [("the aisle between two slot banks", 2), ("out to the foyer", 2)],
     "Generic": [("footsteps in the corridor", 1), ("just outside the door", 2)],
 }
 
-# Quieter ground inside the same venue, for when the level is already high.
+# Fallback only.
 COVER_SPOTS = {
     "Home": ["the hallway", "the far corner of the room", "behind the door"],
     "Hotel": ["the bathroom", "the lift alcove", "the end of the corridor"],
@@ -294,6 +292,7 @@ COVER_SPOTS = {
     "Church": ["a side aisle", "behind a pillar", "the porch"],
     "Rooftop": ["behind the stair hut", "the far parapet", "behind the vent housing"],
     "Restroom": ["a closed cubicle", "the end cubicle", "the far basin against the wall"],
+    "Casino": ["between two slot banks", "behind a pillar", "the far end of the aisle", "the toilets"],
     "Generic": ["a corner", "the corridor", "just outside"],
 }
 
@@ -325,14 +324,11 @@ def exposure_rank(level):
 
 
 def effective_privacy(baseline, target):
-    """A setting sets a floor. It never lowers cover."""
     return EXPOSURE_LADDER[max(exposure_rank(baseline), min(3, target))]
 
 
-def pick_exposure(state, baseline, blockers=()):
+def pick_exposure(baseline, moves, blockers=()):
     """Only moves that actually cost cover. (None, 0) if none do."""
-    place = state.get("venue") or state.get("location") or ""
-    moves = EXPOSURE_MOVES.get(get_probe_key(place), EXPOSURE_MOVES["Generic"])
     here = exposure_rank(baseline)
     live = []
     for move, target in moves:
