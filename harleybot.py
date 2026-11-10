@@ -875,13 +875,31 @@ async def schedule_callback(update, context):
         await q.edit_message_text("Off.")
 
 
+async def _heal_pending(update, context, state, user_id):
+    """A stranded marker blocks /task forever. Re-ask it if still empty, else drop it."""
+    pending = state.get("pending") or ""
+    if not pending:
+        return False
+    if pending.startswith("slot_"):
+        key = pending[5:]
+        if slots.next_gap(state) == key:
+            await ask_slot(context.bot, update.effective_chat.id, state, key)
+            return True
+        state["pending"] = None
+        return False
+    if pending in ("custom_location", "outfit_detail", "hide_spot", "reward_wish",
+                   "interval", "blocker"):
+        return True
+    state["pending"] = None
+    return False
+
+
 async def issue_task(update, context, label="TASK"):
     user = update.effective_user
     state = st.get_state(user.id)
     session = st.get_session()
     try:
-        if state.get("pending"):
-            await update.effective_message.reply_text("Answer that first, then /task.")
+        if await _heal_pending(update, context, state, user.id):
             return
         gap = slots.next_gap(state)
         if gap:
@@ -1270,6 +1288,7 @@ async def reset_cmd(update, context):
     state["hide_spot"] = None
     state["asked"] = {}
     state["slot_skipped"] = []
+    state["pending"] = None
     st.drop_state(uid)
     await update.effective_message.reply_text("Defaults restored.")
 

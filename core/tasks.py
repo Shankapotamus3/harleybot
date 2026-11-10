@@ -1,6 +1,6 @@
 import re, os, random, logging
 from datetime import datetime, timezone
-from . import venue, venice, venue_ai
+from . import venue, venice, venue_ai, contract
 
 logger = logging.getLogger(__name__)
 
@@ -326,6 +326,7 @@ async def generate_task_text(state, session, *, voice, depth=0, model=None):
     delta = max(0, venue.exposure_rank(effective) - venue.exposure_rank(baseline_privacy))
 
     quick = venue.exposure_rank(effective) >= QUICK_AT
+    who = contract.derive(effective, prof)
 
     actual_risk = venue.exposure_rank(effective) + 1 + INTENSITY_SHIFT.get(intensity, 0)
     if not quick:
@@ -469,12 +470,15 @@ KNOWN BLOCKERS HERE - do not build around these:
 RECENTLY USED HERE - prefer variety:
 {recent_text}
 
+WHO ELSE IS HERE - taken from the place, do not add to it:
+{contract.block(who)}
+
 Work in this order:
 {order}
 
 WHAT THIS IS:
 - Nobody here agreed to any of it. The sub cannot explain themselves to a stranger, so the task must
-  work without one. Never ask a passer-by to hold the phone, take the photo, or watch.
+  work without one.
 - The aim is that nobody notices. Exposure is the thrill; being spotted is the failure state.
 - Concealment is the point of the task, not a safety note. Build it so a bystander would have to
   look twice.
@@ -513,12 +517,12 @@ Rules:
 - If you are unsure of a place's own word, use the plain one - gate, not a coined one.
 - Open with one short clause about who is there, not about the place being quiet. At "nobody around"
   just start. At the other levels say why you are not being seen.
-- At "nobody around", do not invent people. A group, a passer-by or a staff member only belongs if
-  they are in the venue description.
-- The Context line is the truth about who is there. Never call the place empty, dead, quiet or
-  deserted at "a few people around" or "people are looking at you" - name who is about instead.
+- Only the people in the WHO ELSE IS HERE block exist. Do not invent a group, a passer-by or a
+  staff member, and never call the place empty at "about" or "watched" - name who is about instead.
 - When people are looking, someone must actually be looking, listening or talking to the sub. Name
   them and what they are doing.
+- Nobody may be asked for anything. No holding, no taking the photo, no counting out loud.
+- Never stand on furniture unless the block says there is something to stand on.
 - Above "caught", reveal first. One item may then come off if the Move needs it - never a full strip.
 - At "about" and above, the task must name its cover: what is between you and them, or what you are
   angling away from. "Turned away" alone is not cover for a reveal.
@@ -527,7 +531,6 @@ Rules:
 - Transit is not the task. If the Travel line says they need to cover up, they put one thing on for
   the walk and it comes off at the spot. Name both, briefly.
 - Do not write a task that only works if somebody sees.
-- Never involve a stranger. No asking, no holding, no counting for them.
 - If what they are wearing is far barer than the place expects, say so once and make the
   concealment the point.
 - Waiting is described as an event, not a duration: "until the group at the counter turns away".
@@ -602,6 +605,13 @@ EXPOSURE: <alone|caught|about|watched>"""
         if depth < 3 and quick and any(f.lower() in low for f in prof["fittings"] if len(f) > 4):
             logger.warning("fixture named in a quick task, retrying")
             return await generate_task_text(state, session, voice=voice, depth=depth + 1, model=model)
+        if depth < 3:
+            broke = contract.guard_interaction(low) or contract.guard_standing(low, who)
+            if not broke and who["must_name_cover"]:
+                broke = contract.guard_cover(low, who, spot)
+            if broke:
+                logger.warning("contract guard: %s, retrying", broke)
+                return await generate_task_text(state, session, voice=voice, depth=depth + 1, model=model)
         final = effective
         setting, kept = None, []
         for line in response.splitlines():
