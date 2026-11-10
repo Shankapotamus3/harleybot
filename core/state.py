@@ -216,11 +216,16 @@ class StateView(dict):
         self._session = session
         for key, col in _PERSIST.items():
             raw = getattr(row, col, None)
-            if key in _JSON and raw:
-                try:
-                    super().__setitem__(key, json.loads(raw))
-                except (ValueError, TypeError):
-                    super().__setitem__(key, {} if key in ("venue_profile", "asked") else [])
+            if key in _JSON:
+                empty = {} if key in ("venue_profile", "asked") else []
+                if raw:
+                    try:
+                        val = json.loads(raw)
+                        super().__setitem__(key, val if isinstance(val, type(empty)) else empty)
+                        continue
+                    except (ValueError, TypeError):
+                        pass
+                super().__setitem__(key, empty)
             else:
                 super().__setitem__(key, raw)
 
@@ -242,7 +247,7 @@ class StateView(dict):
             logger.warning(f"state save failed: {exc}")
 
     def setdefault(self, key, default=None):
-        if key not in self:
+        if key not in self or self[key] is None:
             self[key] = default
         return self[key]
 
