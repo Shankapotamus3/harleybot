@@ -362,7 +362,7 @@ async def custom_input(update, context):
         state["venue"] = place
         state["venue_profile"] = None
         state["hide_spot"] = None
-        state["pending"] = "wizard_privacy"
+        state["pending"] = "slot_privacy" if pending == "slot_location" else "wizard_privacy"
         text, markup = _privacy_prompt(state)
         await msg.reply_text(text, reply_markup=markup)
         return
@@ -540,7 +540,7 @@ async def privacy_callback(update, context):
     await q.answer()
     user = update.effective_user
     state = st.get_state(user.id)
-    was_slot = (state.get("pending") or "").startswith("slot_")
+    pending = state.get("pending") or ""
     level = q.data.split("_", 1)[1]
     if level not in venue.PRIVACY_LABELS:
         await q.edit_message_text("Unknown level.")
@@ -549,7 +549,8 @@ async def privacy_callback(update, context):
     v = state.get("venue") or ""
     clear = InlineKeyboardMarkup([[InlineKeyboardButton("Clear", callback_data="loc_clear")]])
 
-    if state.get("pending") == "wizard_privacy":
+    if pending in ("wizard_privacy", "slot_privacy"):
+        was_slot = pending == "slot_privacy"
         state["pending"] = None
         if venue.exposure_rank(level) >= 2:
             state["context_others"] = "public"
@@ -557,25 +558,24 @@ async def privacy_callback(update, context):
             await q.edit_message_text(
                 f"Locked in - {venue.PRIVACY_LABELS[level]}.\n{venue.PRIVACY_DESC[level]}\n\n"
                 f"{v}\n\n/task when ready.", reply_markup=clear)
-        else:
-            await q.edit_message_text(f"{v}.\n\nWho's about?", reply_markup=present_keyboard())
-        if was_slot:
-            await _after_slot(update, user.id)
+            if was_slot:
+                await _after_slot(update, user.id)
+            return
+        state["pending"] = "slot_present" if was_slot else "wizard_present"
+        await q.edit_message_text(f"{v}.\n\nWho's about?", reply_markup=present_keyboard())
         return
 
     await q.edit_message_text(
         f"{venue.PRIVACY_LABELS[level]}.\n{venue.PRIVACY_DESC[level]}\n\n"
         f"{state.get('location') or ''}\n\n/task when ready.", reply_markup=clear)
-    if was_slot:
-        state["pending"] = None
-        await _after_slot(update, user.id)
 
 
 async def present_callback(update, context):
     q = update.callback_query
     await q.answer()
-    kind = q.data.split("_", 1)[1]
     state = st.get_state(update.effective_user.id)
+    was_slot = (state.get("pending") or "") == "slot_present"
+    kind = q.data.split("_", 1)[1]
     state["context_others"] = kind
     state["context_alone"] = (kind == "alone")
     state["location"] = state.get("venue") or ""
@@ -584,6 +584,8 @@ async def present_callback(update, context):
     await q.edit_message_text(
         f"Cover: {venue.PRIVACY_LABELS[current]}\n\n/task when ready.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Clear", callback_data="loc_clear")]]))
+    if was_slot:
+        await _after_slot(update, update.effective_user.id)
 
 
 async def intensity_cmd(update, context):
@@ -678,6 +680,7 @@ async def venue_callback(update, context):
     q = update.callback_query
     await q.answer()
     state = st.get_state(update.effective_user.id)
+    was_slot = (state.get("pending") or "") == "slot_location"
     if q.data == "venue_custom":
         state["pending"] = "custom_location"
         await q.edit_message_text("Name the place.")
@@ -685,7 +688,7 @@ async def venue_callback(update, context):
     state["venue"] = q.data.split("_", 1)[1]
     state["venue_profile"] = None
     state["hide_spot"] = None
-    state["pending"] = "wizard_privacy"
+    state["pending"] = "slot_privacy" if was_slot else "wizard_privacy"
     text, markup = _privacy_prompt(state)
     await q.edit_message_text(text, reply_markup=markup)
 
@@ -736,9 +739,14 @@ async def outfit_callback(update, context):
     state["current_outfit"] = opt["name"]
     state["outfit_items"] = opt.get(f"{state.get('gender') or 'female'}_items", opt["female_items"])
     state["outfit_detail"] = None
+    await _warn_if_open_task(update, update.effective_user.id)
+    if (state.get("pending") or "") == "slot_outfit":
+        state["pending"] = None
+        await q.edit_message_text(f"{opt['name']}. Saved.", reply_markup=main_menu())
+        await _after_slot(update, update.effective_user.id)
+        return
     state["pending"] = "outfit_detail"
     await q.edit_message_text(f"{opt['name']}, roughly. What are you actually in? Type it or /skip.")
-    await _warn_if_open_task(update, update.effective_user.id)
 
 
 async def kinks_cmd(update, context):
@@ -781,13 +789,17 @@ async def kinks_done_callback(update, context):
 
 
 async def skip_cmd(update, context):
-    state = st.get_state(update.effective_user.id)
+    user = update.effective_user
+    state = st.get_state(user.id)
     pending = state.get("pending") or ""
     if pending.startswith("slot_"):
         slots.mark_skipped(state, pending[5:])
     if pending == "outfit_detail":
         state["outfit_detail"] = None
     state["pending"] = None
+    if pending.startswith("slot_") or pending == "outfit_detail":
+        await _after_slot(update, user.id)
+        return
     await update.effective_message.reply_text("Fine. /task.")
 
 
@@ -1202,7 +1214,7 @@ async def reset_cmd(update, context):
     uid = update.effective_user.id
     state = st.get_state(uid)
     state["variant"] = DEFAULT_VARIANT
-    state["privacy"] = "alone"
+    state["privacy"] = None
     state["intensity"] = "standard"
     state["location"] = None
     state["location_notes"] = None

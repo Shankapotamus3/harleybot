@@ -19,6 +19,8 @@ IMAGE_CFG = os.environ.get("IMAGE_CFG", "7.5")
 MINIMAL_PAYLOAD = os.environ.get("IMAGE_MINIMAL", "1") == "1"
 
 TEXT_MODEL = os.environ.get("TEXT_MODEL", "venice-uncensored-role-play")
+TASK_TEXT_MODEL = os.environ.get("TASK_TEXT_MODEL") or TEXT_MODEL
+CHAT_TEXT_MODEL = os.environ.get("CHAT_TEXT_MODEL") or TEXT_MODEL
 VISION_MODEL = os.environ.get("VISION_MODEL", "qwen-3-8-flash")
 VISION_CHAIN = [m.strip() for m in os.environ.get(
     "VISION_CHAIN", f"{VISION_MODEL},google-gemma-4-26b-a4b-it").split(",") if m.strip()]
@@ -219,12 +221,13 @@ async def request_image(prompt, negative, spec):
     return None
 
 
-async def chat(messages, system, temperature=0.9, max_tokens=500):
+async def chat(messages, system, temperature=0.9, max_tokens=500, model=None):
     try:
         data = await post("/chat/completions", {
-            "model": TEXT_MODEL,
+            "model": model or CHAT_TEXT_MODEL,
             "messages": [{"role": "system", "content": system}] + list(messages),
             "temperature": temperature, "max_tokens": max_tokens,
+            "venice_parameters": {"strip_thinking_response": True},
         }, timeout=30)
         return data["choices"][0]["message"]["content"]
     except Exception as e:
@@ -242,6 +245,7 @@ async def analyze_image(image_b64, mime, prompt):
                     {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{image_b64}"}},
                 ]}],
                 "max_tokens": 200,
+                "venice_parameters": {"strip_thinking_response": True},
             }, timeout=30)
             return data["choices"][0]["message"]["content"]
         except Exception as e:

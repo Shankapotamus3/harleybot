@@ -300,6 +300,10 @@ COVER_WORDS = ("no cover", "nowhere", "can't hide", "cant hide", "no hiding",
                "open plan", "open space", "nowhere private", "nowhere to hide",
                "in the open", "nowhere to stand")
 
+FILLER = {"with", "that", "this", "from", "into", "over", "your", "you're", "left",
+          "onto", "past", "comes", "walks", "someone", "there", "where", "behind",
+          "under", "another"}
+
 
 def is_no_cover(text):
     low = (text or "").lower()
@@ -334,7 +338,8 @@ def pick_exposure(baseline, moves, blockers=()):
     for move, target in moves:
         if target <= here:
             continue
-        words = [w for w in move.split() if len(w) > 3]
+        words = [w.strip(".,") for w in move.split()
+                 if len(w) > 3 and w.lower() not in FILLER]
         if any(w in (b or "").lower() for b in blockers for w in words):
             continue
         live.append((move, target))

@@ -11,7 +11,8 @@ def needs_mirror(task_text):
 
 
 def unachievable(item, task_text):
-    return item.lower().strip(" .") in SELFIE_INVISIBLE and not needs_mirror(task_text)
+    i = item.lower().strip(" .")
+    return any(w in i for w in SELFIE_INVISIBLE) and not needs_mirror(task_text)
 
 
 def split_missing(missing):

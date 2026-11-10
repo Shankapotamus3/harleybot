@@ -55,7 +55,6 @@ KINK_CATEGORIES = {
     "kink_social_media": ("Social Media", "Online exposure"),
 }
 
-# How each kink shows up in prose. Used to prove the task actually expresses one.
 KINK_TELLS = {
     "exposure": ("seen", "watching", "looking", "audience", "spotted", "noticed"),
     "humiliation": ("embarrass", "humiliat", "ashamed", "silly", "fool", "ridiculous"),
@@ -130,7 +129,7 @@ BODY_LABELS = ("TASK:", "SETTING:", "EXPOSURE:", "PEOPLE:", "CONTEXT:", "COVER:"
 
 QUICK_AT = 2
 
-LEGWEAR_WORDS = ("trouser", "jean", "short", "jogger", "sweatpant", "legging",
+LEGWEAR_WORDS = ("trouser", "jean", "shorts", "jogger", "sweatpant", "legging",
                  "skirt", "kilt", "cargo", "chino", "tights")
 
 LEGWEAR_TELLS = ("trouser", "fly", "zip", "pocket", "waistband of your trousers")
@@ -141,12 +140,11 @@ OUT_WORDS = ("lobby", "out into", "out onto", "outside", "car park", "pavement",
 NON_ENGLISH = ("continuar", "continuer", "verdader", "falso", "eikä", "sittemmin",
                "jätti", "perillisi", "apartamentuak", "och", "att", "med", "för",
                "är", "nous", "vous", "avec", "pour", "dans", "pero", "porque",
-               "este", "esta", "muy", "mucho")
+               "este", "esta", "muy", "mucho", "gebehen")
 
 ANATOMY_WORDS = ("cock", "balls", "arse", "ass", "chest", "breast", "nipple", "pussy",
                  "genitals", "thigh", "hip", "bare", "naked", "nude", "strip")
 
-# The body action, fixed per risk band. Both task kinds build on this.
 MOVES = {
     1: ["hook a thumb in the waistband and ease it down an inch",
         "lift the hem to the navel and hold it there",
@@ -289,7 +287,7 @@ def _tidy(text):
     return text.strip()
 
 
-async def generate_task_text(state, session, *, voice, depth=0):
+async def generate_task_text(state, session, *, voice, depth=0, model=None):
     gender = state.get("gender") or "nonbinary"
     location = state.get("location") or "Unknown"
     others = state.get("context_others") or "alone"
@@ -301,7 +299,8 @@ async def generate_task_text(state, session, *, voice, depth=0):
 
     prof = await venue_profile(state, location)
     default = privacy_default(state)
-    spot = (state.get("hide_spot") or "").strip() or random.choice(prof["cover"])
+    spot = (state.get("hide_spot") or "").strip() or random.choice(
+        prof.get("cover") or ["the doorway"])
 
     blockers = session.query(LocationConstraint).filter(
         LocationConstraint.user_id == state.user_id,
@@ -391,7 +390,7 @@ async def generate_task_text(state, session, *, voice, depth=0):
 2. Write the task around the Move line and nothing else."""
         kind_rules = """- This is a quick reveal, not a staged scene. Do not name a fixture of the place. The only
   setting detail is how out of the way the spot is.
-- Three or four sentences. Shorter than usual.
+- Three sentences. Not four.
 - Adapt the Move line to what is worn and what the gear allows. Nothing is added to it.
 - One hand, phone low and close. No props, no surfaces, nothing to balance on.
 - No mirror unless the Move needs the front of the body.
@@ -497,6 +496,8 @@ Rules:
 - The task must expose what it photographs. If the subject is under clothing, say what moves and
   how far - never pair "shirt off" with something the shirt does not reveal.
 - Underwear is not a separate layer to count. It moves with the garment above it.
+- If the Wearing line names trousers or jeans, underwear is not visible unless the waistband has
+  moved. Never say a thong or pants are plain to see through them.
 - If gear comes off the body, say so, and stop describing it as worn.
 - Only hedge about gear that is not already in Wearing. If it is listed, treat it as fact.
 - Only garments named in Wearing exist. Do not add a garment, a piece of jewellery or a kind of
@@ -508,6 +509,7 @@ Rules:
 - The Skin cap is hard. At 1-2 one garment moves and nothing comes off. "Strip to nothing but" is
   only legal at 4-5.
 - English only, all of it. No foreign words, no foreign headings, no "ONLY:" or "NOTE:".
+- If you are unsure of a place's own word, use the plain one - gate, not a coined one.
 - Open with one short clause about who is there, not about the place being quiet. At "nobody around"
   just start. At the other levels say why you are not being seen.
 - At "nobody around", do not invent people. A group, a passer-by or a staff member only belongs if
@@ -546,8 +548,8 @@ Rules:
 - If the privacy needs a door between them and people, drop the mirror and shoot in the stall. Never
   write both a mirror and a stall in one task.
 - Say what the photo must show, concretely - the thing, and how much of the body is in frame.
-- The last sentence states what is bare and what the photo shows. Both, every time. At risk 3 and
-  above an anatomy word appears somewhere in the task, or the task is wrong.
+- The last sentence states what is bare and what the photo shows. Put nothing else in it.
+- At risk 3 and above an anatomy word appears somewhere in the task, or the task is wrong.
 - Direction must be physically true. Kneeling means looking down at yourself.
 - If a word means two things in this place, qualify it - "bowling balls", not "balls".
 - If you name a surface, name a real material: "the tiled floor", "the lane boards".
@@ -564,29 +566,41 @@ TASK: <the task>
 {setting_prompt}
 EXPOSURE: <alone|caught|about|watched>"""
 
-    response = await venice.chat([{"role": "user", "content": prompt}], voice, temperature=0.95)
+    response = await venice.chat([{"role": "user", "content": prompt}], voice,
+                                 temperature=0.95, model=model or getattr(venice, "TASK_TEXT_MODEL", None))
     if response:
         response = response.strip()
         low = response.lower()
         for kink, words in FORBIDDEN_KEYWORDS.items():
             if depth < 3 and kink in forbidden and any(w in low for w in words):
                 logger.warning(f"forbidden kink '{kink}' leaked, retrying")
-                return await generate_task_text(state, session, voice=voice, depth=depth + 1)
+                return await generate_task_text(state, session, voice=voice, depth=depth + 1, model=model)
         if depth < 3 and gender == "male" and "breast" in low:
             logger.warning("male sub got 'breasts', retrying")
-            return await generate_task_text(state, session, voice=voice, depth=depth + 1)
+            return await generate_task_text(state, session, voice=voice, depth=depth + 1, model=model)
         if depth < 3 and not legwear and not travel and any(w in low for w in LEGWEAR_TELLS):
             logger.warning("no legwear but legwear named, retrying")
-            return await generate_task_text(state, session, voice=voice, depth=depth + 1)
+            return await generate_task_text(state, session, voice=voice, depth=depth + 1, model=model)
         if depth < 3 and any(f" {w} " in f" {low} " for w in NON_ENGLISH):
             logger.warning("language drift, retrying")
-            return await generate_task_text(state, session, voice=voice, depth=depth + 1)
-        if depth < 3 and actual_risk >= 3 and not any(w in low for w in ANATOMY_WORDS):
+            return await generate_task_text(state, session, voice=voice, depth=depth + 1, model=model)
+        if depth < 3 and actual_risk >= 3 and not any(
+                re.search(rf"\b{w}", low) for w in ANATOMY_WORDS):
             logger.warning("no anatomy at risk %s, retrying", actual_risk)
-            return await generate_task_text(state, session, voice=voice, depth=depth + 1)
+            return await generate_task_text(state, session, voice=voice, depth=depth + 1, model=model)
         if depth < 3 and tells and not any(w in low for w in tells):
             logger.warning("no kink expressed, retrying")
-            return await generate_task_text(state, session, voice=voice, depth=depth + 1)
+            return await generate_task_text(state, session, voice=voice, depth=depth + 1, model=model)
+        if depth < 3 and quick and any(w in low for w in ("phone", "camera")):
+            logger.warning("phone written into a quick task, retrying")
+            return await generate_task_text(state, session, voice=voice, depth=depth + 1, model=model)
+        if depth < 3 and venue.exposure_rank(effective) >= 2 and any(
+                w in low for w in ("nobody", "no one", "deserted", "empty", "quiet")):
+            logger.warning("called quiet at %s, retrying", effective)
+            return await generate_task_text(state, session, voice=voice, depth=depth + 1, model=model)
+        if depth < 3 and quick and any(f.lower() in low for f in prof["fittings"] if len(f) > 4):
+            logger.warning("fixture named in a quick task, retrying")
+            return await generate_task_text(state, session, voice=voice, depth=depth + 1, model=model)
         final = effective
         setting, kept = None, []
         for line in response.splitlines():

@@ -1,8 +1,7 @@
 from datetime import datetime, timezone, timedelta
 from . import venue, tasks as tk
 
-STALE = {"outfit": timedelta(hours=8), "location": timedelta(hours=6),
-         "hide_spot": timedelta(hours=24)}
+STALE = {"outfit": timedelta(hours=8), "location": timedelta(hours=6)}
 ORDER = ["gender", "location", "outfit", "privacy", "hide_spot"]
 
 
@@ -29,7 +28,7 @@ def _stale(state, key, now):
         return False
     try:
         return now - datetime.fromisoformat(asked) > window
-    except ValueError:
+    except (TypeError, ValueError):
         return False
 
 
