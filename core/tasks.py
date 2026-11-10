@@ -1,7 +1,6 @@
 import re, os, random, logging
 from datetime import datetime, timezone
 from . import venue, venice, venue_ai
-from .state import LocationConstraint
 
 logger = logging.getLogger(__name__)
 
@@ -288,6 +287,8 @@ def _tidy(text):
 
 
 async def generate_task_text(state, session, *, voice, depth=0, model=None):
+    from .state import LocationConstraint
+
     gender = state.get("gender") or "nonbinary"
     location = state.get("location") or "Unknown"
     others = state.get("context_others") or "alone"

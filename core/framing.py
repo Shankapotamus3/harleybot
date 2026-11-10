@@ -3,11 +3,18 @@ import re
 SELFIE_INVISIBLE = {"phone", "the phone", "your phone", "mobile", "smartphone",
                     "camera", "the camera"}
 MIRROR_HINTS = ("mirror", "reflection", "reflected", "in the glass", "at the basin")
+SCENE_HINTS = ("mirror", "stall", "door", "window", "floor", "wall", "counter", "shelf",
+               "lane", "table", "chair", "bench", "basin", "sink", "corridor", "aisle")
 
 
 def needs_mirror(task_text):
     t = (task_text or "").lower()
     return any(h in t for h in MIRROR_HINTS)
+
+
+def is_scene(item):
+    i = (item or "").lower()
+    return any(w in i for w in SCENE_HINTS)
 
 
 def unachievable(item, task_text):
